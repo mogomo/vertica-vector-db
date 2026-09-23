@@ -218,10 +218,8 @@ Check again on other versions.
 ## Verified in milestone M3 (26.2.0-1 single node, 2026-09-23)
 - `UPDATE` writes a new row version with a new commit epoch: the `epoch` pseudo-column of the
   updated row changed from 83557 to 83559, and the row count of the table stays the same. So a
-  row count cannot see a physical UPDATE of an old journal row; incremental refresh therefore
-  detects only rows that are removed or added with old versions (count of rows up to the
-  previous boundary), and a physical UPDATE needs `refresh_index(name, 'full')`. Not used: row
-  epochs for detection. What mergeout does to the epoch of rows older than the AHM was not
+  row count cannot see a physical UPDATE of an old journal row (so the refresh takes a digest as
+  well since the M3 follow-up, below). Not used: row epochs for detection. What mergeout does to the epoch of rows older than the AHM was not
   verified (on the test VM the AHM did not move for several minutes, and `MAKE_AHM_NOW()`
   would have changed the whole database's history).
 - `DO_TM_TASK('mergeout', 'schema.table')` runs a mergeout of one table.
@@ -240,3 +238,41 @@ Check again on other versions.
   CREATE on the schema of the source table and SELECT on it.
 - `v_monitor.locks` shows a non-superuser the locks of other users' sessions too (an open INSERT of
   dbadmin was visible to a user with only vvector_admin): the delta boundary works for them.
+
+## Verified in the M3 follow-up (26.2.0-1 single node, 2026-09-23)
+- `HASH(id, vec, del, ts)` accepts an `ARRAY[FLOAT]` column. The value depends on every element
+  and on their order: `ARRAY[1.0, 2.0]`, `ARRAY[2.0, 1.0]` and `ARRAY[1.0, 2.0000001]` hash
+  differently; a NULL array hashes to a value too. HASH returns a non-negative INT, so
+  `SUM(HASH(...))` over 1M rows fails with "ERROR 4845: Sum() overflowed";
+  `SUM(HASH(...)::NUMERIC(38,0))` works (at most 2^63 per row, far below 10^38 for 2^32 rows).
+- Cost on 1M SIFT rows of 128 FLOAT (the VM): `COUNT(*)` with a version condition 23 to 29 ms;
+  with `SUM(HASH(id, vec, ts)::NUMERIC(38,0))` 650 to 730 ms warm, 2.5 s when the vector column
+  is read from disk for the first time. The vectors are what costs: HASH of (id, ts) alone 23 ms.
+- A conditional UPDATE is a compare-and-set: session A ran `UPDATE t SET owner = 1 WHERE started
+  IS NULL` and kept its transaction open; session B's `UPDATE t SET owner = 2 WHERE started IS
+  NULL` waited for A's lock and, after A's COMMIT, updated 0 rows (it read the committed data).
+- `LOCK TABLE t IN EXCLUSIVE MODE` in an open transaction holds an INSERT of another session into
+  t until COMMIT (2 s in the test).
+- PL/vSQL: `BEGIN PERFORM CALL p(); EXCEPTION WHEN OTHERS THEN ... END;` where p COMMITs and then
+  raises: the commits of p stay; in the handler `PERFORM UPDATE ...; PERFORM COMMIT;` work;
+  `RAISE EXCEPTION '%', SQLERRM;` passes the message on (as ERROR 2005).
+- PL/vSQL does not accept `NUMERIC(38,0)` as the type of a variable ("PL/vSQL parser failed ...
+  syntax error, unexpected UINT"); a cast `x::NUMERIC(38,0)` in an expression works.
+- `DROP TRANSFORM FUNCTION s.f(INT, ARRAY[FLOAT], BOOLEAN)` is a syntax error at "ARRAY", like
+  GRANT and REVOKE. `DROP LIBRARY ... CASCADE` and `DROP SCHEMA ... CASCADE` remove such a
+  function. An anonymous block `DO $$ BEGIN ... END; $$;` runs in vsql, with `EXECUTE` of
+  dynamic DDL inside.
+- A schema may have the name of a role (`CREATE SCHEMA vvector_admin` with the role
+  `vvector_admin` present).
+- `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA s` reaches only the functions and procedures that
+  exist at that moment; a REVOKE of a procedure created later gives "NOTICE 2061: ... could not
+  be revoked from public. Cannot revoke privilege that you did not grant".
+- `SET ROLE NONE;` switches off every role of the session (the default role included); the user's
+  direct grants and PUBLIC stay.
+- Only a superuser may drop a trigger, even with `DROP TRIGGER IF EXISTS` of a name that does not
+  exist: "ROLLBACK 11036: Only a Super User can drop triggers" for a user with vvector_admin.
+  `v_catalog.stored_proc_triggers` (trigger_name, schema_name, procedure_name, ...) and
+  `v_catalog.user_schedules` (schedule_name, schema_name, attached_trigger, ...) list them, so
+  unregister_index drops them only when they exist.
+- The SDK gives a UDx the user of the session (`ServerInterface::getUserName()`, VerticaUDx.h),
+  not the user's roles or rights.

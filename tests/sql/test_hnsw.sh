@@ -155,7 +155,7 @@ echo "== error messages"
 expect "ef_search above 100000 is refused" "ef_search must be 0 (preset) to 100000" "$(search_sql vh_cos ", ef_search=100001" "$SCHEMA.vh_cos_snap");"
 expect "set_index_options refuses m 1" "m must be 2 to 256" "CALL vvector.set_index_options('vh_cos', NULL, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
 expect "vbuild refuses m 300" "vbuild: m must be 2 to 256" "
-SELECT COUNT(*) FROM (SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vh_err', index_type='hnsw', m=300) OVER()
+SELECT COUNT(*) FROM (SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vh_err', index_type='hnsw', m=300) OVER()
 FROM $SCHEMA.journal) b;"
 
 if [ -n "$SIFT" ]; then

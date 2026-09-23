@@ -128,7 +128,8 @@ accepts `--help`, and every script that changes the database accepts
 
 ### What the install creates
 
-Everything is in schema `vvector`:
+Everything is in schema `vvector`, except the functions that build and load
+snapshots, which are in schema `vvector_admin`:
 
 | Object | What it is |
 |---|---|
@@ -137,20 +138,40 @@ Everything is in schema `vvector`:
 | `vvector.probe` | table (8192 rows, segmented): makes node-wise functions run once on every node |
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
 | role `vvector_admin` | may build, load and manage indexes |
-| functions | `vsearch`, `vknn`, `vinfo`, `vversion` (search and information), `vbuild`, `vload`, `vconfig`, `vnode` (build and load) |
+| functions in `vvector` | `vsearch`, `vknn`, `vinfo`, `vversion` (search and information) |
+| functions in `vvector_admin` | `vbuild`, `vload`, `vconfig`, `vnode` (build and load; `refresh_index` and `load_all` call them) |
 | procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
 
-Rights: `vsearch`, `vknn`, `vinfo`, `vversion`, `vbuild`, `vnode` and the procedure
-`sizing` are open to everyone (PUBLIC); `vload`, `vconfig` and all other
-procedures need `vvector_admin` (`GRANT vvector_admin TO someone;`). vbuild is
-open because Vertica 26.2 cannot grant a single function that has an ARRAY
-argument; it writes nothing, and storing its output needs rights on
-`vvector.snapshot`. The views of an index are not granted to anyone: grant
-SELECT on them to the users who may search (the `_delta` view shows the rows
-of the journal). A user who registers and refreshes an index needs,
-besides `vvector_admin`, USAGE and CREATE on the schema of the source table
-(the views go there) and SELECT on the table; tested with a user that has no
-other rights.
+Rights:
+
+- **Searching is open to everyone.** `vsearch`, `vknn`, `vinfo`, `vversion`
+  and the procedure `sizing` are granted to PUBLIC. A search needs no view:
+  `vknn` and `vsearch ... FROM dual` with the `query` parameter search any
+  index by its name. So SELECT on the views of an index does not decide who
+  may search it. The views protect the journal rows only: the `_delta` view
+  shows the rows of the source table, and it is not granted to anyone. Grant
+  SELECT on the views to the users who should run exact searches (with the
+  changes since the refresh). Anyone who may connect can find the k nearest
+  ids of any index; do not index vectors whose ids or distances must stay
+  hidden from some users of the database.
+- **Building and loading needs the role `vvector_admin`**
+  (`GRANT vvector_admin TO someone; ALTER USER someone DEFAULT ROLE vvector_admin;`,
+  or `SET ROLE vvector_admin` in the session): the functions in schema
+  `vvector_admin` and every procedure except `sizing`. `vbuild` is there
+  because an incremental build reads a whole snapshot from the node cache:
+  open to everyone, it would hand out the vectors of every index.
+  `schedule_refresh` also needs a superuser: Vertica lets only a superuser
+  create a trigger.
+- Rights are given per schema because Vertica 26.2 cannot grant a single
+  function that has an ARRAY argument.
+
+A user who registers and refreshes an index needs, besides `vvector_admin`,
+USAGE and CREATE on the schema of the source table (the views go there) and
+SELECT on the table. `tests/sql/test_rights.sh` checks this with a user that
+has no other rights: register, full and incremental refresh, status, search
+and unregister work; with the role switched off (`SET ROLE NONE`) the same
+user can still search, but not build, load, refresh or read
+`vvector.snapshot`.
 
 ## Prepare a table
 
@@ -192,17 +213,22 @@ their own storage and are found quickly:
     INSERT INTO app.docs (id, vec) VALUES (7, ARRAY[0.1, 0.2, 0.3]);   -- add or change
     INSERT INTO app.docs (id, del) VALUES (8, TRUE);                    -- delete
 
-A physical `DELETE` on the table (or a dropped partition) is allowed, but
-queries see it only after the next refresh, which notices it and rebuilds the
-index in full. A physical `UPDATE` of an older row is not noticed by an
-incremental refresh: run `CALL vvector.refresh_index('docs', 'full')` after
-one. A table without a version column is a **static index**: queries see the
+To keep the journal append-only, grant the users that write to it INSERT
+only, no UPDATE or DELETE on the table.
+
+A physical `DELETE` or `UPDATE` on the table (or a dropped partition) is
+allowed, but queries see it only after the next refresh. Any physical change
+to rows up to the boundary of the last refresh is noticed by the next refresh
+(with the default `verify_every` 1), which then rebuilds the index in full
+(see [refresh_index](#refresh_index)). Rows after the boundary are read by
+every refresh anyway. A table without a version column is a **static index**: queries see the
 snapshot only, every id must appear once, changes show up at the next refresh,
 and every refresh is a full build.
 
 ## Register, refresh, schedule
 
-All procedures need the role `vvector_admin`.
+All procedures need the role `vvector_admin`, except `sizing` (everyone);
+`schedule_refresh` also needs a superuser.
 
 ### register_index
 
@@ -238,18 +264,32 @@ on a cluster it names the projection that was made.
 The first refresh of the quick start, then refreshes after an added and a
 deleted vector (the output of each call):
 
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 656, full build (first build), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.288 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 959, full build (first build), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.282 seconds; journal digest taken in 0.014 seconds
     NOTICE 2005:  vvector: index docs: journal replica: none: a single node reads the delta locally already
 
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 657, incremental from snapshot 656 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.335 seconds
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 657 kept, no vector changed since it was built; the delta starts at the new boundary; 0.145 seconds
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 659, full build (mode full), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.277 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 960, incremental from snapshot 959 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.342 seconds; journal verified in 0.021 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 960 kept, no vector changed since it was built; the delta starts at the new boundary; 0.178 seconds; journal verified in 0.022 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 962, full build (mode full), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.287 seconds; journal digest taken in 0.015 seconds
 
 It takes the delta boundary, builds a new snapshot, stores it in
 `vvector.snapshot`, loads it on every node, writes the index defaults to every
 node, updates the manifest and the views, deletes snapshots older than the
 previous one, and makes, keeps or drops the journal replica. Queries keep
 working during a refresh. The first line says what was built and why.
+
+One refresh of an index runs at a time. A second `refresh_index` of the same
+index (by hand, or by the schedule) while one runs stops at once with an
+error that says since when and by whom the index is being refreshed:
+
+    ERROR 2005:  vvector.refresh_index: index docs is being refreshed since 2026-09-23 16:56:19 UTC (by dbadmin, session v_vdb_node0001-1391:0x241bd). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored 6 hours after its start, or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'docs'; COMMIT;
+
+The refresh marks the manifest row (`refresh_started_at`,
+`refresh_started_by`) and removes the mark when it ends, also when it fails.
+If its session is killed or its node goes down, the mark stays: it is ignored
+6 hours after it was set, or a `vvector_admin` removes it with the statement
+the message gives
+(`UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'docs'; COMMIT;`).
+`status` shows a running refresh.
 
 There are two ways to build:
 
@@ -276,10 +316,25 @@ There are two ways to build:
 In every mode the build is full when an incremental one cannot give the right
 answer: the first build; a static index (no version column); changed build
 options (`index_type`, `m`, `ef_construction`, `quantization`) or a new
-snapshot format; a node whose cache does not hold the active snapshot; and a
-journal that lost or gained rows up to the previous boundary (a physical
-`DELETE`, a dropped partition, versions set by hand). The refresh counts
-those rows every time and compares the count at the next one.
+snapshot format; a node whose cache does not hold the active snapshot; and
+journal rows up to the previous boundary that are not the rows the last
+refresh saw (a physical `DELETE` or `UPDATE`, a dropped partition, versions
+set by hand). The manifest keeps the number of those rows and a digest of
+them (the sum of `HASH(id, vector, delete flag, version)`). Every refresh
+carries both forward from the journal rows between the previous and the new
+boundary, which it reads anyway. To verify them, a refresh computes both again
+over every row up to the previous boundary, the vectors included, and compares;
+any difference is a full build. The index option `verify_every` says when:
+`1` at every refresh (the default), `N` every N refreshes, `0` never. The
+verification is the part of a refresh that grows with the whole journal (table
+below); with `0` a refresh reads only the new rows, and a physical change
+goes unnoticed: then run `CALL vvector.refresh_index('docs', 'full')` after
+every physical UPDATE, DELETE or dropped partition yourself. A full build
+takes exact values. The first line says what happened, for example
+`full build (the journal rows up to the previous boundary changed since the last refresh: same count (20000), other digest (a physical UPDATE, or rows replaced by hand)), ...; journal verified in 0.43 seconds` (900,000 x 128),
+or, with `verify_every` 10, `...; journal not verified (verify_every 10, last verified 1 refreshes ago)`.
+An index made by a version without the digest gets it at its next refresh by
+one scan, without a rebuild ("journal digest taken for the first time").
 
 Measured on the test machine (`scripts/benchmark.sh --parts=incremental`,
 fenced; 900,000 SIFT1M vectors of 128 dimensions, then changes of growing
@@ -287,16 +342,19 @@ size, each followed by `refresh_index`):
 
 | Change since the last refresh | flat | hnsw |
 |---|---:|---:|
-| none (the snapshot is kept) | 0.5 s | 0.5 s |
-| 100 adds, 50 deletes | 4.4 s | 6.5 s |
-| 1,000 adds, 500 deletes | 4.4 s | 6.5 s |
-| 10,000 adds, 5,000 deletes | 4.7 s | 7.2 s |
-| 50,000 adds, 25,000 deletes | 5.1 s | 9.2 s |
-| full build of the same 930,550 vectors | 8.5 s | 42.4 s |
+| none (the snapshot is kept), journal verified (`verify_every` 1) | 1.0 s | 1.0 s |
+| none, not verified (`verify_every` 0) | 0.6 s | 0.6 s |
+| 100 adds, 50 deletes | 5.3 s | 6.9 s |
+| 1,000 adds, 500 deletes | 5.0 s | 6.9 s |
+| 10,000 adds, 5,000 deletes | 5.0 s | 7.3 s |
+| 50,000 adds, 25,000 deletes | 5.7 s | 9.5 s |
+| full build of the same 930,550 vectors | 8.8 s | 42.1 s |
 
 An incremental refresh costs a fixed part plus a small part per change. The
 fixed part is the whole snapshot being written to `vvector.snapshot` and
-loaded on every node again (about 4 s for 450 to 600 MB); the build itself
+loaded on every node again (about 4 s for 450 to 600 MB), and the
+verification of the journal (0.4 s here, 0.6 to 0.8 s right after a large
+insert; none with `verify_every` 0); the build itself
 takes 0.25 s for 1000 adds and 500 deletes on 1M vectors. A full build of an
 HNSW index spends most of its time on the graph; the graph after 100
 incremental refreshes finds as much as a new one (recall@10 0.9845 against
@@ -315,7 +373,10 @@ replaces the schedule.
 
     CALL vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
                                    tombstone_ratio, rebuild_every, memory_mode, precision_default,
-                                   freshness_default, ef_search_default, threads_default);
+                                   freshness_default, ef_search_default, threads_default [, verify_every]);
+
+    -- verify the journal every 10 refreshes instead of at every one:
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 10);
 
     -- queries of index docs apply the journal by default:
     CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'exact', NULL, NULL);
@@ -325,7 +386,8 @@ replaces the schedule.
 
     NOTICE 2005:  vvector: index docs options changed. Build options apply at the next refresh; query defaults apply now.
 
-NULL keeps a value. Query defaults (the last four) apply at once on every
+NULL keeps a value; the 13-argument form leaves `verify_every` as it is.
+Query defaults (precision, freshness, ef_search, threads) apply at once on every
 node (within 200 ms); `'default'` (text) or `0` (numbers) sets one back to the
 built-in default. Build options apply at the next refresh. Values that belong
 to later milestones are refused with a message that names the milestone.
@@ -338,6 +400,7 @@ to later milestones are refused with a message that names the milestone.
 | refresh_mode | auto, incremental, full | auto | in use (see [refresh_index](#refresh_index)) |
 | tombstone_ratio | above 0 to 1 | 0.2 | in use: `auto` builds in full once the tombstones exceed this share of the snapshot |
 | rebuild_every | 0 (never) or more | never | in use: `auto` builds in full after this many incremental refreshes |
+| verify_every | 0 (never), 1 (every refresh) or more | 1 | in use: how often a refresh verifies the journal rows up to the boundary (see [refresh_index](#refresh_index)) |
 | memory_mode | ram, compact | ram | ram only (compact: M4) |
 | precision_default | fast, balanced, best, exact | balanced | in use (HNSW); a flat index is always exact |
 | freshness_default | snapshot, exact | snapshot | in use |
@@ -349,13 +412,14 @@ to later milestones are refused with a message that names the milestone.
     CALL vvector.status('docs');
 
     NOTICE 2005:  vvector: index docs: hnsw index, 5 live vectors, 1 tombstones (tombstone_ratio 0.2), refresh_mode auto, 1 incremental refreshes since the last full build (rebuild_every never)
-    NOTICE 2005:  vvector: index docs: last refresh: refreshed: snapshot 660, incremental from snapshot 659 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.319 seconds
-    NOTICE 2005:  vvector: index docs: 3 journal rows in the delta, read in 8 ms
+    NOTICE 2005:  vvector: index docs: journal digest verified at every refresh (verify_every 1); 0 refreshes since the last verification or full build
+    NOTICE 2005:  vvector: index docs: last refresh: refreshed: snapshot 963, incremental from snapshot 962 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.347 seconds; journal verified in 0.021 seconds
+    NOTICE 2005:  vvector: index docs: 3 journal rows in the delta, read in 7 ms
     NOTICE 2005:  vvector: index docs: journal replica auto: none: a single node reads the delta locally already
-    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (29374 MB free or cache), 8 cores
+    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (28580 MB free or cache), 8 cores
 
 `status` reports the live vectors and the tombstones, the refresh mode, what
-the last refresh did, the rows in the delta and how long they take to read,
+the last refresh did, a refresh that is running now, the rows in the delta and how long they take to read,
 the journal replica, open transactions that write to the table, versions in
 the future (a sign that an application sets the version column itself), and a
 sizing check: index size against node memory, the memory a refresh needs
@@ -404,9 +468,12 @@ the delta view, `vector_count` (live vectors), `tombstones`, `base_snapshot`
 `dims`, `graph_bytes` (the HNSW graph), `index_bytes` (the whole snapshot),
 `built_at`, `build_seconds`, `format_version`, `active_options` (the build
 options of the active snapshot), `incremental_count` (incremental refreshes
-since the last full build), `boundary_rows` (journal rows up to the boundary,
-compared at the next refresh), `refresh_note` (what the last refresh did and
-why)), and the journal replica (`journal_replica` = auto, on or off;
+since the last full build), `boundary_rows` and `boundary_digest` (the number
+and the digest of the journal rows up to the boundary, carried forward and
+verified), `verify_every`, `refreshes_since_verify` (refreshes since the last
+verification or full build), `refresh_note` (what the last refresh did and why),
+`refresh_started_at` and `refresh_started_by` (set while a refresh runs)), and
+the journal replica (`journal_replica` = auto, on or off;
 `replica_projection`, the projection vvector made; `replica_note`, what the
 last check did and why).
 
@@ -415,7 +482,7 @@ last check did and why).
 
      index_name | source_table | metric | index_type | active_snapshot | vector_count | dims | graph_bytes | index_bytes | build_seconds
     ------------+--------------+--------+------------+-----------------+--------------+------+-------------+-------------+---------------
-     docs       | app.docs     | cosine | hnsw       |             656 |            5 |    3 |         896 |        1536 |         0.288
+     docs       | app.docs     | cosine | hnsw       |             959 |            5 |    3 |         896 |        1536 |         0.282
 
 ## Search
 
@@ -599,14 +666,14 @@ the snapshot too; applying them again changes nothing.
 
      id | del | has_ver | snapshot_id
     ----+-----+---------+-------------
-        |     | f       |         656
-      1 | f   | t       |         656
-      2 | f   | t       |         656
-      2 | t   | t       |         656
-      3 | f   | t       |         656
-      4 | f   | t       |         656
-      5 | f   | t       |         656
-      6 | f   | t       |         656
+        |     | f       |         959
+      1 | f   | t       |         959
+      2 | f   | t       |         959
+      2 | t   | t       |         959
+      3 | f   | t       |         959
+      4 | f   | t       |         959
+      5 | f   | t       |         959
+      6 | f   | t       |         959
 
 With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
 `snapshot` the result is the one of the last refresh:
@@ -842,7 +909,7 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
 
          node_name    | index_name | snapshot_id | vector_count | dims | metric | index_type | freshness_default | loaded
       ----------------+------------+-------------+--------------+------+--------+------------+-------------------+--------
-       v_vdb_node0001 | docs       |         656 |            5 |    3 | cosine | hnsw       | exact             | t
+       v_vdb_node0001 | docs       |         959 |            5 |    3 | cosine | hnsw       | exact             | t
 
   Without `index_name` it lists every index in the cache directory.
   Other columns: max_ver, quantization, graph_bytes, tombstones,
@@ -872,8 +939,14 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
   A new library that reads another snapshot format refuses the old cache
   files with "format version 1, this library reads version 2: refresh the
   index": run `refresh_index` for every index after such an upgrade.
-- **Monitoring**: the refresh labels its statements `vvector_build` and
-  `vvector_load`:
+  Upgrading from a version that had `vbuild`, `vload`, `vconfig` and `vnode`
+  in schema `vvector`: `make deploy` drops the library with its functions and
+  creates them again (Vertica cannot drop a single function with an ARRAY
+  argument); searches running at that moment fail. The first refresh of every
+  index after that upgrade is a full build (the digest is new).
+- **Monitoring**: the refresh labels its statements `vvector_verify` (count
+  and digest of the journal recomputed), `vvector_digest` (carried forward from
+  the new rows, or taken for a full build), `vvector_build` and `vvector_load`:
   `SELECT request_label, request_duration_ms FROM v_monitor.query_requests WHERE request_label LIKE 'vvector%' ORDER BY start_timestamp DESC;`
   Put your own `/*+LABEL(name)*/` in searches to find them the same way.
 
@@ -884,25 +957,25 @@ by hand.
 
 | Function | Rights | What it does |
 |---|---|---|
-| `vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir) OVER()` | PUBLIC | turns (id, vector) rows into a snapshot; returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
-| `vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time |
-| `vconfig(k USING PARAMETERS index_name, options, cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; returns (node_name, status) |
-| `vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | PUBLIC | one row per node: (node_name, k); used to send every chunk to every node exactly once |
-| `vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | PUBLIC | what every node has cached (see above) |
-| `vversion() OVER()` | PUBLIC | (library_version, format_version, build_flags) |
+| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
+| `vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time |
+| `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; returns (node_name, status) |
+| `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
+| `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | PUBLIC | what every node has cached (see above) |
+| `vvector.vversion() OVER()` | PUBLIC | (library_version, format_version, build_flags) |
 
 A snapshot built and loaded by hand (the procedures do the same, plus the
 views, the manifest and the checks):
 
     INSERT INTO vvector.snapshot
     SELECT 'docs', 900, byte_offset, chunk FROM (
-      SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='docs', metric='cosine') OVER()
+      SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='docs', metric='cosine') OVER()
       FROM app.docs) b;
     COMMIT;
-    SELECT vvector.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
+    SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
     FROM (SELECT s.byte_offset, s.chunk FROM vvector.snapshot s CROSS JOIN vvector.probe p
           WHERE s.index_name = 'docs' AND s.snapshot_id = 900
-            AND p.k IN (SELECT k FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c;
+            AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c;
 
 Take snapshot ids from `vvector.snapshot_seq` if the index is also refreshed
 by the procedures: a node refuses a snapshot id lower than the one of the
@@ -948,6 +1021,10 @@ cache), starting with `vknn:`.
 | `vvector.register_index: ...` (table, column, type, metric, margin, op_col needs ver_col, already registered) | a bad argument; the message names it | fix the argument |
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
 | `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
+| `vvector.refresh_index: index x is being refreshed since T UTC (by USER, session S). Two refreshes of one index cannot run at the same time ...` | another refresh of the index runs (by hand or by the schedule), or one was killed and left its mark | wait until it ends; if none runs, `UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'x'; COMMIT;` (or wait until 6 hours after T) |
+| `Permission denied for schema vvector_admin` | a build or load function called without the role `vvector_admin` | `GRANT vvector_admin TO someone;` and enable it (default role or `SET ROLE`) |
+| `Function vvector.refresh_index(unknown) does not exist, or permission is denied ...` (any procedure) | the caller lacks the role `vvector_admin`, or has it but not enabled in the session | grant it and enable it (default role or `SET ROLE vvector_admin`) |
+| `Only a Super User can drop triggers` (from `schedule_refresh`) | `schedule_refresh` was called by a user who is not a superuser | a superuser runs `schedule_refresh` |
 | `vvector.load_on_nodes: index x, snapshot S: loaded on N of M nodes` | a node could not load (disk, rights) | vinfo shows the cause per node; `load_all` |
 | `vvector.push_options: index x: options written on N of M nodes` | a node could not write its cache directory | check the cache directory; `load_all` |
 | `vvector.<procedure>: index x is not registered` | a wrong index name | `SELECT index_name FROM vvector.manifest` |
@@ -1048,7 +1125,13 @@ Vertica and SDK:
 - A transform function is not called on empty input: the views carry a
   sentinel row for that reason.
 - Rights are granted per schema (Vertica cannot grant a single function with
-  an ARRAY argument); vbuild is PUBLIC.
+  an ARRAY argument): the search functions in `vvector` are PUBLIC, the build
+  and load functions in `vvector_admin` need the role `vvector_admin`.
+- Searching is PUBLIC and cannot be limited per index: `vknn` and
+  `vsearch ... FROM dual` search any index by name, without a view. The views
+  protect the journal rows, not the index.
+- `schedule_refresh` needs a superuser (Vertica: only a superuser may create
+  a trigger).
 - A UNION ALL of `ARRAY[INT]` and `ARRAY[NUMERIC]` columns fails inside
   Vertica 26.2 (INTERNAL 5445); cast to `ARRAY[FLOAT]` first.
 - Fenced mode adds about 6 ms per statement, and about 6 ms more to the first
@@ -1069,11 +1152,13 @@ Data model:
 - Ids are INT and unique per index; every vector of an index has the same
   number of elements, at most 32768; NULL elements, NaN, Infinity and values
   beyond +-3.4e38 are refused.
-- The table is a journal: adds and deletes are INSERTs. A physical DELETE (or
-  a dropped partition) becomes visible at the next refresh, which rebuilds in
-  full because of it. A physical UPDATE of a row older than the last refresh
-  is not noticed by an incremental refresh: follow it with
-  `refresh_index(name, 'full')`.
+- The table is a journal: adds and deletes are INSERTs. A physical DELETE or
+  UPDATE (or a dropped partition) becomes visible at the next refresh, which
+  notices any physical change to rows up to its boundary (count and digest of
+  those rows) and rebuilds in full because of it. With `verify_every` N it
+  notices it within N refreshes; with 0 not at all: run
+  `refresh_index(name, 'full')` after such a change. The verification reads
+  every journal row up to the boundary.
 - Without a version column the index is static and every id must appear once.
 - The version column must be filled by the database (`DEFAULT
   CLOCK_TIMESTAMP()`); versions set by an application can make results wrong
@@ -1113,7 +1198,10 @@ Index and search:
 
 Operations:
 - A new index default is seen by queries within 200 ms; a new snapshot at once.
-- Two refreshes of one index at the same time are not supported.
+- Two refreshes of one index at the same time are refused: the second one
+  gets an error. A refresh whose session was killed leaves its mark in the
+  manifest; the next refresh ignores it after 6 hours (or remove it by hand,
+  see [refresh_index](#refresh_index)).
 - Cache files stay on the nodes after `unregister_index`.
 - A refresh builds on one node; its memory is the build memory above.
 - A node that missed a refresh answers "snapshot cache stale ... run vload"
@@ -1121,7 +1209,8 @@ Operations:
 - A new snapshot format needs a refresh of every index; the error says so.
 - An incremental refresh reads only the changes, but writes and loads the
   whole snapshot again: its cost has a part that grows with the index size
-  (about 6.5 s for 900,000 x 128 HNSW, 4.4 s flat, on the test VM) besides the part that grows
+  (about 6.9 s for 900,000 x 128 HNSW, 5.0 s flat, on the test VM, of which
+  0.4 s is the verification of the journal) besides the part that grows
   with the changes. A full build of 1M x 128 takes 11 s as a flat index and
   46 s as an HNSW index.
 - Tombstones (the old positions of changed and deleted vectors) stay in the
@@ -1145,7 +1234,7 @@ Operations:
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M) to text for COPY |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp` and `test_delta.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp`, and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M); `run_all.sh` runs them in every mode |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection); `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

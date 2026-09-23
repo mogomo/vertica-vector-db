@@ -1,5 +1,5 @@
 // vnode: tells which node holds which rows of the segmented table vvector.probe.
-//   vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe
+//   vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe
 // Output (node_name, k): one row per node, with the smallest k stored on it.
 // vload uses it to get exactly one probe row, and so one copy of the chunks, per node.
 #include "Vertica.h"

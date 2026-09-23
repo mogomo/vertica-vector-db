@@ -116,13 +116,15 @@ CREATE TABLE $SCHEMA.sift_inc (id INT NOT NULL, vec ARRAY[FLOAT], del BOOLEAN NO
     PARTITION BY (ts AT TIME ZONE 'UTC')::DATE GROUP BY CALENDAR_HIERARCHY_DAY((ts AT TIME ZONE 'UTC')::DATE, 2, 2);
 INSERT INTO $SCHEMA.sift_inc (id, vec, ts) SELECT id, vec, CLOCK_TIMESTAMP() - INTERVAL '1 day' FROM $SCHEMA.sift_base WHERE id < 900000;
 COMMIT;" > /dev/null
-refresh_timed() {   # INDEX [MODE] -> one line: total, vbuild statement, vload statement (none when nothing changed), what was built
+refresh_timed() {   # INDEX [MODE] -> one line: total, journal statement (verify = recompute the digest up to the boundary,
+                    # digest = carry it forward from the new rows, or take it for a full build), vbuild, vload (none when nothing changed), what was built
     local start total loads
     loads=$(sql "SELECT COUNT(*) FROM v_monitor.query_requests WHERE request_label = 'vvector_load'")
     start=$(date +%s%N)
     sql "CALL vvector.refresh_index('$1'${2:+, '$2'});" > /dev/null 2>&1
     total=$(( ($(date +%s%N) - start) / 1000000 ))
-    printf "  %-12s %9d ms  vbuild %7s ms  vload %6s ms  %s\n" "$1" "$total" \
+    printf "  %-12s %9d ms  %-16s ms  vbuild %7s ms  vload %6s ms  %s\n" "$1" "$total" \
+        "$(sql "SELECT SUBSTR(request_label, 9) || ' ' || request_duration_ms FROM v_monitor.query_requests WHERE request_label IN ('vvector_digest', 'vvector_verify') ORDER BY start_timestamp DESC LIMIT 1")" \
         "$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = 'vvector_build' ORDER BY start_timestamp DESC LIMIT 1")" \
         "$(sql "SELECT CASE WHEN COUNT(*) > $loads THEN MAX(CASE WHEN n = 1 THEN request_duration_ms END)::VARCHAR ELSE '-' END
                 FROM (SELECT request_duration_ms, ROW_NUMBER() OVER(ORDER BY start_timestamp DESC) AS n
@@ -145,6 +147,14 @@ for adds in 0 100 1000 10000 50000; do
     fi
     refresh_timed sift_inc_f
     refresh_timed sift_inc_h
+    if [ "$adds" -eq 0 ]; then
+        echo "no change again, verify_every 0 (the digest carried forward, never recomputed):"
+        for x in sift_inc_f sift_inc_h; do
+            sql "CALL vvector.set_index_options('$x', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);" > /dev/null 2>&1
+            refresh_timed $x
+            sql "CALL vvector.set_index_options('$x', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1);" > /dev/null 2>&1
+        done
+    fi
 done
 echo "full build of the same vectors, for comparison:"
 refresh_timed sift_inc_f full

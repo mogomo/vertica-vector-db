@@ -14,8 +14,14 @@
 #   the full scan, HNSW recall at the default precision is at least 0.95;
 # - a refresh without changes (or with rows that change nothing) keeps the snapshot;
 # - every full-build trigger: mode full, refresh_mode full, changed build options, tombstone_ratio,
-#   rebuild_every, a physical DELETE, a node cache without the active snapshot, a static index;
-#   refresh_mode incremental ignores the ratio and status warns; a bad mode is refused.
+#   rebuild_every, a physical DELETE, a physical UPDATE of an old row's vector and of its version
+#   (same row count, other digest; a search then finds the new vector), verify_every 0 (not noticed),
+#   2 (noticed at the second refresh), an index without a digest (taken without a rebuild), a node cache without the
+#   active snapshot, a static index; refresh_mode incremental ignores the ratio and status warns; a
+#   bad mode is refused;
+# - one refresh at a time: a second refresh of an index that is being refreshed stops with an error
+#   (a real second refresh while the first waits for a lock, and a mark set by hand); status shows
+#   the running refresh; a mark older than 6 hours is ignored; a refresh that fails removes its mark.
 # With --sift=SCHEMA (sift_base and sift_query of scripts/load_dataset.sh in that schema) also the
 # acceptance test of milestone M3: an HNSW index on 900,000 SIFT1M vectors, then 100 refreshes of
 # 1000 adds and 500 deletes each, tombstone_ratio 0.03 (a full build must fire on the way); at the
@@ -24,7 +30,7 @@
 # 2 GB of disk for the journal copy.
 #
 # Test data: schema VVINC (or --schema=NAME), dropped and recreated. Indexes vif_l2, vif_cos (flat),
-# vih_l2, vih_cos (hnsw), vi_static, vi_tiny, vi_sift.
+# vih_l2, vih_cos (hnsw), vi_static, vi_tiny, vi_empty, vi_sift.
 #
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -uo pipefail
@@ -57,7 +63,7 @@ IX_PREFIX=vif_
 
 INDEXES="vif_l2 vif_cos vih_l2 vih_cos"
 unregister_all() {
-    run_sql "unregister" "$(for i in $INDEXES vi_static vi_tiny vi_sift; do echo "CALL vvector.unregister_index('$i');"; done)" > /dev/null
+    run_sql "unregister" "$(for i in $INDEXES vi_static vi_tiny vi_empty vi_sift; do echo "CALL vvector.unregister_index('$i');"; done)" > /dev/null
 }
 value() {   # SQL -> its single value
     if [ "$ECHO_ONLY" = yes ]; then echo 1; return; fi
@@ -214,6 +220,44 @@ expect "a physical DELETE of an old row: a full build that drops it" "index vif_
 DELETE FROM $SCHEMA.journal WHERE id = 3500; COMMIT;
 CALL vvector.refresh_index('vif_l2');"
 built_equals_live "vif_l2 no longer holds the deleted row" vif_l2
+FIVES="ARRAY[$(printf '5.0%.0s, ' $(seq 1 $((DIMS - 1))))5.0]"
+expect "a physical UPDATE of an old row's vector: same count, other digest, a full build" \
+    "index vif_l2 $FULL (the journal rows up to the previous boundary changed since the last refresh: same count ([0-9]*), other digest" "
+UPDATE $SCHEMA.journal SET vec = $FIVES WHERE id = 3600; COMMIT;
+CALL vvector.refresh_index('vif_l2');"
+built_equals_live "vif_l2 after the UPDATE" vif_l2
+expect "a search finds the updated vector" "^3600|0|1$" "
+SELECT id, score, rank FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+    USING PARAMETERS index_name='vif_l2', query='[$(printf '5, %.0s' $(seq 1 $((DIMS - 1))))5]', k=1) OVER() FROM $SCHEMA.vif_l2_snap) s;"
+expect "a physical UPDATE of an old row's version (still before the boundary): a full build" \
+    "index vif_l2 $FULL (the journal rows up to the previous boundary changed since the last refresh: same count" "
+UPDATE $SCHEMA.journal SET ts = ts - INTERVAL '1 hour' WHERE id = 3700; COMMIT;
+CALL vvector.refresh_index('vif_l2');"
+built_equals_live "vif_l2 after the version UPDATE" vif_l2
+refresh "no change after the UPDATEs: the next refresh keeps the snapshot" vif_l2 "index vif_l2 refreshed: snapshot [0-9]* kept"
+SEVENS="ARRAY[$(printf '7.0%.0s, ' $(seq 1 $((DIMS - 1))))7.0]"
+expect "verify_every 0: a physical UPDATE is not noticed" "index vif_l2 refreshed: snapshot [0-9]* kept, .*; journal not verified (verify_every 0)" "
+CALL vvector.set_index_options('vif_l2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+UPDATE $SCHEMA.journal SET vec = $SEVENS WHERE id = 3800; COMMIT;
+CALL vvector.refresh_index('vif_l2');"
+expect "status shows verify_every 0 and what the DBA must do" "journal digest verified never (verify_every 0): after a physical UPDATE" "CALL vvector.status('vif_l2');"
+expect "verify_every 2, the second refresh since the last verification: verified, the UPDATE found" \
+    "index vif_l2 $FULL (the journal rows up to the previous boundary changed since the last refresh: same count .*; journal verified in [0-9.]* seconds" "
+CALL vvector.set_index_options('vif_l2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 2);
+CALL vvector.refresh_index('vif_l2');"
+refresh "verify_every 2, the first refresh after it: not verified" vif_l2 "kept, .*; journal not verified (verify_every 2, last verified 1 refreshes ago)"
+refresh "verify_every 2, the second: verified" vif_l2 "kept, .*; journal verified in [0-9.]* seconds"
+expect "an index without a digest gets one by a scan, without a rebuild" "index vif_l2 refreshed: snapshot [0-9]* kept, .*; journal digest taken for the first time in [0-9.]* seconds (row count verified)" "
+CALL vvector.set_index_options('vif_l2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1);
+UPDATE vvector.manifest SET boundary_digest = NULL WHERE index_name = 'vif_l2'; COMMIT;
+CALL vvector.refresh_index('vif_l2');"
+refresh "... and the next refresh verifies against it" vif_l2 "kept, .*; journal verified in [0-9.]* seconds"
+expect "a bad verify_every is refused" "verify_every must be 0 (never), 1 (every refresh) or more" "
+CALL vvector.set_index_options('vif_l2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, -1);"
+refresh "the HNSW index on the same journal: a full build" vih_l2 "index vih_l2 $FULL (the journal "
+expect "an exact search of the HNSW index finds the updated vector" "^3600|0|1$" "
+SELECT id, score, rank FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+    USING PARAMETERS index_name='vih_l2', query='[$(printf '5, %.0s' $(seq 1 $((DIMS - 1))))5]', k=1, precision='exact') OVER() FROM $SCHEMA.vih_l2_snap) s;"
 SID=$(value "SELECT active_snapshot FROM vvector.manifest WHERE index_name = 'vif_cos';")
 [ "$ECHO_ONLY" = yes ] || rm -f "$CACHE_DIR/vif_cos/$SID.vv"
 wait_cache_check
@@ -240,6 +284,50 @@ CALL vvector.refresh_index('vi_tiny');"
 expect "the tiny index: manifest counts and status" "^vector_count 5, tombstones 1, note: refreshed" "
 SELECT 'vector_count ' || vector_count || ', tombstones ' || tombstones || ', note: ' || LEFT(refresh_note, 9) FROM vvector.manifest WHERE index_name = 'vi_tiny';"
 expect "status of the tiny index" "5 live vectors, 1 tombstones" "CALL vvector.status('vi_tiny');"
+
+echo "== one refresh at a time"
+# A real second refresh: the first holds its mark while it waits for a lock on vvector.snapshot (the
+# INSERT of its chunks), which another session keeps for a few seconds.
+if [ "$ECHO_ONLY" = no ]; then
+    change_round
+    printf '%s\n' "LOCK TABLE vvector.snapshot IN EXCLUSIVE MODE;" "SELECT SLEEP(6);" "COMMIT;" | vsql -X -A -t -q > /dev/null 2>&1 &
+    locker=$!
+    sleep 1
+    printf '%s\n%s\n' "$PRE" "CALL vvector.refresh_index('vif_cos');" | vsql -X -A -t -q > "${TMPDIR:-/tmp}/vvinc_first.$$" 2>&1 &
+    first=$!
+    for _ in $(seq 1 40); do
+        [ "$(value "SELECT COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = 'vif_cos';")" = 1 ] && break
+        sleep 0.1
+    done
+fi
+expect "a second refresh while the first runs: refused" "index vif_cos is being refreshed since .* (by .*, session .*). Two refreshes of one index cannot run at the same time" "
+CALL vvector.refresh_index('vif_cos');"
+expect "status shows the running refresh" "index vif_cos: a refresh is running since" "CALL vvector.status('vif_cos');"
+if [ "$ECHO_ONLY" = no ]; then
+    wait "$locker"; wait "$first"
+    if grep -q "index vif_cos $INCR" "${TMPDIR:-/tmp}/vvinc_first.$$"; then
+        echo "PASS  the first refresh finished"
+    else
+        echo "FAIL  the first refresh finished"; sed 's/^/      got: /' "${TMPDIR:-/tmp}/vvinc_first.$$" | head -6
+        FAILED=$((FAILED + 1))
+    fi
+    rm -f "${TMPDIR:-/tmp}/vvinc_first.$$"
+fi
+expect "the mark is gone after the refresh" "^mark: 0$" "
+SELECT 'mark: ' || COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = 'vif_cos';"
+expect "a mark set by hand: refused, with the statement that removes it" "UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'vif_cos'" "
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '5 hours', refresh_started_by = 'someone, session x'
+    WHERE index_name = 'vif_cos'; COMMIT;
+CALL vvector.refresh_index('vif_cos');"
+expect "a mark older than 6 hours is ignored" "index vif_cos refreshed" "
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '7 hours' WHERE index_name = 'vif_cos'; COMMIT;
+CALL vvector.refresh_index('vif_cos');"
+expect "a refresh that fails reports its error" "vvector.refresh_index: index vi_empty: table $SCHEMA.empty has no vectors" "
+CREATE TABLE $SCHEMA.empty (id INT NOT NULL, vec ARRAY[FLOAT], del BOOLEAN NOT NULL DEFAULT FALSE, ts TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP());
+CALL vvector.register_index('vi_empty', '$SCHEMA.empty', 'id', 'vec', 'del', 'ts', 'l2', 0, 'flat');
+CALL vvector.refresh_index('vi_empty');"
+expect "... and removes its mark" "^mark: 0$" "
+SELECT 'mark: ' || COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = 'vi_empty';"
 
 if [ -n "$SIFT" ]; then
     echo "== SIFT1M: HNSW on 900,000 vectors, 100 refreshes of 1000 adds and 500 deletes"

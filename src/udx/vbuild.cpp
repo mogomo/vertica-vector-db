@@ -1,5 +1,5 @@
 // vbuild: builds a snapshot from consolidated vectors and returns it in chunks.
-//   vvector.vbuild(id, vec, del USING PARAMETERS index_name='docs', metric='cosine', max_ver=0) OVER()
+//   vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='docs', metric='cosine', max_ver=0) OVER()
 // id INT, vec ARRAY[FLOAT] (ARRAY[INT] and ARRAY[NUMERIC] are accepted too), del BOOLEAN.
 // No ORDER BY: the builder sorts by id itself. Rows with del = true are skipped in a full build.
 // With base_snapshot the build is incremental: the rows are the changes since that snapshot (one

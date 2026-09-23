@@ -92,8 +92,9 @@ README "Install"):
     make deploy FENCED=no
 
 Deploy creates the library `vvector`, the schema `vvector` with the tables
-`snapshot`, `manifest` and `probe`, the sequence `snapshot_seq`, the role
-`vvector_admin`, the functions and the stored procedures. It can be run again
+`snapshot`, `manifest` and `probe`, the sequence `snapshot_seq`, the search
+functions and the stored procedures, the schema `vvector_admin` with the build
+and load functions, and the role `vvector_admin`. It can be run again
 at any time; snapshots and the manifest are kept. The message
 `ROLLBACK 5403: User/role "vvector_admin" already exists` on a second run is
 expected.
@@ -153,10 +154,11 @@ See what every node has cached:
 
     make undeploy
 
-removes the library and the functions. The schema `vvector` with its snapshots
-stays. To remove everything:
+removes the library and the functions. The schemas `vvector` (with the
+snapshots) and `vvector_admin` stay. To remove everything:
 
     DROP SCHEMA vvector CASCADE;
+    DROP SCHEMA vvector_admin CASCADE;
     DROP ROLE vvector_admin;
 
 and delete the cache directory (`/tmp/vvector` by default) on every node.

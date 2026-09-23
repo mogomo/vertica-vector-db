@@ -147,7 +147,7 @@ project this code comes from):
   replicated table on one node only. On a 3-node Eon cluster only one node ran
   the load. On a single node this cannot be seen.
 - So the input is driven by a segmented table. `vvector.probe(k)` holds 8192
-  rows, segmented by hash, so every node has some. `vvector.vnode(k)
+  rows, segmented by hash, so every node has some. `vvector_admin.vnode(k)
   OVER(PARTITION NODES)` returns the smallest k stored on each node. The chunks
   are cross joined to those probe rows: one probe row per node, so every node
   gets every chunk exactly once. The join is local because the snapshot table
@@ -318,12 +318,24 @@ When the refresh builds in full instead (`refresh_index` in
 tombstones above `tombstone_ratio` of the positions or `rebuild_every`
 incremental refreshes reached (mode `auto` only); a node whose cache does not
 hold the active snapshot (checked with `vinfo` before the build); and a
-journal whose rows up to the previous boundary changed in number. That count
-(`manifest.boundary_rows`) is taken at every refresh for the new boundary: a
-row committed later always has a newer version (that is the boundary rule),
-so the count only changes when rows are removed (physical DELETE, dropped
-partitions) or written with old versions by hand. It is one scan of the
-version column.
+journal whose rows up to the previous boundary are not the rows the last
+refresh saw. A row committed later always has a newer version (that is the
+boundary rule), so those rows only change when someone changes them
+physically: DELETE, UPDATE, dropped partitions, rows written with old
+versions by hand. The manifest keeps their number and a digest,
+`SUM(HASH(id, vec, op, ver)::NUMERIC(38,0))` (`manifest.boundary_rows`,
+`manifest.boundary_digest`). Every refresh carries both forward from the rows
+between the previous and the new boundary (all of them, before the
+consolidation per id): a scan of the new partitions only. The verification
+recomputes both over every row up to the previous boundary and compares;
+`verify_every` (index option) says how often: 1 at every refresh (the
+default), N every N refreshes, 0 never. A full build stores exact values.
+Vertica's UPDATE keeps the row count (verified), so the count alone missed
+it; the digest sees a changed vector, delete flag or version. HASH of a
+FLOAT array depends on every element and on their order (VERTICA_NOTES);
+two different row sets with the same count and the same sum of 63-bit
+hashes are possible in theory, but not by accident in practice. Row epochs
+were not used: what mergeout does to them is not a contract. Cost: below.
 
 ## Where a single query spends its time
 
@@ -559,6 +571,37 @@ the 950,000 live vectors (manifest, vinfo and the journal agree) and recall@10 a
 default precision against the exact search of 1000 queries passed (>= 0.95). The
 disk use of the database stayed within 7 GB of its start: the Tuple Mover purged the
 deleted snapshot rows by itself.
+
+### Journal digest (M3 follow-up)
+
+Carrying the digest forward costs a scan of the rows between the two
+boundaries: 1 to 2 ms for a quiet journal. The verification reads every
+journal row up to the boundary, the vectors included: a cost that grows with
+the journal, like writing the snapshot. The refresh labels the statements
+`vvector_verify` and `vvector_digest` and prints the verify time in
+`refresh_note`. VM, fenced, `scripts/benchmark.sh --parts=incremental` on the
+900,000 x 128 copy of SIFT1M (client ms):
+
+| Refresh | flat total | hnsw total | journal statement |
+|---|---:|---:|---:|
+| no change, `verify_every` 1 (verified) | 1037 | 1034 | verify 433 to 435 |
+| no change, `verify_every` 0 (carried forward) | 599 | 601 | digest 1 to 2 |
+| 1,000 adds, 500 deletes, verified | 4979 | 6861 | verify 422 to 425 |
+| 50,000 adds, 25,000 deletes, verified | 5718 | 9490 | verify 605 to 793 |
+| full build (exact values, up to the new boundary) | 8848 | 42090 | digest 563 to 746 |
+| first build, journal read from disk the first time | 10199 | 40970 | digest 382 to 1774 |
+
+The verify scan takes about 0.43 s when the journal is in memory and more
+right after a large insert (the new rows are read the first time). At M3,
+before the digest, a refresh that changed nothing took 0.53 s; with
+`verify_every` 0 it takes 0.60 s: the other 70 ms are the two manifest
+updates of the one-refresh-at-a-time guard. A count on the version column
+alone took 23 to 29 ms at 1M rows: the vectors are what the verification
+pays for. A shorter verification would need digests per partition,
+re-read only for partitions whose storage containers changed since the last
+refresh (`v_monitor.storage_containers`); not planned now. A journal
+compaction (M7, optional) would have to write the new digest in the same
+transaction.
 
 ### Prewarming (milestone M3)
 

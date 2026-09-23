@@ -1,5 +1,5 @@
 // vload: writes the snapshot cache file on every node and makes it active.
-//   vvector.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=7) OVER(PARTITION NODES)
+//   vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=7) OVER(PARTITION NODES)
 // Output (node_name, snapshot_id, bytes, status). Idempotent: run it again any time.
 // Thin adapter around src/engine/cache.h.
 #include "udx_common.h"

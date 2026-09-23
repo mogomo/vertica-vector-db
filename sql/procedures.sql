@@ -3,7 +3,7 @@
 --   vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin [, index_type])
 --   vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
 --                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
---                             freshness_default, ef_search_default, threads_default)
+--                             freshness_default, ef_search_default, threads_default [, verify_every])
 --   vvector.refresh_index(index_name [, mode])
 --   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
@@ -91,8 +91,8 @@ BEGIN
     IF opts IS NULL THEN
         RAISE EXCEPTION 'vvector.push_options: index % is not registered', nm;
     END IF;
-    want := (SELECT COUNT(*) FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
-    got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vconfig(k USING PARAMETERS index_name='
+    want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vconfig(k USING PARAMETERS index_name='
         || QUOTE_LITERAL(nm) || ', options=' || QUOTE_LITERAL(opts) || ') OVER(PARTITION NODES) FROM vvector.probe) c WHERE status = ''written''';
     IF got IS NULL OR got < want THEN
         RAISE EXCEPTION 'vvector.push_options: index %: options written on % of % nodes', nm, COALESCE(got, 0), want;
@@ -397,9 +397,13 @@ $$;
 -- Changes the options of an index. NULL keeps a value. Build options (x_type, x_m, x_efc, x_quant) take
 -- effect at the next refresh; query defaults (x_prec, x_fresh, x_ef, x_thr) at once, on every node.
 -- 'default' (text) or 0 (numbers) sets a query default back to the built-in default.
-CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
-                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
-                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT)
+-- x_verify (verify_every, the last argument of the 14-argument form): verify the journal digest at every
+-- refresh (1, the default), every N refreshes (N), or never (0).
+-- set_index_options_core does the work; both forms print the NOTICE (NOTICEs of a nested CALL do not
+-- reach the caller).
+CREATE OR REPLACE PROCEDURE vvector.set_index_options_core(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                           x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                           x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
     IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) = 0 THEN
@@ -447,6 +451,9 @@ BEGIN
     IF x_thr IS NOT NULL AND (x_thr < 0 OR x_thr > 64) THEN
         RAISE EXCEPTION 'vvector.set_index_options: threads_default must be 0 (one per core) to 64';
     END IF;
+    IF x_verify IS NOT NULL AND x_verify < 0 THEN
+        RAISE EXCEPTION 'vvector.set_index_options: verify_every must be 0 (never), 1 (every refresh) or more';
+    END IF;
 
     PERFORM UPDATE vvector.manifest SET
         index_type = COALESCE(x_type, index_type),
@@ -460,10 +467,33 @@ BEGIN
         precision_default = CASE WHEN x_prec IS NULL THEN precision_default WHEN x_prec = 'default' THEN NULL ELSE x_prec END,
         freshness_default = CASE WHEN x_fresh IS NULL THEN freshness_default WHEN x_fresh = 'default' THEN NULL ELSE x_fresh END,
         ef_search_default = CASE WHEN x_ef IS NULL THEN ef_search_default WHEN x_ef = 0 THEN NULL ELSE x_ef END,
-        threads_default = CASE WHEN x_thr IS NULL THEN threads_default WHEN x_thr = 0 THEN NULL ELSE x_thr END
+        threads_default = CASE WHEN x_thr IS NULL THEN threads_default WHEN x_thr = 0 THEN NULL ELSE x_thr END,
+        verify_every = COALESCE(x_verify, verify_every)
         WHERE index_name = nm;
     PERFORM COMMIT;
     PERFORM CALL vvector.push_options(nm);
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify);
+    RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
+END;
+$$;
+
+-- The 13-argument form of the first releases: verify_every stays as it is.
+CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
+                                                x_prec, x_fresh, x_ef, x_thr, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
@@ -473,11 +503,11 @@ CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT) LANGUAGE 
 DECLARE
     want INT; got INT;
 BEGIN
-    want := (SELECT COUNT(*) FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
-    got := EXECUTE 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector.vload(byte_offset, chunk USING PARAMETERS index_name='
+    want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    got := EXECUTE 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='
         || QUOTE_LITERAL(nm) || ', snapshot_id=' || sid || ') OVER(PARTITION NODES) FROM (SELECT s.byte_offset, s.chunk '
         || 'FROM vvector.snapshot s CROSS JOIN vvector.probe p WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
-        || ' AND p.k IN (SELECT k FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ''loaded''';
+        || ' AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ''loaded''';
     IF got IS NULL OR got < want THEN
         RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes', nm, sid, COALESCE(got, 0), want;
     END IF;
@@ -565,8 +595,24 @@ BEGIN
     every := (SELECT MAX(rebuild_every) FROM vvector.manifest WHERE index_name = nm);
     RAISE NOTICE 'vvector: index %: % index, % live vectors, % tombstones (tombstone_ratio %), refresh_mode %, % incremental refreshes since the last full build (rebuild_every %)',
                  nm, kind, live, tomb, ratio, COALESCE(rmode, 'auto'), since, COALESCE(every::VARCHAR, 'never');
+    IF ver IS NOT NULL THEN
+        RAISE NOTICE 'vvector: index %: journal digest verified %; % refreshes since the last verification or full build', nm,
+                     (SELECT CASE WHEN COALESCE(MAX(verify_every), 1) = 0 THEN 'never (verify_every 0): after a physical UPDATE, DELETE or dropped partition run refresh_index(name, ''full'')'
+                                  WHEN COALESCE(MAX(verify_every), 1) = 1 THEN 'at every refresh (verify_every 1)'
+                                  ELSE 'every ' || MAX(verify_every) || ' refreshes (verify_every ' || MAX(verify_every) || ')' END
+                      FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT COALESCE(MAX(refreshes_since_verify), 0) FROM vvector.manifest WHERE index_name = nm);
+    END IF;
     RAISE NOTICE 'vvector: index %: last refresh: %', nm,
                  (SELECT COALESCE(MAX(refresh_note), 'none yet') FROM vvector.manifest WHERE index_name = nm);
+    IF (SELECT COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
+        RAISE NOTICE 'vvector: index %: a refresh is running since % (by %)%', nm,
+                     (SELECT TO_CHAR(MAX(refresh_started_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC' FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT MAX(refresh_started_by) FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT CASE WHEN MAX(refresh_started_at) < CLOCK_TIMESTAMP() - INTERVAL '6 hours'
+                                  THEN ': its mark is older than 6 hours and the next refresh ignores it' ELSE '' END
+                      FROM vvector.manifest WHERE index_name = nm);
+    END IF;
     IF tomb > ratio * (live + tomb) AND COALESCE(rmode, 'auto') = 'incremental' THEN
         RAISE WARNING 'vvector: index %: % of % positions are tombstones: searches pass through them. refresh_mode incremental never rebuilds by itself: run CALL vvector.refresh_index(''%'', ''full'') when the node is quiet.', nm, tomb, live + tomb, nm;
     END IF;
@@ -647,11 +693,13 @@ $$;
 --                rebuild_every incremental refreshes
 -- A full build is always made for the first build, a static index (no version column), changed
 -- build options (index_type, metric, m, ef_construction, quantization) or library format, a node
--- whose cache does not hold the active snapshot, and when rows up to the previous boundary were
--- removed or added afterwards (a physical DELETE, dropped partitions, versions set by hand): the
--- number of those rows is counted at every refresh and compared at the next.
+-- whose cache does not hold the active snapshot, and when the rows up to the previous boundary are
+-- not the rows the last refresh saw (a physical DELETE or UPDATE, dropped partitions, versions set
+-- by hand): their count and digest, carried forward from refresh to refresh, are recomputed and
+-- compared every verify_every refreshes.
 -- The outcome goes to manifest refresh_note: NOTICEs of a nested CALL do not reach the caller.
-CREATE OR REPLACE PROCEDURE vvector.refresh_index_core(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
+-- refresh_index_core runs this with the guard against a second refresh of the same index.
+CREATE OR REPLACE PROCEDURE vvector.refresh_index_run(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128); sch VARCHAR(128); tbl VARCHAR(128);
     measure VARCHAR(16); kind VARCHAR(16); quant VARCHAR(16); hm INT; hefc INT; margin INT;
@@ -660,7 +708,9 @@ DECLARE
     source VARCHAR(4000); del_expr VARCHAR(400); v_expr VARCHAR(400);
     t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT; n_graph INT; n_tomb INT;
     rmode VARCHAR(16); ratio FLOAT; every INT; since INT; opts VARCHAR(200); prev_opts VARCHAR(200); prev_fmt INT;
-    prev_vec INT; prev_tomb INT; prev_max INT; rows_then INT; rows_now INT; rows_next INT; want INT; got INT; counts VARCHAR(64);
+    prev_vec INT; prev_tomb INT; prev_max INT; rows_then INT; rows_now INT; rows_next INT; want INT; got INT; counts VARCHAR(200);
+    digest_then VARCHAR(64); digest_now VARCHAR(64); digest_next VARCHAR(64); h_expr VARCHAR(600);
+    v_every INT; v_since INT; verify BOOLEAN; t_scan TIMESTAMPTZ; scan_secs FLOAT; j_note VARCHAR(300);
     why VARCHAR(600); r_note VARCHAR(1000); build_opts VARCHAR(400);
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
@@ -693,7 +743,10 @@ BEGIN
     prev_vec := (SELECT COALESCE(MAX(m.vector_count), 0) FROM vvector.manifest m WHERE m.index_name = nm);
     prev_tomb := (SELECT COALESCE(MAX(m.tombstones), 0) FROM vvector.manifest m WHERE m.index_name = nm);
     rows_then := (SELECT MAX(m.boundary_rows) FROM vvector.manifest m WHERE m.index_name = nm);
+    digest_then := (SELECT MAX(m.boundary_digest)::VARCHAR FROM vvector.manifest m WHERE m.index_name = nm);   -- digests are compared as text: PL/vSQL declares no NUMERIC(38,0)
     prev_max := (SELECT MAX(m.active_max_ver) FROM vvector.manifest m WHERE m.index_name = nm);
+    v_every := (SELECT COALESCE(MAX(m.verify_every), 1) FROM vvector.manifest m WHERE m.index_name = nm);
+    v_since := (SELECT COALESCE(MAX(m.refreshes_since_verify), 0) FROM vvector.manifest m WHERE m.index_name = nm);
     fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
     -- The options a snapshot is built with. A snapshot can only be continued with the same ones.
     opts := kind || ' ' || measure || ' ' || quant || CASE WHEN kind = 'hnsw' THEN ' m=' || hm || ' ef_construction=' || hefc ELSE '' END;
@@ -774,27 +827,75 @@ BEGIN
         why := since || ' incremental refreshes since the last full build (rebuild_every ' || every || ')';
     END IF;
     IF why IS NULL THEN
-        want := (SELECT COUNT(*) FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+        want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
         got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm)
             || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE loaded AND snapshot_id = ' || prev;
         IF COALESCE(got, 0) < want THEN
             why := 'the active snapshot ' || prev || ' is in the cache of ' || COALESCE(got, 0) || ' of ' || want || ' nodes';
         END IF;
     END IF;
-    -- Rows up to the previous boundary, compared with the count of the last refresh, and rows up to
-    -- the new boundary, compared at the next refresh. One scan of the version column.
+    -- The journal rows up to the previous boundary must be the rows the last refresh saw: a physical
+    -- DELETE or UPDATE, a dropped partition, or a row written with an old version by hand changes
+    -- them, and then the build must be full. The manifest keeps their count and digest (the sum of
+    -- HASH over the columns vvector reads: id, vector, delete flag, version). They are carried forward
+    -- from the journal rows between the previous and the new boundary (all rows, before the
+    -- consolidation per id), which a refresh reads anyway. The verification recomputes both over every
+    -- row up to the previous boundary, the vectors included, and compares: at every refresh with
+    -- verify_every 1 (the default), every N refreshes with N, never with 0. A full build stores exact
+    -- values (one scan up to the new boundary). An index without a digest yet gets it by one scan,
+    -- which also checks the count.
     rows_next := NULL;
+    digest_next := NULL;
+    j_note := NULL;
+    verify := FALSE;
+    IF ver IS NOT NULL THEN
+        h_expr := 'HASH(' || idc || ', ' || vc || CASE WHEN op IS NULL THEN '' ELSE ', ' || op END || ', ' || ver || ')::NUMERIC(38,0)';
+    END IF;
     IF why IS NULL THEN
-        counts := EXECUTE 'SELECT COUNT(CASE WHEN ' || ver || ' <= ' || prev_from || ' THEN 1 END) || '' '' || COUNT(CASE WHEN '
-            || ver || ' <= ' || v_from || ' THEN 1 END) FROM ' || tab;
-        rows_now := SPLIT_PART(counts, ' ', 1)::INT;
-        rows_next := SPLIT_PART(counts, ' ', 2)::INT;
-        IF rows_now <> rows_then THEN
+        verify := digest_then IS NULL OR (v_every > 0 AND v_since + 1 >= v_every);
+        t_scan := (SELECT CLOCK_TIMESTAMP());
+        IF verify THEN
+            counts := EXECUTE 'SELECT /*+LABEL(vvector_verify)*/ COUNT(CASE WHEN jv <= ' || prev_from || ' THEN 1 END) || '' '' || COALESCE(SUM(CASE WHEN jv <= '
+                || prev_from || ' THEN jh END), 0) || '' '' || COUNT(CASE WHEN jv <= ' || v_from || ' THEN 1 END) || '' '' || COALESCE(SUM(CASE WHEN jv <= '
+                || v_from || ' THEN jh END), 0) FROM (SELECT ' || ver || ' AS jv, ' || h_expr || ' AS jh FROM ' || tab
+                || ' WHERE ' || ver || ' <= ' || prev_from || ' OR ' || ver || ' <= ' || v_from || ') j';
+            rows_now := SPLIT_PART(counts, ' ', 1)::INT;
+            digest_now := SPLIT_PART(counts, ' ', 2);
+            rows_next := SPLIT_PART(counts, ' ', 3)::INT;
+            digest_next := SPLIT_PART(counts, ' ', 4);
+        ELSE
+            counts := EXECUTE 'SELECT /*+LABEL(vvector_digest)*/ (' || rows_then || ' + COUNT(*)) || '' '' || (' || digest_then
+                || '::NUMERIC(38,0) + COALESCE(SUM(' || h_expr || '), 0)) FROM ' || tab
+                || ' WHERE ' || ver || ' > ' || prev_from || ' AND ' || ver || ' <= ' || v_from;
+            rows_next := SPLIT_PART(counts, ' ', 1)::INT;
+            digest_next := SPLIT_PART(counts, ' ', 2);
+        END IF;
+        scan_secs := (SELECT DATEDIFF('millisecond', t_scan, CLOCK_TIMESTAMP()) / 1000.0);
+        IF verify AND rows_now <> rows_then THEN
             why := 'the journal has ' || rows_now || ' rows up to the previous boundary, the last refresh counted ' || rows_then
-                || ' (a physical DELETE, dropped partitions, or versions set by hand)';
+                || ' (a physical DELETE or UPDATE, dropped partitions, or versions set by hand)';
+        ELSIF verify AND digest_then IS NOT NULL AND digest_now <> COALESCE(digest_then, '') THEN
+            why := 'the journal rows up to the previous boundary changed since the last refresh: same count (' || rows_now
+                || '), other digest (a physical UPDATE, or rows replaced by hand)';
+        END IF;
+        IF verify AND digest_then IS NULL THEN
+            j_note := 'journal digest taken for the first time in ' || scan_secs || ' seconds (row count verified)';
+        ELSIF verify THEN
+            j_note := 'journal verified in ' || scan_secs || ' seconds';
+        ELSIF v_every = 0 THEN
+            j_note := 'journal not verified (verify_every 0)';
+        ELSE
+            j_note := 'journal not verified (verify_every ' || v_every || ', last verified ' || (v_since + 1) || ' refreshes ago)';
         END IF;
     ELSIF ver IS NOT NULL THEN
-        rows_next := EXECUTE 'SELECT COUNT(*) FROM ' || tab || ' WHERE ' || ver || ' <= ' || v_from;
+        t_scan := (SELECT CLOCK_TIMESTAMP());
+        counts := EXECUTE 'SELECT /*+LABEL(vvector_digest)*/ COUNT(*) || '' '' || COALESCE(SUM(' || h_expr || '), 0) FROM ' || tab
+            || ' WHERE ' || ver || ' <= ' || v_from;
+        rows_next := SPLIT_PART(counts, ' ', 1)::INT;
+        digest_next := SPLIT_PART(counts, ' ', 2);
+        verify := TRUE;
+        scan_secs := (SELECT DATEDIFF('millisecond', t_scan, CLOCK_TIMESTAMP()) / 1000.0);
+        j_note := 'journal digest taken in ' || scan_secs || ' seconds';
     END IF;
 
     -- 3. The rows to build from.
@@ -822,7 +923,7 @@ BEGIN
                || ', quantization=' || QUOTE_LITERAL(quant) || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || max_ver
                || CASE WHEN why IS NULL THEN ', base_snapshot=' || prev ELSE '' END;
     EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
-         || ', byte_offset, chunk FROM (SELECT vvector.vbuild(id, vec, del USING PARAMETERS ' || build_opts
+         || ', byte_offset, chunk FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS ' || build_opts
          || ') OVER() FROM (' || source || ') e) b';
     PERFORM COMMIT;
     chunks := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
@@ -835,9 +936,9 @@ BEGIN
         -- boundary. Only the boundary moves; nothing is loaded.
         secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
         r_note := 'refreshed: snapshot ' || prev || ' kept, no vector changed since it was built; the delta starts at the new boundary; '
-               || secs || ' seconds';
+               || secs || ' seconds' || COALESCE('; ' || j_note, '');
         PERFORM UPDATE vvector.manifest SET active_max_ver = max_ver, delta_from = v_from, boundary_rows = rows_next,
-                       built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = r_note
+                       boundary_digest = digest_next::NUMERIC(38,0), refreshes_since_verify = CASE WHEN verify THEN 0 ELSE v_since + 1 END, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = r_note
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
@@ -863,12 +964,13 @@ BEGIN
             r_note := 'refreshed: snapshot ' || sid || ', full build (' || why || '), ';
         END IF;
         r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
-               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds';
+               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds' || COALESCE('; ' || j_note, '');
         PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
                        base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
                        graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
                        active_options = opts, incremental_count = CASE WHEN why IS NULL THEN since + 1 ELSE 0 END,
-                       boundary_rows = rows_next, refresh_note = r_note
+                       boundary_rows = rows_next, boundary_digest = digest_next::NUMERIC(38,0),
+                       refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = r_note
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
@@ -882,6 +984,48 @@ BEGIN
     IF ver IS NOT NULL THEN
         PERFORM CALL vvector.apply_replica(nm);
     END IF;
+END;
+$$;
+
+-- At most one refresh of an index at a time (two would load, record and delete each other's
+-- snapshots). A refresh marks the manifest row (refresh_started_at, refresh_started_by) with one
+-- conditional UPDATE: the UPDATE of a second refresh waits for the lock on the manifest, then finds
+-- the mark and changes nothing, and that refresh stops with an error. The mark is removed when the
+-- refresh ends, also when it fails. A mark left behind by a refresh that could not remove it (its
+-- session was killed, its node went down) is ignored after 6 hours, or removed by hand (the error
+-- message gives the statement).
+CREATE OR REPLACE PROCEDURE vvector.refresh_index_core(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    me VARCHAR(200); t_start TIMESTAMPTZ; holder VARCHAR(200); since TIMESTAMPTZ;
+BEGIN
+    IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) = 0 THEN
+        RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
+    END IF;
+    IF x_mode IS NOT NULL AND x_mode NOT IN ('auto', 'incremental', 'full') THEN
+        RAISE EXCEPTION 'vvector.refresh_index: mode must be auto, incremental or full';
+    END IF;
+    me := (SELECT CURRENT_USER() || ', session ' || session_id FROM v_monitor.current_session);
+    t_start := (SELECT CLOCK_TIMESTAMP());
+    PERFORM UPDATE vvector.manifest SET refresh_started_at = t_start, refresh_started_by = me
+            WHERE index_name = nm AND (refresh_started_at IS NULL OR refresh_started_at < t_start - INTERVAL '6 hours');
+    PERFORM COMMIT;
+    since := (SELECT MAX(refresh_started_at) FROM vvector.manifest WHERE index_name = nm);
+    holder := (SELECT MAX(refresh_started_by) FROM vvector.manifest WHERE index_name = nm);
+    IF since IS NULL OR since <> t_start OR COALESCE(holder, '') <> me THEN
+        RAISE EXCEPTION 'vvector.refresh_index: index % is being refreshed since % (by %). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored 6 hours after its start, or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = ''%''; COMMIT;',
+                        nm, COALESCE(TO_CHAR(since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC', '?'), COALESCE(holder, '?'), nm;
+    END IF;
+    BEGIN
+        PERFORM CALL vvector.refresh_index_run(nm, x_mode);
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM UPDATE vvector.manifest SET refresh_started_at = NULL, refresh_started_by = NULL
+                WHERE index_name = nm AND refresh_started_at = t_start;
+        PERFORM COMMIT;
+        RAISE EXCEPTION '%', SQLERRM;
+    END;
+    PERFORM UPDATE vvector.manifest SET refresh_started_at = NULL, refresh_started_by = NULL
+            WHERE index_name = nm AND refresh_started_at = t_start;
+    PERFORM COMMIT;
 END;
 $$;
 
@@ -936,8 +1080,15 @@ BEGIN
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.unregister_index: index % is not registered', nm;
     END IF;
-    EXECUTE 'DROP TRIGGER IF EXISTS vvector.' || nm || '_refresh_trigger';
-    EXECUTE 'DROP SCHEDULE IF EXISTS vvector.' || nm || '_refresh_schedule';
+    -- Only a superuser may drop a trigger, even with IF EXISTS: drop them only when schedule_refresh made them.
+    IF (SELECT COUNT(*) FROM v_catalog.stored_proc_triggers WHERE LOWER(schema_name) = 'vvector'
+                                                          AND LOWER(trigger_name) = LOWER(nm || '_refresh_trigger')) > 0 THEN
+        EXECUTE 'DROP TRIGGER IF EXISTS vvector.' || nm || '_refresh_trigger';
+    END IF;
+    IF (SELECT COUNT(*) FROM v_catalog.user_schedules WHERE LOWER(schema_name) = 'vvector'
+                                                      AND LOWER(schedule_name) = LOWER(nm || '_refresh_schedule')) > 0 THEN
+        EXECUTE 'DROP SCHEDULE IF EXISTS vvector.' || nm || '_refresh_schedule';
+    END IF;
     PERFORM UPDATE vvector.manifest SET journal_replica = 'off' WHERE index_name = nm;
     PERFORM COMMIT;
     PERFORM CALL vvector.apply_replica(nm);     -- drops the replica unless another index shares it
@@ -963,10 +1114,13 @@ REVOKE EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHA
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM PUBLIC;
@@ -975,6 +1129,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;
@@ -990,3 +1146,4 @@ GRANT EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) TO vvector_admin;

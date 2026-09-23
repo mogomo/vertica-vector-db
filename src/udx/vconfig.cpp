@@ -1,6 +1,6 @@
 // vconfig: writes the index defaults of set_index_options into the cache of every node, where
 // vsearch reads them (a query cannot read the manifest table).
-//   vvector.vconfig(k USING PARAMETERS index_name='docs', options='precision=best,threads=4')
+//   vvector_admin.vconfig(k USING PARAMETERS index_name='docs', options='precision=best,threads=4')
 //       OVER(PARTITION NODES) FROM vvector.probe
 // options: name=value items, names precision, freshness, ef_search, threads; an empty value or a
 // missing name = the built-in default. Output (node_name, status). Called by the procedures; role

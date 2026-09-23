@@ -55,7 +55,7 @@ expect "vbuild into vvector.snapshot" "^chunks: [1-9]" "
 DELETE FROM vvector.snapshot WHERE index_name = 'vvtest';
 INSERT INTO vvector.snapshot
 SELECT 'vvtest', 1, byte_offset, chunk FROM (
-  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest', metric='cosine', max_ver=4711) OVER()
+  SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest', metric='cosine', max_ver=4711) OVER()
   FROM $SCHEMA.vectors) b;
 COMMIT;
 SELECT 'chunks: ' || COUNT(*) FROM vvector.snapshot WHERE index_name = 'vvtest';"
@@ -63,17 +63,17 @@ SELECT 'chunks: ' || COUNT(*) FROM vvector.snapshot WHERE index_name = 'vvtest';
 expect "vload on every node" "^loaded on all nodes" "
 SELECT CASE WHEN l.loaded = u.up THEN 'loaded on all nodes' ELSE 'loaded on ' || l.loaded || ' of ' || u.up || ' nodes' END
 FROM (SELECT COUNT(DISTINCT node_name) AS loaded
-      FROM (SELECT vvector.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
+      FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
             FROM (SELECT s.byte_offset, s.chunk FROM vvector.snapshot s CROSS JOIN vvector.probe p
                   WHERE s.index_name = 'vvtest' AND s.snapshot_id = 1
-                    AND p.k IN (SELECT k FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) g WHERE status = 'loaded') l
+                    AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) g WHERE status = 'loaded') l
 CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
 
 expect "vload again (idempotent)" "^loaded$" "
-SELECT DISTINCT status FROM (SELECT vvector.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
+SELECT DISTINCT status FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
       FROM (SELECT s.byte_offset, s.chunk FROM vvector.snapshot s CROSS JOIN vvector.probe p
                   WHERE s.index_name = 'vvtest' AND s.snapshot_id = 1
-                    AND p.k IN (SELECT k FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l;"
+                    AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l;"
 
 expect "vinfo: count, dims, metric and watermark match on every node" "^vinfo ok" "
 SELECT CASE WHEN i.nodes_reporting = u.up AND i.min_count = t.n AND i.max_count = t.n AND i.min_dims = $DIMS
@@ -89,51 +89,51 @@ CROSS JOIN (SELECT COUNT(*) AS n FROM $SCHEMA.vectors) t;"
 echo "== vbuild input rules"
 expect "ARRAY[INT] vectors are accepted (Vertica converts them to ARRAY[FLOAT])" "^built: 2 vectors of 3$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+  SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
   FROM (SELECT 1 AS id, ARRAY[1, 2, 3] AS vec UNION ALL SELECT 2, ARRAY[4, 5, 6]) v) b;"
 # Not in one query with the INT arrays: a UNION of ARRAY[INT] and ARRAY[NUMERIC] fails inside Vertica 26.2.
 expect "ARRAY[NUMERIC] vectors are accepted" "^built: 2 vectors of 3$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+  SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
   FROM (SELECT 1 AS id, ARRAY[1.5, 2.5, 3.5]::ARRAY[NUMERIC(6,2)] AS vec UNION ALL SELECT 2, ARRAY[1, 2, 3]::ARRAY[NUMERIC(6,2)]) v) b;"
 expect "a repeated id is refused" "id 7 appears twice" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 7 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 7, ARRAY[3.0, 4.0]) v;"
 expect "vectors of different lengths are refused" "has 3 elements, the ones before have 2" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 2, ARRAY[3.0, 4.0, 5.0]) v;"
 expect "a NULL vector is refused" "the vector of id 2 is NULL (a delete needs del = true)" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 2, NULL::ARRAY[FLOAT]) v;"
 expect "a NULL element is refused" "the vector of id 1 has a NULL element" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, NULL]::ARRAY[FLOAT] AS vec) v;"
 expect "an unknown metric is refused" "metric must be l2, cosine, dot or l1" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', metric='hamming') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', metric='hamming') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "index_type hnsw builds a graph, also of one vector" "^built: 1 vectors of 2$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER()
+  SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER()
   FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v) b;"
 expect "an unknown index_type is refused" "index_type must be flat or hnsw, not 'ivf'" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='ivf') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='ivf') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "quantization sq8 says when it comes" "quantization sq8 is not implemented yet (milestone M4)" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "an incremental build needs its base snapshot in the node cache" "base snapshot 5 is not usable in the cache of .*refresh with mode full" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5$CD) OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5$CD) OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "rows with del = true are left out of a full build; l1 is a metric" "^built: 2 vectors of 2$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec, del USING PARAMETERS index_name='vvtest_x', metric='l1') OVER()
+  SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='vvtest_x', metric='l1') OVER()
   FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec, FALSE AS del UNION ALL SELECT 2, ARRAY[3.0, 4.0], TRUE
         UNION ALL SELECT 3, ARRAY[5.0, 6.0], NULL) v) b;"
 expect "a NaN element is refused" "element 2 is not a finite float32 value" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 'NaN'::FLOAT] AS vec) v;"
 expect "a value beyond the float32 range is refused" "element 1 is not a finite float32 value" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1e300, 1.0] AS vec) v;"
 
 echo "== vsearch and cache rules"

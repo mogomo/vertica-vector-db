@@ -5,11 +5,25 @@
 -- Safe to run again: tables and their data are kept; missing manifest columns are added.
 \set ON_ERROR_STOP on
 
+-- Upgrade from a version that had vbuild, vload, vconfig and vnode in schema vvector. They move to
+-- schema vvector_admin. DROP FUNCTION cannot name a function with an ARRAY argument (Vertica 26.2:
+-- syntax error at "ARRAY"), so the library is dropped with all its functions and made again below.
+-- The tables, the procedures and the views do not depend on it.
+DO $$
+BEGIN
+    IF (SELECT COUNT(*) FROM v_catalog.user_functions WHERE schema_name = 'vvector' AND function_name = 'vbuild') > 0 THEN
+        EXECUTE 'DROP LIBRARY vvector CASCADE';
+    END IF;
+END;
+$$;
+
 CREATE OR REPLACE LIBRARY vvector AS :libfile LANGUAGE 'C++';
 
 -- Catalog. UNSEGMENTED ALL NODES: every node holds a full copy, so the
 -- snapshot is backed up and replicated like any other table.
 CREATE SCHEMA IF NOT EXISTS vvector;
+-- The functions that build and load snapshots (vbuild, vload, vconfig, vnode): role vvector_admin only.
+CREATE SCHEMA IF NOT EXISTS vvector_admin;
 
 CREATE TABLE IF NOT EXISTS vvector.snapshot (
     index_name   VARCHAR(64) NOT NULL,
@@ -39,6 +53,7 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS memory_mode VARCHAR(16) DE
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_mode VARCHAR(16) DEFAULT 'auto';
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS tombstone_ratio FLOAT DEFAULT 0.2;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS rebuild_every INT DEFAULT NULL;
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS verify_every INT DEFAULT 1;               -- verify the journal digest every N refreshes, 0 = never
 -- Query defaults (set_index_options; NULL = the built-in default; the next query uses them):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS precision_default VARCHAR(16) DEFAULT NULL;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS freshness_default VARCHAR(16) DEFAULT NULL;
@@ -60,6 +75,10 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS format_version INT DEFAULT
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS active_options VARCHAR(200) DEFAULT NULL;    -- build options of the active snapshot
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS incremental_count INT DEFAULT NULL;         -- incremental refreshes since the last full build
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS boundary_rows INT DEFAULT NULL;             -- journal rows with ver_col <= delta_from at the last refresh
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS boundary_digest NUMERIC(38,0) DEFAULT NULL; -- sum of HASH(id, vec, op, ver) over those rows
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refreshes_since_verify INT DEFAULT NULL;    -- refreshes since the digest was last verified
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_started_at TIMESTAMPTZ DEFAULT NULL; -- set while a refresh runs (at most one at a time)
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_started_by VARCHAR(200) DEFAULT NULL; -- user and session of that refresh
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_note VARCHAR(1000) DEFAULT NULL;    -- what the last refresh did and why
 -- Journal replica (set_journal_replica; kept up to date by register_index and refresh_index):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS journal_replica VARCHAR(16) DEFAULT 'auto';     -- auto, on or off
@@ -87,30 +106,29 @@ COMMIT;
 CREATE ROLE vvector_admin;
 \set ON_ERROR_STOP on
 
--- Functions live in schema vvector. Call them as vvector.vsearch(...) or put vvector
--- on the search path.
-CREATE OR REPLACE TRANSFORM FUNCTION vvector.vbuild   AS LANGUAGE 'C++' NAME 'VBuildFactory'   LIBRARY vvector :fenced_build;
-CREATE OR REPLACE TRANSFORM FUNCTION vvector.vload    AS LANGUAGE 'C++' NAME 'VLoadFactory'    LIBRARY vvector :fenced_build;
-CREATE OR REPLACE TRANSFORM FUNCTION vvector.vconfig  AS LANGUAGE 'C++' NAME 'VConfigFactory'  LIBRARY vvector :fenced_build;
-CREATE OR REPLACE TRANSFORM FUNCTION vvector.vnode    AS LANGUAGE 'C++' NAME 'VNodeFactory'    LIBRARY vvector :fenced_build;
+-- Search and information functions live in schema vvector: call them as vvector.vsearch(...) or put
+-- vvector on the search path. The build and load functions live in schema vvector_admin.
+CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vbuild   AS LANGUAGE 'C++' NAME 'VBuildFactory'   LIBRARY vvector :fenced_build;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vload    AS LANGUAGE 'C++' NAME 'VLoadFactory'    LIBRARY vvector :fenced_build;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vconfig  AS LANGUAGE 'C++' NAME 'VConfigFactory'  LIBRARY vvector :fenced_build;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vnode    AS LANGUAGE 'C++' NAME 'VNodeFactory'    LIBRARY vvector :fenced_build;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vsearch  AS LANGUAGE 'C++' NAME 'VSearchFactory'  LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vknn     AS LANGUAGE 'C++' NAME 'VKnnFactory'     LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vinfo    AS LANGUAGE 'C++' NAME 'VInfoFactory'    LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vversion AS LANGUAGE 'C++' NAME 'VVersionFactory' LIBRARY vvector :fenced_search;
 
--- Rights. vload and vconfig write files on the nodes and the procedures change the catalog:
--- vvector_admin only. The other functions only read their input or the node cache: everyone.
--- GRANT and REVOKE cannot name a function with an ARRAY argument (Vertica 26.2: syntax error at
--- "ARRAY"). So all functions of the schema are granted to PUBLIC in one statement, which also
--- reaches stored procedures, and vload, vconfig and the procedures are revoked again (procedures.sql).
--- vbuild stays open: it writes nothing, it turns its input rows into bytes.
+-- Rights. GRANT and REVOKE cannot name a function with an ARRAY argument (Vertica 26.2: syntax error
+-- at "ARRAY"), so rights are given per schema:
+--   vvector        vsearch, vknn, vinfo, vversion: everyone (PUBLIC). This also reaches the stored
+--                  procedures, so procedures.sql revokes them again and grants them to vvector_admin.
+--   vvector_admin  vbuild, vload, vconfig, vnode: role vvector_admin only. vload and vconfig write
+--                  files on the nodes; vbuild with base_snapshot reads a whole snapshot from the node
+--                  cache, so it must not be open to users who may not read the indexed tables.
 GRANT USAGE ON SCHEMA vvector TO PUBLIC;
 GRANT SELECT ON vvector.manifest, vvector.probe TO PUBLIC;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector TO PUBLIC;
-REVOKE EXECUTE ON TRANSFORM FUNCTION vvector.vload(INT, LONG VARBINARY) FROM PUBLIC;
-GRANT EXECUTE ON TRANSFORM FUNCTION vvector.vload(INT, LONG VARBINARY) TO vvector_admin;
-REVOKE EXECUTE ON TRANSFORM FUNCTION vvector.vconfig(INT) FROM PUBLIC;
-GRANT EXECUTE ON TRANSFORM FUNCTION vvector.vconfig(INT) TO vvector_admin;
+GRANT USAGE ON SCHEMA vvector_admin TO vvector_admin;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector_admin TO vvector_admin;
 GRANT ALL ON vvector.snapshot, vvector.manifest TO vvector_admin;
 GRANT SELECT ON SEQUENCE vvector.snapshot_seq TO vvector_admin;
 
