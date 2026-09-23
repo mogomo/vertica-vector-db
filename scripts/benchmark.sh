@@ -43,7 +43,7 @@ IX=sift
 OUT="build/benchmark-$(date +%Y%m%d-%H%M%S).txt"
 if [ "$ECHO_ONLY" = yes ]; then
     echo "scripts/load_dataset.sh --dataset=sift --dir=$DATA_DIR --schema=$SCHEMA"
-    echo "CALL vvector.register_index('$IX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL); CALL vvector.refresh_index('$IX');"
+    echo "CALL vvector.register_index('$IX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'flat'); CALL vvector.refresh_index('$IX');"
     echo "make bench DATA_DIR=$DATA_DIR"
     for m in ${MODES//,/ }; do echo "scripts/deploy.sh --fenced=$m; full scan; scripts/latency.sh --index=$IX --schema=$SCHEMA --runs=$RUNS; batch of $BATCH; recall@10"; done
     exit 0
@@ -70,7 +70,7 @@ TAG="vvbench$(date +%s)"
 echo; echo "== refresh of the index (FENCED=yes)"
 scripts/deploy.sh --fenced=yes > /dev/null 2>&1
 sql "CALL vvector.unregister_index('$IX');" > /dev/null 2>&1 || true
-sql "CALL vvector.register_index('$IX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL);" > /dev/null 2>&1
+sql "CALL vvector.register_index('$IX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'flat');" > /dev/null 2>&1
 start=$(date +%s%N)
 sql "CALL vvector.refresh_index('$IX');" > /dev/null 2>&1
 printf "%-58s %12.3f s\n" "refresh_index, 1M x 128 (all steps)" "$(awk -v ns=$(( $(date +%s%N) - start )) 'BEGIN {print ns / 1e9}')"

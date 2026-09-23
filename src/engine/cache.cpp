@@ -1,4 +1,5 @@
 #include "cache.h"
+#include "hnsw.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -241,6 +242,7 @@ void MappedSnapshot::open(const std::string &path, bool verify)
     path_ = path;
     try {
         set_ = snapshot_open(static_cast<const std::uint8_t *>(map_), size_, verify);
+        if (verify && set_.has_graph()) hnsw_open(set_, true);
     } catch (const std::runtime_error &e) {
         throw std::runtime_error(std::string(e.what()) + " in " + path);
     }

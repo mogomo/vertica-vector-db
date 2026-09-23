@@ -1,36 +1,102 @@
-// vvector engine: HNSW index. STUB.
-// The interface is fixed so that vbuild, the snapshot format (FLAG_HNSW, off_graph) and
-// vsearch can be wired now. Every call throws until the index is written (milestone M2).
+// vvector engine: HNSW graph index (Malkov and Yashunin, TPAMI 2018; the mechanics follow hnswlib).
+// The graph is built in place into the graph section of a snapshot (SnapshotBuilder::finish with
+// hnsw_graph_section) and searched straight from the mapped file. Vectors stay in the vectors
+// section: the flat search and the graph search read the same rows.
+//
+// Graph section (docs/format.md), every part on a 64-byte boundary from the section start:
+//   header       64 bytes, HnswHeader
+//   levels       uint8[count]: the top level of every position
+//   level0       count blocks of (m0 + 1) uint32: n, then n neighbour positions; m0 = 2 x m
+//   upper_index  uint32[count]: the first upper block of a position, NO_UPPER when its level is 0
+//   upper        for every position of level L >= 1, in position order, L blocks of (m + 1) uint32
+//                (n, then n neighbours) for the levels 1 .. L
 #ifndef VVECTOR_ENGINE_HNSW_H
 #define VVECTOR_ENGINE_HNSW_H
 
+#include "flat.h"
 #include "snapshot.h"
 
 #include <cstdint>
-#include <stdexcept>
-#include <utility>
+#include <functional>
 #include <vector>
 
 namespace vvector {
 
+constexpr std::uint32_t HNSW_MIN_M = 2;
+constexpr std::uint32_t HNSW_MAX_M = 256;
+constexpr std::uint32_t HNSW_MAX_LEVEL = 32;
+constexpr std::uint32_t HNSW_NO_UPPER = 0xFFFFFFFFu;
+constexpr std::uint64_t HNSW_HEADER_BYTES = 64;
+constexpr std::uint64_t HNSW_LEVEL_SEED = 0x76766563746f7231ull;
+
+struct HnswHeader {
+    std::uint32_t m;               // links per node on the levels above 0
+    std::uint32_t m0;              // links per node on level 0: 2 x m
+    std::uint32_t ef_construction;
+    std::uint32_t max_level;       // level of the entry point
+    std::uint32_t entry_point;     // position where every search starts
+    std::uint32_t reserved0;
+    std::uint64_t count;           // positions, as in the snapshot header
+    std::uint64_t level_seed;      // levels are a function of (level_seed, id)
+    std::uint64_t upper_blocks;    // blocks in the upper part: the sum of all levels
+    std::uint64_t reserved[2];
+};
+static_assert(sizeof(HnswHeader) == HNSW_HEADER_BYTES, "graph header must be 64 bytes");
+
 struct HnswParams {
-    std::uint32_t m = 16;                  // links per node and layer (2 * m on layer 0)
+    std::uint32_t m = 16;                  // links per node and level (2 x m on level 0)
     std::uint32_t ef_construction = 200;   // candidate list size while building
+    int threads = 1;                       // build threads
 };
 
-// Builds the graph section of a snapshot for the vectors in s. Returns the section bytes.
-inline std::vector<std::uint8_t> hnsw_build(const VectorSet &, const HnswParams &)
-{
-    throw std::runtime_error("HNSW is not implemented yet");
-}
+// The level of the node with this id: floor(-ln(u) / ln(m)) for u in (0, 1] from a hash of
+// (seed, id), at most HNSW_MAX_LEVEL. The same id always gets the same level.
+std::uint32_t hnsw_level(std::int64_t id, std::uint32_t m, std::uint64_t seed = HNSW_LEVEL_SEED);
 
-// Approximate k nearest neighbours of q: (position in s, score), best first.
-// ef_search >= k is the candidate list size of the search.
-inline std::vector<std::pair<std::uint64_t, float>> hnsw_search(const VectorSet &, const float *, std::uint32_t,
-                                                                std::uint32_t)
-{
-    throw std::runtime_error("HNSW is not implemented yet");
-}
+// The graph section of a snapshot, opened for reading.
+struct HnswGraph {
+    std::uint32_t m = 0, m0 = 0, ef_construction = 0, max_level = 0, entry_point = 0;
+    std::uint64_t count = 0, upper_blocks = 0;
+    const std::uint8_t *levels = nullptr;
+    const std::uint32_t *level0 = nullptr;
+    const std::uint32_t *upper_index = nullptr;
+    const std::uint32_t *upper = nullptr;
+
+    // The links of pos on a level: [0] = n, [1 .. n] = neighbour positions.
+    const std::uint32_t *links(std::uint32_t pos, std::uint32_t level) const
+    {
+        return level == 0 ? level0 + std::uint64_t(pos) * (m0 + 1)
+                          : upper + (std::uint64_t(upper_index[pos]) + level - 1) * (m + 1);
+    }
+};
+
+// Bytes of the graph section for these ids (in position order). Throws when m is out of range.
+std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::uint32_t m);
+
+// Builds the graph of the vectors of s into section (hnsw_section_bytes bytes, zero-filled).
+// Nodes are inserted in parallel as in hnswlib: a lock per group of link lists, a global lock only
+// while the entry point changes. The graph depends on how the threads interleave; with one thread it
+// depends on the data only. poll: see parallel.h (Cancelled is thrown).
+void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p,
+                const std::function<bool()> &poll = std::function<bool()>());
+
+// The graph section for SnapshotBuilder::finish.
+GraphSection hnsw_graph_section(const HnswParams &p, const std::function<bool()> &poll = std::function<bool()>());
+
+// Opens the graph of a snapshot with FLAG_HNSW. Throws std::runtime_error with the cause. verify
+// reads every link (vload); without it only the header is checked (every query).
+HnswGraph hnsw_open(const VectorSet &s, bool verify);
+
+// Approximate k nearest neighbours of every query of s (s.metric, s.stride, s.queries, s.k,
+// s.radius, s.threads as in flat_search). ef (raised to k) is the candidate list size of the
+// search. Positions marked in skip (journal mask, tombstones; may be null) are traversed but never
+// returned. extra (may be null) holds rows searched exactly beside the graph (the journal's live
+// vectors); both result lists are merged. Result layout and order as flat_search: (key, id).
+// With radius only the found neighbours within it are returned. One thread per query; the result
+// does not depend on the number of threads.
+void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, std::uint32_t ef,
+                 const std::uint64_t *skip, const RowBlock *extra, std::vector<Neighbor> &out,
+                 std::vector<std::uint32_t> &count, const std::function<bool()> &poll = std::function<bool()>());
 
 } // namespace vvector
 

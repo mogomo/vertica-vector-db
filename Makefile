@@ -5,7 +5,7 @@
 # Arrays/Arrays.cpp (array support) is compiled as part of Vertica.cpp.
 #
 #   make                      build build/libvvector.so
-#   make test                 engine unit tests, no Vertica needed
+#   make test [DATA_DIR=DIR]  engine unit tests, no Vertica needed; with DATA_DIR also the SIFT1M recall test
 #   make tools                build/tools/fvecs (vector files to COPY text)
 #   make bench [DATA_DIR=DIR] engine benchmark; with DATA_DIR on SIFT1M (DIR/sift_*.fvecs), else random data
 #   make deploy [FENCED=yes|no|mixed]   install the library and functions (default: fenced)
@@ -56,7 +56,7 @@ $(BUILD_DIR)/tests/%: tests/engine/%.cpp $(wildcard tests/engine/*.h) $(ENGINE_S
 	$(CXX) $(COMMON_FLAGS) -o $@ $< $(ENGINE_SRC)
 
 test: $(TEST_BIN)
-	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done
+	@for t in $(TEST_BIN); do echo "== $$t"; $$t $(if $(DATA_DIR),--dir=$(DATA_DIR)) || exit 1; done
 	@echo "All engine tests passed."
 
 bench: $(BENCH_BIN)

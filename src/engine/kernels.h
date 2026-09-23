@@ -32,6 +32,12 @@ void keys_1q(Metric m, const float *rows, std::uint64_t n, std::uint32_t stride,
 void keys_4q(Metric m, const float *rows, std::uint64_t n, std::uint32_t stride, const float *const q[4],
              float *keys);
 
+// The keys of n rows at scattered positions against one query: keys[i] for the row
+// rows + pos[i] * stride. For graph search: the next rows are prefetched while one is scored.
+// Each key equals distance_key of the same pair bit for bit.
+void keys_gather(Metric m, const float *rows, std::uint32_t stride, const std::uint32_t *pos, std::uint32_t n,
+                 const float *q, float *keys);
+
 // The value the built-in function of the metric returns: VECTOR_L2, COSINE_SIMILARITY, DOT_PRODUCT,
 // or the Manhattan distance.
 inline float key_to_score(Metric m, float key)

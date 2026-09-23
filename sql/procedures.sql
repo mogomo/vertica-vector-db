@@ -107,7 +107,7 @@ $$;
 -- margin:     overlap of the delta. Timestamp ver_col: seconds (NULL = 60). Open transactions are found
 --             through their locks, so it only covers clock differences and statement-start versions.
 --             INT ver_col: units of that column; there it must also cover the longest write transaction.
--- index_type: flat (the default until milestone M2) or hnsw (milestone M2).
+-- index_type: hnsw (the default: approximate, fast) or flat (every query scans every vector).
 -- register_index_core does the work; the two forms of register_index call it and print the result
 -- themselves, because NOTICEs of a nested CALL do not reach the caller.
 CREATE OR REPLACE PROCEDURE vvector.register_index_core(nm VARCHAR, src_table VARCHAR, id_column VARCHAR, vec_column VARCHAR,
@@ -134,9 +134,6 @@ BEGIN
     END IF;
     IF kind IS NULL OR kind NOT IN ('flat', 'hnsw') THEN
         RAISE EXCEPTION 'vvector.register_index: index_type must be flat or hnsw';
-    END IF;
-    IF kind = 'hnsw' THEN
-        RAISE EXCEPTION 'vvector.register_index: index_type hnsw is not implemented yet (milestone M2): use flat';
     END IF;
     sch := SPLIT_PART(src_table, '.', 1);
     tbl := SPLIT_PART(src_table, '.', 2);
@@ -222,7 +219,7 @@ CREATE OR REPLACE PROCEDURE vvector.register_index(nm VARCHAR, src_table VARCHAR
                                                    op_column VARCHAR, ver_column VARCHAR, measure VARCHAR, margin INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
-    PERFORM CALL vvector.register_index_core(nm, src_table, id_column, vec_column, op_column, ver_column, measure, margin, 'flat');
+    PERFORM CALL vvector.register_index_core(nm, src_table, id_column, vec_column, op_column, ver_column, measure, margin, 'hnsw');
     IF ver_column IS NULL THEN
         RAISE NOTICE 'vvector: index % registered (static: no version column). Next: CALL vvector.refresh_index(''%''). Queries read %_snap in schema %; grant SELECT on it to the users who may search the index.',
                      nm, nm, nm, SPLIT_PART(src_table, '.', 1);
@@ -246,9 +243,6 @@ BEGIN
     END IF;
     IF x_type IS NOT NULL AND x_type NOT IN ('flat', 'hnsw') THEN
         RAISE EXCEPTION 'vvector.set_index_options: index_type must be flat or hnsw';
-    END IF;
-    IF COALESCE(x_type, '') = 'hnsw' THEN
-        RAISE EXCEPTION 'vvector.set_index_options: index_type hnsw is not implemented yet (milestone M2)';
     END IF;
     IF x_m IS NOT NULL AND (x_m < 2 OR x_m > 256) THEN
         RAISE EXCEPTION 'vvector.set_index_options: m must be 2 to 256';
@@ -345,7 +339,7 @@ END;
 $$;
 
 -- Memory estimate for an index before its table is loaded. Prints one line per figure; changes nothing.
--- index_type flat or hnsw, quantization none or sq8 (hnsw and sq8 are estimates for milestones M2 and M4).
+-- index_type flat or hnsw (with m = 16), quantization none or sq8 (sq8 is an estimate for milestone M4).
 CREATE OR REPLACE PROCEDURE vvector.sizing(n_vectors INT, n_dims INT, kind VARCHAR, quant VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     stride INT; vec_mb FLOAT; ids_mb FLOAT; graph_mb FLOAT; sq8_mb FLOAT; total_mb FLOAT; build_mb FLOAT; mem_gb FLOAT;
@@ -362,12 +356,16 @@ BEGIN
     stride := (n_dims + 15) // 16 * 16;
     vec_mb := n_vectors * stride * 4 / 1048576.0;
     ids_mb := n_vectors * 8 / 1048576.0;
-    -- HNSW with m = 16: layer 0 holds 2m + 1 uint32 per vector, the upper layers about 1/(m - 1) of that.
+    -- HNSW with m = 16: level 0 holds 2m + 1 uint32 per vector, plus a level byte and an index entry
+    -- (5 bytes); a vector has 1/(m - 1) upper blocks of m + 1 uint32 on average.
     graph_mb := CASE WHEN kind = 'hnsw' THEN n_vectors * (33 * 4 + 5 + 17 * 4 / 15.0) / 1048576.0 ELSE 0 END;
     sq8_mb := CASE WHEN quant = 'sq8' THEN n_vectors * (stride + 8) / 1048576.0 ELSE 0 END;
     total_mb := vec_mb + ids_mb + graph_mb + sq8_mb;
-    build_mb := total_mb + n_vectors * 4 / 1048576.0;
     mem_gb := (SELECT MIN(total_memory_bytes) FROM v_monitor.host_resources) / 1073741824.0;
+    -- Build: the snapshot, 4 bytes per vector to sort; HNSW adds 2 bytes per vector per build thread
+    -- (one per core) and 5 bytes per vector while the levels are laid out.
+    build_mb := total_mb + n_vectors * 4 / 1048576.0
+                + CASE WHEN kind = 'hnsw' THEN n_vectors * (5 + 2 * (SELECT MIN(processor_core_count) FROM v_monitor.host_resources)) / 1048576.0 ELSE 0 END;
     RAISE NOTICE 'vvector.sizing: % vectors of % dimensions (% floats per row): vectors % MB, ids % MB, graph % MB, sq8 codes % MB',
                  n_vectors, n_dims, stride, vec_mb::NUMERIC(18,1), ids_mb::NUMERIC(18,1), graph_mb::NUMERIC(18,1), sq8_mb::NUMERIC(18,1);
     RAISE NOTICE 'vvector.sizing: snapshot and cache file % MB per node; build memory about % MB on the refreshing node (fenced: counts against FencedUDxMemoryLimitMB)',
@@ -445,7 +443,7 @@ BEGIN
     cores := (SELECT MIN(processor_core_count) FROM v_monitor.host_resources);
     fenced_mb := (SELECT MAX(current_value::INT) FROM v_monitor.configuration_parameters WHERE parameter_name = 'FencedUDxMemoryLimitMB');
     thr := (SELECT MAX(threads_default) FROM vvector.manifest WHERE index_name = nm);
-    build := bytes + 4 * vectors;
+    build := bytes + 4 * vectors + CASE WHEN kind = 'hnsw' THEN vectors * (5 + 2 * cores) ELSE 0 END;
     RAISE NOTICE 'vvector: index %: sizing: index % MB, all indexes % MB, build about % MB, smallest node % MB of memory (% MB free or cache), % cores',
                  nm, bytes // 1048576, all_bytes // 1048576, build // 1048576, mem // 1048576, free_mem // 1048576, cores;
     IF bytes > mem // 2 THEN
@@ -473,7 +471,7 @@ DECLARE
     op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
     prev INT; sid INT; chunks INT; max_ver INT; v_from VARCHAR(64);
     source VARCHAR(4000); del_expr VARCHAR(400); v_expr VARCHAR(400);
-    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT;
+    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT; n_graph INT;
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
@@ -578,11 +576,12 @@ BEGIN
     -- 5. Manifest and views.
     n_vec := EXECUTE 'SELECT MAX(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
     n_dims := EXECUTE 'SELECT MAX(dims) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+    n_graph := EXECUTE 'SELECT MAX(graph_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
     n_bytes := (SELECT SUM(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
     fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
     secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
     PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
-                   base_snapshot = 0, vector_count = n_vec, dims = n_dims, tombstones = 0, graph_bytes = 0, index_bytes = n_bytes,
+                   base_snapshot = 0, vector_count = n_vec, dims = n_dims, tombstones = 0, graph_bytes = n_graph, index_bytes = n_bytes,
                    built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt
             WHERE index_name = nm;
     PERFORM COMMIT;

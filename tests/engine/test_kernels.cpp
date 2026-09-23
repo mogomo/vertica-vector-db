@@ -1,4 +1,4 @@
-// Distance kernels: agreement with a plain double loop, bit-identical batch and single kernels,
+// Distance kernels: agreement with a plain double loop, bit-identical batch, gather and single kernels,
 // hand-made cases, zero vectors, and a fingerprint of the result bits that must be the same on
 // every machine (aarch64, x86_64 with any instruction set).
 #include "check.h"
@@ -60,8 +60,14 @@ int main()
             std::vector<float> k1(rows.n), k4(4 * rows.n);
             keys_4q(m, rows.data.data(), rows.n, rows.stride, q, k4.data());
             bool close = true, same = true;
+            // Scattered positions (graph search): every row once, in a mixed order.
+            std::vector<std::uint32_t> pos(rows.n);
+            for (std::uint64_t i = 0; i < rows.n; ++i) pos[i] = static_cast<std::uint32_t>((i * 17) % rows.n);
+            std::vector<float> kg(rows.n);
             for (int j = 0; j < 4; ++j) {
                 keys_1q(m, rows.data.data(), rows.n, rows.stride, q[j], k1.data());
+                keys_gather(m, rows.data.data(), rows.stride, pos.data(), static_cast<std::uint32_t>(rows.n), q[j], kg.data());
+                for (std::uint64_t i = 0; i < rows.n; ++i) same = same && kg[i] == k1[pos[i]];
                 for (std::uint64_t i = 0; i < rows.n; ++i) {
                     const double ref = ref_key(m, rows.row(i), q[j], dims);
                     // Error bound of a float32 sum over 16 lanes: (terms per lane + 8) units of

@@ -77,6 +77,23 @@ template <Kind K> inline void rows_1q(const float *rows, std::uint64_t n, std::u
     }
 }
 
+// Prefetches a whole row, one cache line at a time.
+inline __attribute__((always_inline)) void prefetch_row(const float *r, std::uint32_t stride)
+{
+    for (std::uint32_t j = 0; j < stride; j += 16) __builtin_prefetch(r + j);
+}
+
+template <Kind K> inline void rows_gather(const float *rows, std::uint32_t stride, const std::uint32_t *pos,
+                                          std::uint32_t n, const float *q, float *keys)
+{
+    const std::uint32_t ahead = 2;
+    for (std::uint32_t i = 0; i < n && i < ahead; ++i) prefetch_row(rows + std::uint64_t(pos[i]) * stride, stride);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (i + ahead < n) prefetch_row(rows + std::uint64_t(pos[i + ahead]) * stride, stride);
+        keys[i] = key_of<K>(pair<K>(rows + std::uint64_t(pos[i]) * stride, q, stride));
+    }
+}
+
 // Four queries against one row. Four 16-lane accumulators do not fit in the 32 NEON registers
 // next to the row, so each row is done in two halves: lanes 0-7 (a, b) over the whole row, then
 // lanes 8-15 (c, d). Every lane sees exactly the operations of pair(), in the same order.
@@ -157,6 +174,16 @@ VV_CLONES void keys_4q(Metric m, const float *rows, std::uint64_t n, std::uint32
     case L2SQ: rows_4q<L2SQ>(rows, n, stride, q, keys); break;
     case L1: rows_4q<L1>(rows, n, stride, q, keys); break;
     default: rows_4q<DOT>(rows, n, stride, q, keys); break;
+    }
+}
+
+VV_CLONES void keys_gather(Metric m, const float *rows, std::uint32_t stride, const std::uint32_t *pos, std::uint32_t n,
+                           const float *q, float *keys)
+{
+    switch (kind_of(m)) {
+    case L2SQ: rows_gather<L2SQ>(rows, stride, pos, n, q, keys); break;
+    case L1: rows_gather<L1>(rows, stride, pos, n, q, keys); break;
+    default: rows_gather<DOT>(rows, stride, pos, n, q, keys); break;
     }
 }
 

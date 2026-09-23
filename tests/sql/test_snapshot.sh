@@ -111,8 +111,12 @@ FROM (SELECT 1 AS id, ARRAY[1.0, NULL]::ARRAY[FLOAT] AS vec) v;"
 expect "an unknown metric is refused" "metric must be l2, cosine, dot or l1" "
 SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', metric='hamming') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
-expect "index_type hnsw says when it comes" "HNSW is not implemented yet (milestone M2)" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER()
+expect "index_type hnsw builds a graph, also of one vector" "^built: 1 vectors of 2$" "
+SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
+  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER()
+  FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v) b;"
+expect "an unknown index_type is refused" "index_type must be flat or hnsw, not 'ivf'" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='ivf') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "quantization sq8 says when it comes" "quantization sq8 is not implemented yet (milestone M4)" "
 SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()

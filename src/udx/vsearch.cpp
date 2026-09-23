@@ -8,9 +8,12 @@
 // Parameters: index_name, k, precision, freshness, ef_search, exact, radius, threads, query,
 // rescore, oversampling, cache_dir. Tuning values: function parameter, then session parameter,
 // then index default (set_index_options), then built-in default.
-// Thin adapter: the search is src/engine/flat.h.
+// On an HNSW index the precision levels are presets of ef_search (fast: max(2 x k, 32), balanced:
+// 100, best: 400); precision exact or exact=true search every vector (flat).
+// Thin adapter: the search is src/engine/flat.h and src/engine/hnsw.h.
 #include "udx_common.h"
 #include "../engine/flat.h"
+#include "../engine/hnsw.h"
 #include "../engine/kernels.h"
 #include "../engine/parallel.h"
 #include "../engine/text.h"
@@ -107,8 +110,9 @@ class VSearch : public TransformFunction
             vvector::MappedSnapshot snap;
             snap.open_active(cache_dir, name);
 
-            // Tuning values. On a flat index every precision is exact, and ef_search, rescore and
-            // oversampling have no effect; they are checked so that the same SQL works on every index.
+            // Tuning values. On a flat index every precision is exact and ef_search has no effect;
+            // rescore and oversampling have no effect before int8 quantisation (milestone M4). All are
+            // checked, so that the same SQL works on every index.
             Settings cfg(srvInterface, snap.options());
             const vint k = cfg.integer("k", 10);
             if (k < 1 || k > MAX_K) fail("k must be 1 to 16384, not " + std::to_string(k));
@@ -119,7 +123,7 @@ class VSearch : public TransformFunction
             if (!one_of(freshness, {"snapshot", "exact"})) fail("freshness must be snapshot or exact, not '" + freshness + "'");
             const vint ef_search = cfg.integer("ef_search", 0);
             if (ef_search < 0 || ef_search > 100000) fail("ef_search must be 0 (preset) to 100000");
-            cfg.boolean("exact", false);
+            const bool exact = cfg.boolean("exact", false);
             cfg.boolean("rescore", true);
             const double oversampling = cfg.real("oversampling", 1.0);
             if (!(oversampling >= 1.0 && oversampling <= 100.0)) fail("oversampling must be 1 to 100");
@@ -223,7 +227,17 @@ class VSearch : public TransformFunction
             std::vector<vvector::Neighbor> found;
             std::vector<std::uint32_t> count;
             try {
-                vvector::flat_search(fs, blocks, extra_ids.empty() ? 1 : 2, found, count, [this] { return isCanceled(); });
+                if (now.has_graph() && !exact && precision != "exact") {
+                    // ef: the ef_search value, else the preset of the precision level; at least k.
+                    vint ef = ef_search;
+                    if (ef == 0) ef = precision == "best" ? 400 : precision == "balanced" ? 100 : std::max<vint>(2 * k, 32);
+                    const vvector::HnswGraph graph = vvector::hnsw_open(now, false);
+                    vvector::hnsw_search(fs, now, graph, static_cast<std::uint32_t>(std::max(ef, k)),
+                                         skip.empty() ? nullptr : skip.data(), extra_ids.empty() ? nullptr : &blocks[1],
+                                         found, count, [this] { return isCanceled(); });
+                } else {
+                    vvector::flat_search(fs, blocks, extra_ids.empty() ? 1 : 2, found, count, [this] { return isCanceled(); });
+                }
             } catch (const vvector::Cancelled &) {
                 return;
             }

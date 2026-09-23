@@ -5,9 +5,10 @@
 // (they matter for incremental builds, milestone M3).
 // Parameters: index_name, metric (l2 | cosine | dot | l1), index_type (flat | hnsw), max_ver (the
 // journal watermark: a parameter, not a column, because every input column costs transfer time
-// per row), m, ef_construction, threads, quantization (none | sq8), base_snapshot, cache_dir.
+// per row), m (HNSW links per node, 16), ef_construction (200), threads (graph build threads,
+// 0 = one per core), quantization (none | sq8), base_snapshot, cache_dir.
 // Output (byte_offset, chunk, vector_count, dims, max_ver, format_version).
-// Thin adapter around src/engine/snapshot.h.
+// Thin adapter around src/engine/snapshot.h and src/engine/hnsw.h.
 #include "udx_common.h"
 #include "../engine/hnsw.h"
 #include "../engine/parallel.h"
@@ -36,12 +37,11 @@ class VBuild : public TransformFunction
             const vint m = params.containsParameter("m") ? params.getIntRef("m") : 16;
             const vint efc = params.containsParameter("ef_construction") ? params.getIntRef("ef_construction") : 200;
             const vint base = params.containsParameter("base_snapshot") ? params.getIntRef("base_snapshot") : 0;
-            vvector::resolve_threads(params.containsParameter("threads") ? params.getIntRef("threads") : 0);
+            const int threads = vvector::resolve_threads(params.containsParameter("threads") ? params.getIntRef("threads") : 0);
             if (type != "flat" && type != "hnsw") fail("index_type must be flat or hnsw, not '" + type + "'");
             if (quant != "none" && quant != "sq8") fail("quantization must be none or sq8, not '" + quant + "'");
             if (m < 2 || m > 256) fail("m must be 2 to 256");
             if (efc < 1 || efc > 100000) fail("ef_construction must be 1 to 100000");
-            if (type == "hnsw") fail("index_type hnsw: HNSW is not implemented yet (milestone M2)");
             if (quant == "sq8") fail("quantization sq8 is not implemented yet (milestone M4)");
             if (base != 0) fail("base_snapshot: incremental builds are not implemented yet (milestone M3)");
 
@@ -60,7 +60,20 @@ class VBuild : public TransformFunction
             if (builder.count() == 0) return;          // nothing to build: no rows out
 
             vvector::SnapshotBuffer buffer;
-            builder.finish(max_ver, buffer);
+            if (type == "hnsw") {
+                vvector::HnswParams hp;
+                hp.m = static_cast<std::uint32_t>(m);
+                hp.ef_construction = static_cast<std::uint32_t>(efc);
+                hp.threads = threads;
+                const vvector::GraphSection graph = vvector::hnsw_graph_section(hp, [this] { return isCanceled(); });
+                try {
+                    builder.finish(max_ver, buffer, &graph);
+                } catch (const vvector::Cancelled &) {
+                    return;
+                }
+            } else {
+                builder.finish(max_ver, buffer);
+            }
             const vvector::VectorSet set = vvector::snapshot_open(buffer.data(), buffer.size(), false);
 
             const char *bytes = reinterpret_cast<const char *>(buffer.data());

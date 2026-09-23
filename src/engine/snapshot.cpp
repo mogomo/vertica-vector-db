@@ -277,7 +277,7 @@ void SnapshotBuilder::add(std::int64_t id, const float *v, std::uint32_t dims)
     end_row();
 }
 
-void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out)
+void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out, const GraphSection *graph)
 {
     if (open_row_) throw std::logic_error("SnapshotBuilder::finish with an open row");
     if (ids_.empty()) throw std::runtime_error("no vectors");
@@ -316,6 +316,10 @@ void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out)
     std::memcpy(h.magic, SNAPSHOT_MAGIC, sizeof(h.magic));
     h.format_version = FORMAT_VERSION;
     h.flags = metric_ == Metric::Cosine ? FLAG_NORMALISED : 0;
+    if (graph) {
+        h.flags |= FLAG_HNSW;
+        h.graph_bytes = graph->bytes(ids_.data(), n);
+    }
     h.count = n;
     h.dims = dims_;
     h.row_stride = stride_;
@@ -328,6 +332,7 @@ void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out)
     std::uint8_t *base = buffer_.data();
     std::memcpy(base + h.off_ids, ids_.data(), n * 8);
     std::memcpy(base, &h, sizeof(h));
+    if (graph) graph->fill(snapshot_open(base, h.total_bytes, false), base + h.off_graph);
     h.checksum = snapshot_checksum(base, h.total_bytes);
     std::memcpy(base + offsetof(SnapshotHeader, checksum), &h.checksum, sizeof(h.checksum));
 

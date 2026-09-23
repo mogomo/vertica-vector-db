@@ -169,9 +169,26 @@ int main()
         CHECK(parts == snapshot_checksum(d, n));
     }
 
-    // HNSW is a stub until milestone M2.
-    CHECK(throws([&] { hnsw_build(a.set, HnswParams()); }, "not implemented"));
-    CHECK(throws([&] { hnsw_search(a.set, a.set.vector(0), 5, 50); }, "not implemented"));
+    // A graph section is the last section, built in place, and covered by the checksum.
+    {
+        SnapshotBuilder b(Metric::L2);
+        std::vector<float> v(20);
+        for (int i = 0; i < 300; ++i) { test_vector(i, 20, 4, true, v.data()); b.add(300 - i, v.data(), 20); }
+        HnswParams p;
+        p.m = 4;
+        const GraphSection g = hnsw_graph_section(p);
+        TestSet t;
+        b.finish(9, t.buffer, &g);
+        t.set = snapshot_open(t.buffer.data(), t.buffer.size(), true);
+        SnapshotHeader h;
+        std::memcpy(&h, t.buffer.data(), sizeof(h));
+        CHECK(h.flags == FLAG_HNSW && h.off_graph > h.off_ids && h.off_graph % 64 == 0);
+        CHECK(h.graph_bytes == hnsw_section_bytes(t.set.ids, 300, 4));
+        CHECK(h.total_bytes == h.off_graph + h.graph_bytes);
+        CHECK(t.set.ids[0] == 1 && t.set.ids[299] == 300);
+        t.buffer.data()[h.off_graph + h.graph_bytes / 2] ^= 1;
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), true); }, "checksum"));
+    }
 
     return finish("test_snapshot");
 }

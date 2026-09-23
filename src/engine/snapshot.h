@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,15 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
 // True if the bytes start with the vvector magic. Used before deleting cache files.
 bool snapshot_has_magic(const std::uint8_t *data, std::uint64_t size);
 
+// A section that SnapshotBuilder::finish builds in place, after the rows are sorted: the HNSW
+// graph (hnsw.h). bytes() gives its size for the ids in position order; fill() writes it into the
+// zero-filled section of the finished snapshot s (s.graph is the same bytes, read-only). The
+// checksum is computed after fill.
+struct GraphSection {
+    std::function<std::uint64_t(const std::int64_t *ids, std::uint64_t n)> bytes;
+    std::function<void(const VectorSet &s, std::uint8_t *section)> fill;
+};
+
 // Builds a full snapshot. Rows are written straight into the final buffer as they arrive; ids
 // may arrive in any order and are sorted at finish by moving the rows in place, so the builder
 // never holds a second copy of the vectors.
@@ -170,9 +180,10 @@ public:
     std::uint64_t count() const { return ids_.size(); }
     std::uint32_t dims() const { return dims_; }
 
-    // Sorts by id, writes ids, header and checksum into the buffer and hands it over to out.
-    // Throws std::runtime_error on a repeated id or no vectors. The builder is empty afterwards.
-    void finish(std::int64_t max_ver, SnapshotBuffer &out);
+    // Sorts by id, writes ids, header, the graph section if given, and the checksum into the
+    // buffer and hands it over to out. Throws std::runtime_error on a repeated id or no vectors,
+    // and whatever graph->fill throws. The builder is empty afterwards.
+    void finish(std::int64_t max_ver, SnapshotBuffer &out, const GraphSection *graph = nullptr);
 
 private:
     Metric metric_;
