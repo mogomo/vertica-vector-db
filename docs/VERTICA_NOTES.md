@@ -56,7 +56,8 @@ Check again on other versions.
   `using Vertica::BaseDataOID;`.
 - A transform function with no arguments and no FROM works: `SELECT f() OVER()`.
 - Vertica does not call a transform function on empty input. Hence the sentinel
-  row in the delta view and `FROM dual` for snapshot-only queries.
+  row in the delta view, and the `_snap` view (the sentinel alone) or `FROM dual`
+  for snapshot-only queries.
 - Every input column costs row transfer time (graph project: dropping two
   columns halved a 100M-row build).
 - A large generic lambda around a hot output loop stopped inlining and cost 30%
@@ -65,7 +66,7 @@ Check again on other versions.
   set with `ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '...'`. It is
   also visible inside stored procedures of the same session.
 - `vt_report_error` inside `try` is fine; messages reach the client with file
-  and line.
+  and line. (vvector throws `std::runtime_error` inside and reports once, in the catch: see below.)
 
 ## SQL
 - `OVER(PARTITION NODES)` over an UNSEGMENTED table runs on one node only. Over
@@ -134,7 +135,16 @@ Check again on other versions.
   block. vvector reads vectors through that pointer, not with a call per element. A NULL element is
   the float8 value `vfloat_null` (a NaN pattern; test with `vfloatIsNull`).
 - SDK: `TransformFunctionFactory::Properties` has `isExploder` ("expands rows 1:N"), set through
-  `getFunctionProperties`; marked INTERNAL in the header. Tested for vknn at milestone M2.
+  `getFunctionProperties`; marked INTERNAL in the header. Tested with a small test library: with
+  `isExploder = true` a transform function can be called without OVER() (`SELECT f(a) FROM t`),
+  beside other columns (`SELECT b, f(a) FROM t`: every output row carries b of its input row), and
+  with `OVER(PARTITION ROW)` or `OVER(PARTITION BEST)`. `LATERAL` is a syntax error. This is the
+  shape for vknn (milestone M2).
+- Parsing an ARRAY literal of 128 FLOAT numbers in a statement costs Vertica about 7 ms (measured
+  as the difference between two otherwise equal vsearch statements); a VARCHAR parameter of the
+  same numbers costs nothing measurable. Hence the `query` parameter of vsearch.
+- A fenced transform function costs about 6 ms per statement more than an unfenced one
+  (`vversion() OVER()`: 7.0 ms against 1.1 ms at the client, VM, 26.2.0-1).
 - SDK: session parameters arrive as strings (`getUDSessionParamReader("library").getStringRef`),
   whatever the value looks like; vvector parses numbers and booleans itself.
 - SDK: `vt_report_error` throws through a function pointer set by the server; the exception type is

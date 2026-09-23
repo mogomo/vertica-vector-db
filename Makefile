@@ -6,6 +6,8 @@
 #
 #   make                      build build/libvvector.so
 #   make test                 engine unit tests, no Vertica needed
+#   make tools                build/tools/fvecs (vector files to COPY text)
+#   make bench [DATA_DIR=DIR] engine benchmark; with DATA_DIR on SIFT1M (DIR/sift_*.fvecs), else random data
 #   make deploy [FENCED=yes|no|mixed]   install the library and functions (default: fenced)
 #   make undeploy             remove functions and library
 #   make clean
@@ -26,6 +28,9 @@ ENGINE_HDR := $(wildcard src/engine/*.h)
 UDX_SRC    := $(wildcard src/udx/*.cpp)
 TEST_SRC   := $(wildcard tests/engine/test_*.cpp)
 TEST_BIN   := $(patsubst tests/engine/%.cpp,$(BUILD_DIR)/tests/%,$(TEST_SRC))
+BENCH_SRC  := $(wildcard tests/engine/bench_*.cpp)
+BENCH_BIN  := $(patsubst tests/engine/%.cpp,$(BUILD_DIR)/tests/%,$(BENCH_SRC))
+DATA_DIR   ?=
 
 # Reported by vversion().
 BUILD_FLAGS := $(OPT) -ffp-contract=off -std=c++17 $(shell uname -m) $(notdir $(CXX))-$(shell $(CXX) -dumpfullversion 2>/dev/null || $(CXX) -dumpversion)
@@ -37,7 +42,7 @@ COMMON_FLAGS := -std=c++17 -g $(OPT) -ffp-contract=off -Wall -pthread -DVVECTOR_
 UDX_FLAGS    := $(COMMON_FLAGS) -DNDEBUG -fno-plt -I $(SDK_HOME)/include -Wno-unused-value -shared -fPIC \
                 -D_GLIBCXX_USE_CXX11_ABI=$(VERTICA_CXX11_ABI)
 
-.PHONY: all test deploy undeploy clean
+.PHONY: all test bench tools deploy undeploy clean
 
 all: $(LIB)
 
@@ -53,6 +58,15 @@ $(BUILD_DIR)/tests/%: tests/engine/%.cpp $(wildcard tests/engine/*.h) $(ENGINE_S
 test: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done
 	@echo "All engine tests passed."
+
+bench: $(BENCH_BIN)
+	@for b in $(BENCH_BIN); do echo "== $$b"; $$b $(if $(DATA_DIR),--dir=$(DATA_DIR)) || exit 1; done
+
+tools: $(BUILD_DIR)/tools/fvecs
+
+$(BUILD_DIR)/tools/%: tools/%.cpp Makefile
+	@mkdir -p $(BUILD_DIR)/tools
+	$(CXX) $(COMMON_FLAGS) -o $@ $<
 
 deploy: $(LIB)
 	scripts/deploy.sh --fenced=$(FENCED)
