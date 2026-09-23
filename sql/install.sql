@@ -57,6 +57,10 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS index_bytes INT DEFAULT NU
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS built_at TIMESTAMPTZ DEFAULT NULL;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS build_seconds FLOAT DEFAULT NULL;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS format_version INT DEFAULT NULL;
+-- Journal replica (set_journal_replica; kept up to date by register_index and refresh_index):
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS journal_replica VARCHAR(16) DEFAULT 'auto';     -- auto, on or off
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS replica_projection VARCHAR(256) DEFAULT NULL;   -- schema.projection made by vvector
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS replica_note VARCHAR(1000) DEFAULT NULL;        -- what the last check did and why
 
 -- Snapshot ids. Never reused, so an old cache file can never pass as a newer snapshot.
 CREATE SEQUENCE IF NOT EXISTS vvector.snapshot_seq CACHE 1;

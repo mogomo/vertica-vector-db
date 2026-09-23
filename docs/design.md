@@ -314,6 +314,20 @@ client / server.
 | `vknn`, `query` parameter, `FROM dual` | 7.76 / 3.73 | 1.45 / 1.06 | 1.43 / 1.04 |
 | `vknn` on the query row of a table | 7.94 / 3.91 | 1.61 / 1.16 | 1.58 / 1.13 |
 
+(These rows were measured with the first default, precision fast. The default is now balanced,
+ef_search 100: recall@10 0.98 instead of 0.89 on SIFT1M for 0.09 ms more engine time per search;
+measured again at balanced, VM, 200 runs, client / server ms:
+
+| Statement shape | Fenced | Mixed |
+|---|---:|---:|
+| HNSW, `FROM sift_hnsw_snap` | 7.05 / 4.01 | 1.85 / 1.42 |
+| HNSW, `FROM dual` | 6.93 / 3.96 | 1.81 / 1.40 |
+| HNSW, `FROM sift_hnsw_delta`, empty delta | 8.01 / 4.77 | 2.80 / 2.17 |
+| `vknn`, `query` parameter, `FROM dual` | 7.36 / 3.65 | 1.56 / 1.14 |
+| `vknn` on the query row of a table | 7.52 / 3.78 | 1.71 / 1.23 |
+
+The 0.09 ms of engine time is inside the run-to-run noise of a statement.)
+
 The HNSW search itself takes 0.05 ms (engine, one call at ef 32); the rest of
 the 1.9 ms statement is Vertica: 0.8 ms for any statement, about 0.3 ms for a
 transform function, about 0.5 ms for vsearch's setup, cache check and output,
@@ -357,8 +371,45 @@ Levers repeated at M2:
 
 | Lever | Result |
 |---|---|
-| 3. No gather across nodes | On the cluster the empty delta cost 15 to 17 ms more than `_snap`: EXPLAIN shows the journal scanned on every node and sent to the initiator (Send/Recv) even when no row qualifies. A replicated (UNSEGMENTED ALL NODES) projection of the journal, ordered by the version column, refreshed with `REFRESH('table')`, and `ANALYZE_STATISTICS('table')` afterwards: the planner then reads that projection on the initiator only ("Execute on: Query Initiator") and the empty delta costs 4 ms (mixed) instead of 17 ms; 1000 journal rows 7 ms instead of 25 ms. Without fresh statistics the planner kept the segmented projection. Cost: every node stores the whole journal (81 MB per node for 100k x 128, against 27 MB segmented) and every load writes to all nodes. Documented in the README as an option; the deploy does not create it |
+| 3. No gather across nodes | On the cluster the empty delta cost 15 to 17 ms more than `_snap`: EXPLAIN shows the journal scanned on every node and sent to the initiator (Send/Recv) even when no row qualifies. A replicated (UNSEGMENTED ALL NODES) projection of the journal, ordered by the version column, filled with `REFRESH('table')`, with statistics on the version column: the planner then reads it on the initiator only ("Execute on: Query Initiator"). Without statistics the planner kept the segmented projection; with statistics that were stale (the table doubled after them) it still chose the replica. Since the M2 follow-up this is the default (`journal_replica = auto`, see "Journal replica" below) |
 | 7. Lightest function shape | `vknn` (exploder, no OVER(), no view) is the fastest single search: 1.43 ms against 1.88 ms for vsearch `_snap` on the VM (mixed), 5.9 against 7.6 ms on the cluster. Fenced there is little gain (the fenced call dominates). It has no stale check and no journal, and in batches it is 3 to 4 times slower than vsearch (row by row against one batch on all cores). Kept as the lightest single-search shape; vsearch stays the exact and the batch path |
+
+### Journal replica (lever 3 as the default)
+
+`vvector.apply_replica` (sql/procedures.sql) runs in `register_index`, in every `refresh_index` and
+in `set_journal_replica`. Mode `auto` keeps the projection `<schema>.<index>_journal_rep` (id, vector,
+delete and version columns, `ORDER BY` version, `UNSEGMENTED ALL NODES`) while the database has
+more than one node and one copy of the journal (the largest segmented projection of the table,
+summed over the nodes, from `v_monitor.projection_storage`) is at most 2048 MB and at most 10% of the
+smallest `disk_space_free_mb` of a DATA or DEPOT location. `on` keeps it always, `off` never. It makes
+it with `CREATE PROJECTION` and `REFRESH(table)`, takes `ANALYZE_STATISTICS(table.version)` at every
+check, drops it when the rule no longer holds, shares it between indexes on the same journal
+columns, never touches a projection it did not make, and makes none in `auto` when the table has an
+unsegmented projection already. A failure (rights, name taken) is caught and written to
+`replica_note` with the statements for a DBA. `CREATE PROJECTION` and `REFRESH` wait for every open
+transaction that writes to the table (measured: 12 s behind a writer that committed after 15 s);
+`ANALYZE_STATISTICS`, `DROP PROJECTION` and `SELECT` do not. So a new replica is postponed while
+`v_monitor.locks` shows another writer (the note says so; the next check tries again), and a
+refresh never hangs behind a long load.
+
+Cost and gain, measured on the 3-node Eon test cluster (x86_64, 2 cores, 15 GB per node, Vertica
+26.2.0-2), journal of random vectors of 128 dimensions:
+
+| Measurement | Without | With the replica |
+|---|---:|---:|
+| vsearch over `_delta`, empty delta, mixed (100k rows, through `register_index` with `auto`) | 23.4 ms | 10.7 ms |
+| the same with 1000 journal rows | 31.3 ms | 14.6 ms |
+| `REFRESH` of the new projection, 200k rows | | 7.5 s once |
+| `ANALYZE_STATISTICS` of the version column, 240k rows | | 45 ms |
+| bulk `INSERT ... SELECT` of 20,000 rows | 250 to 383 ms | 830 to 914 ms |
+| 100 single-row INSERT + COMMIT | 3.2 to 5.1 s | 4.7 to 5.2 s |
+| `refresh_index` (flat, 440k to 520k rows; the build reads the segmented projection on all nodes, EXPLAIN checked) | 31.2, 31.5 s | 28.4, 24.6 s |
+| storage per node (240k rows) | 63 MB | + 191 MB (full copy) |
+
+In Eon the replica is one set of containers in the `replica` shard (11 containers, each listed on
+all 3 nodes in `v_monitor.storage_containers`): one more copy in communal storage, and each node's
+depot caches all of it. The limit of 2048 MB keeps the depot cost and the one-time `REFRESH` (about
+80 s at the limit, extrapolated) small; above it `status` says why there is none and how to force it.
 
 ## Refresh cost
 

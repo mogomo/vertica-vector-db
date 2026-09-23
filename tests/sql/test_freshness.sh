@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Integration test of the freshness model: journal, delta view, register_index,
-# refresh_index, load_all, status, schedule_refresh, unregister_index, and the
-# delta boundary with an open writer (two sessions).
+# refresh_index, load_all, status, schedule_refresh, unregister_index, the
+# delta boundary with an open writer (two sessions), and the journal replica (auto on one
+# node and on a cluster, on, off, shared by two indexes, postponed while a writer is open, a failure,
+# dropped by unregister).
 # What is tested: the delta view holds exactly the rows a query must apply, every
 # refresh builds exactly the live vectors (latest row per id, not deleted), and
 # vsearch applies the journal with freshness='exact' and ignores it by default.
@@ -183,6 +185,67 @@ SELECT 'visible during the open transaction: ' || COUNT(*) FROM $SCHEMA.${IX}_de
 [ "$ECHO_ONLY" = yes ] || wait $WRITER
 expect "after the late commit the row is in the delta view, without another refresh" "^visible after the commit: 1$" "
 SELECT 'visible after the commit: ' || COUNT(*) FROM $SCHEMA.${IX}_delta WHERE id = 900777777;"
-run_sql "cleanup" "CALL vvector.unregister_index('$IX');" > /dev/null
+
+echo "== journal replica (an unsegmented projection of the journal, so the delta is read on one node)"
+REP="${IX}_journal_rep"
+has_rep() { echo "SELECT 'replica projections: ' || COUNT(DISTINCT projection_name) FROM v_catalog.projections
+                   WHERE LOWER(projection_schema) = LOWER('$SCHEMA') AND LOWER(projection_name) = LOWER('$1');"; }
+NODES=$( [ "$ECHO_ONLY" = yes ] && echo 1 || vsql -X -A -t -c "SELECT COUNT(*) FROM v_catalog.nodes" )
+if [ "$NODES" -gt 1 ]; then
+    expect "auto on $NODES nodes: register and refresh made the replica" "^replica projections: 1$" "$(has_rep "$REP")"
+    Q1=$(printf '%s' "$VEC" | sed 's/RANDOM() \* 2 - 1/0.5/g')
+    expect "the delta view is read from the replica, on the initiator only" "Projection: .*$REP" "
+EXPLAIN SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='$IX', k=5, freshness='exact') OVER()
+FROM (SELECT * FROM $SCHEMA.${IX}_delta UNION ALL SELECT 1, ${Q1}::ARRAY[FLOAT], NULL, NULL, NULL, NULL, NULL) q;"
+else
+    expect "auto on one node: no replica, and the reason" "journal replica auto: none: a single node" "CALL vvector.status('$IX');"
+    expect "auto on one node: no projection made" "^replica projections: 0$" "$(has_rep "$REP")"
+fi
+expect "set_journal_replica on: the replica exists" "^replica projections: 1$" "
+CALL vvector.set_journal_replica('$IX', 'on');
+$(has_rep "$REP")"
+expect "status reports it" "journal replica on: \(created\|kept\) $SCHEMA.$REP" "CALL vvector.status('$IX');"
+expect "exact search with the replica: 5 rows" "^rows: 5$" "$COUNT5"
+expect "exact search with the replica: deleted ids stay out" "^deleted in results: 0$" "$(deleted_found exact)"
+expect "a second index on the same journal columns shares the replica" "^shared: t, projections: 1$" "
+CALL vvector.unregister_index('${IX}_b');
+CALL vvector.register_index('${IX}_b', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', 0, 'flat');
+CALL vvector.set_journal_replica('${IX}_b', 'on');
+SELECT 'shared: ' || (a.replica_projection = b.replica_projection)::VARCHAR || ', projections: '
+       || (SELECT COUNT(DISTINCT projection_name) FROM v_catalog.projections WHERE LOWER(projection_schema) = LOWER('$SCHEMA') AND NOT is_segmented)
+FROM vvector.manifest a, vvector.manifest b WHERE a.index_name = '$IX' AND b.index_name = '${IX}_b';"
+expect "unregistering the second index keeps the shared replica" "^replica projections: 1$" "
+CALL vvector.unregister_index('${IX}_b');
+$(has_rep "$REP")"
+expect "set_journal_replica off drops it" "^replica projections: 0, dropped$" "
+CALL vvector.set_journal_replica('$IX', 'off');
+SELECT 'replica projections: ' || (SELECT COUNT(DISTINCT projection_name) FROM v_catalog.projections
+       WHERE LOWER(projection_schema) = LOWER('$SCHEMA') AND LOWER(projection_name) = LOWER('$REP'))
+       || CASE WHEN replica_note LIKE '%dropped%' THEN ', dropped' ELSE ', note: ' || replica_note END
+FROM vvector.manifest WHERE index_name = '$IX';"
+# CREATE PROJECTION waits for open writers of the table: with one open, the replica is postponed.
+if [ "$ECHO_ONLY" = yes ]; then
+    echo "-- background session: INSERT INTO $SCHEMA.journal (id, vec) VALUES (900888888, ...); SELECT SLEEP(10); COMMIT;"
+else
+    ( printf "INSERT INTO $SCHEMA.journal (id, vec) VALUES (900888888, $VEC);\nSELECT SLEEP(10);\nCOMMIT;\n" | vsql -X -A -t -q > /dev/null 2>&1 ) &
+    WRITER=$!
+    sleep 3
+fi
+expect "with an open writer the replica is postponed, the call does not wait" "journal replica on: postponed: 1 open transactions write to" "
+CALL vvector.set_journal_replica('$IX', 'on');"
+[ "$ECHO_ONLY" = yes ] || wait $WRITER
+expect "after the writer committed, the next call makes it" "^replica projections: 1$" "
+CALL vvector.set_journal_replica('$IX', 'on');
+$(has_rep "$REP")"
+run_sql "replica off again" "CALL vvector.set_journal_replica('$IX', 'off');" > /dev/null
+expect "a replica that cannot be made is reported, not an error, with the statements for a DBA" "journal replica on: not created: .*A DBA can run: CREATE PROJECTION" "
+CREATE TABLE $SCHEMA.$REP (x INT);
+CALL vvector.set_journal_replica('$IX', 'on');
+DROP TABLE $SCHEMA.$REP;"
+expect "a bad mode is refused" "mode must be auto, on or off" "CALL vvector.set_journal_replica('$IX', 'always');"
+expect "unregister_index drops the replica" "^replica projections: 0$" "
+CALL vvector.set_journal_replica('$IX', 'on');
+CALL vvector.unregister_index('$IX');
+$(has_rep "$REP")"
 
 finish_tests test_freshness

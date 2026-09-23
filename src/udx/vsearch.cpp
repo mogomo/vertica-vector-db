@@ -8,8 +8,8 @@
 // Parameters: index_name, k, precision, freshness, ef_search, exact, radius, threads, query,
 // rescore, oversampling, cache_dir. Tuning values: function parameter, then session parameter,
 // then index default (set_index_options), then built-in default.
-// On an HNSW index the precision levels are presets of ef_search (fast: max(2 x k, 32), balanced:
-// 100, best: 400); precision exact or exact=true search every vector (flat).
+// On an HNSW index the precision levels are presets of ef_search (fast: max(2 x k, 32), balanced,
+// the default: 100, best: 400); precision exact or exact=true search every vector (flat).
 // Thin adapter: the search is src/engine/flat.h and src/engine/hnsw.h.
 #include "udx_common.h"
 #include "../engine/flat.h"

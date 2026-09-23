@@ -202,7 +202,7 @@ struct SearchSettings {
     {
         k = cfg.integer("k", 10);
         if (k < 1 || k > MAX_K) fail("k must be 1 to 16384, not " + std::to_string(k));
-        precision = cfg.text("precision", "fast");
+        precision = cfg.text("precision", "balanced");
         if (!one_of(precision, {"fast", "balanced", "best", "exact"}))
             fail("precision must be fast, balanced, best or exact, not '" + precision + "'");
         ef_search = cfg.integer("ef_search", 0);
@@ -221,7 +221,7 @@ struct SearchSettings {
     bool use_graph(const vvector::VectorSet &s) const { return s.has_graph() && !exact && precision != "exact"; }
 
     // Candidate list size of the graph search: ef_search, else the preset of the precision level
-    // (fast: max(2 x k, 32), balanced: 100, best: 400); at least k.
+    // (fast: max(2 x k, 32), balanced (the default): 100, best: 400); at least k.
     std::uint32_t ef() const
     {
         vint ef = ef_search;

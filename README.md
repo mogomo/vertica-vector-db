@@ -38,7 +38,7 @@ full scan of the table:
     FROM app.docs ORDER BY distance LIMIT 10;
 
 On 1,000,000 vectors of 128 dimensions that takes 7.7 seconds on the test
-machine. vvector answers the same query in 1.9 ms with an HNSW index (7.8 ms
+machine. vvector answers the same query in 1.9 ms with an HNSW index (7.1 ms
 when the search function is fenced), or with exactly the same result in 5 ms
 with a flat index (12 ms fenced). The index is a snapshot of the vectors that
 is stored in Vertica, cached on every node, and kept exact by applying the
@@ -137,7 +137,7 @@ Everything is in schema `vvector`:
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
 | role `vvector_admin` | may build, load and manage indexes |
 | functions | `vsearch`, `vknn`, `vinfo`, `vversion` (search and information), `vbuild`, `vload`, `vconfig`, `vnode` (build and load) |
-| procedures | `register_index`, `set_index_options`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
+| procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
 
 Rights: `vsearch`, `vknn`, `vinfo`, `vversion`, `vbuild`, `vnode` and the procedure
 `sizing` are open to everyone (PUBLIC); `vload`, `vconfig` and all other
@@ -217,17 +217,23 @@ It creates the views `<schema>.<index>_snap` and, with a version column,
 `<schema>.<index>_delta` in the schema of the source table:
 
     NOTICE 2005:  vvector: index docs registered. Next: CALL vvector.refresh_index('docs'). Queries read docs_snap (snapshot only) or docs_delta (with the changes since the refresh) in schema app; grant SELECT on them to the users who may search the index.
+    NOTICE 2005:  vvector: index docs: journal replica: none: a single node reads the delta locally already
+
+The second line is about the journal replica (see [Operations](#operations)):
+on a cluster it names the projection that was made.
 
 ### refresh_index
 
     CALL vvector.refresh_index('docs');
 
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 240, 5 vectors of 3 dimensions, 0 MB, 0.237 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 342, 5 vectors of 3 dimensions, 0 MB, 0.267 seconds
+    NOTICE 2005:  vvector: index docs: journal replica: none: a single node reads the delta locally already
 
 It takes the delta boundary, builds a new snapshot from the latest row of
 every id (deletes left out), stores it in `vvector.snapshot`, loads it on
 every node, writes the index defaults to every node, updates the manifest and
-the views, and deletes snapshots older than the previous one. Queries keep
+the views, deletes snapshots older than the previous one, and makes, keeps
+or drops the journal replica. Queries keep
 working during a refresh. Every refresh is a full rebuild until milestone M3.
 On the test machine 1,000,000 vectors of 128 dimensions take 11 s as a flat
 index and 46 s as an HNSW index (the graph build uses every core of the node
@@ -251,8 +257,8 @@ replaces the schedule.
     -- queries of index docs apply the journal by default:
     CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'exact', NULL, NULL);
 
-    -- a denser graph from the next refresh on, and precision balanced for every query from now on:
-    CALL vvector.set_index_options('docs', NULL, 32, 400, NULL, NULL, NULL, NULL, NULL, 'balanced', NULL, NULL, NULL);
+    -- a denser graph from the next refresh on, and precision best for every query from now on:
+    CALL vvector.set_index_options('docs', NULL, 32, 400, NULL, NULL, NULL, NULL, NULL, 'best', NULL, NULL, NULL);
 
     NOTICE 2005:  vvector: index docs options changed. Build options apply at the next refresh; query defaults apply now.
 
@@ -269,7 +275,7 @@ to later milestones are refused with a message that names the milestone.
 | refresh_mode | auto, incremental, full | auto | every refresh is full (incremental: M3) |
 | tombstone_ratio, rebuild_every | above 0 to 1; 0 = never | 0.2; never | stored for M3 |
 | memory_mode | ram, compact | ram | ram only (compact: M4) |
-| precision_default | fast, balanced, best, exact | fast | in use (HNSW); a flat index is always exact |
+| precision_default | fast, balanced, best, exact | balanced | in use (HNSW); a flat index is always exact |
 | freshness_default | snapshot, exact | snapshot | in use |
 | ef_search_default | 0 to 100000 | 0 (preset) | in use (HNSW) |
 | threads_default | 0 (one per core) to 64 | 0 | in use |
@@ -280,9 +286,11 @@ to later milestones are refused with a message that names the milestone.
 
     NOTICE 2005:  vvector: index docs: hnsw index, refresh_mode auto, 0 tombstones
     NOTICE 2005:  vvector: index docs: 7 journal rows in the delta, read in 8 ms
-    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (30443 MB free or cache), 8 cores
+    NOTICE 2005:  vvector: index docs: journal replica auto: none: a single node reads the delta locally already
+    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (30746 MB free or cache), 8 cores
 
-`status` reports the rows in the delta and how long they take to read, open
+`status` reports the rows in the delta and how long they take to read, the
+journal replica, open
 transactions that write to the table, versions in the future (a sign that an
 application sets the version column itself), and a sizing check: index size
 against node memory, the memory a refresh needs against
@@ -326,14 +334,16 @@ The same from the shell:
 `metric`), the options of `set_index_options`, and the state of the active
 snapshot (`active_snapshot`, `active_max_ver`, `delta_from` = the boundary of
 the delta view, `vector_count`, `dims`, `graph_bytes` (the HNSW graph), `index_bytes` (the whole snapshot), `built_at`,
-`build_seconds`, `format_version`).
+`build_seconds`, `format_version`), and the journal replica (`journal_replica`
+= auto, on or off; `replica_projection`, the projection vvector made;
+`replica_note`, what the last check did and why).
 
     SELECT index_name, source_table, metric, index_type, active_snapshot, vector_count, dims, graph_bytes, index_bytes, build_seconds
     FROM vvector.manifest WHERE index_name = 'docs';
 
      index_name | source_table | metric | index_type | active_snapshot | vector_count | dims | graph_bytes | index_bytes | build_seconds
     ------------+--------------+--------+------------+-----------------+--------------+------+-------------+-------------+---------------
-     docs       | app.docs     | cosine | hnsw       |             240 |            5 |    3 |         896 |        1536 |         0.237
+     docs       | app.docs     | cosine | hnsw       |             342 |            5 |    3 |         896 |        1536 |         0.267
 
 ## Search
 
@@ -375,7 +385,7 @@ Parameters:
 | freshness | snapshot | snapshot, exact | `exact` applies the journal rows of the input; `snapshot` ignores them |
 | radius | off | a number | only neighbours within it, at most k: l2 and l1 `score <= radius`; cosine and dot `score >= radius` (on HNSW: see [Range search](#range-search)) |
 | threads | 0 | 0 (one per core) to 64 | threads for one statement |
-| precision | fast | fast, balanced, best, exact | HNSW: the speed and recall trade-off, a preset of ef_search (fast: 2 x k, at least 32; balanced: 100; best: 400; exact: read every vector). A flat index is always exact |
+| precision | balanced | fast, balanced, best, exact | HNSW: the speed and recall trade-off, a preset of ef_search (fast: 2 x k, at least 32; balanced: 100; best: 400; exact: read every vector). A flat index is always exact |
 | ef_search | 0 (preset) | 0 to 100000 | HNSW: the length of the candidate list; overrides the preset of `precision`; below k it is raised to k. No effect on a flat index |
 | exact | false | true, false | `true` reads every vector of an HNSW index (the same as `precision='exact'`) |
 | rescore, oversampling | true, 1 | true or false; 1 to 100 | int8 quantisation (M4); no effect now |
@@ -403,7 +413,7 @@ then session parameter, then index default, then built-in default.
 
 `app.docs_snap` is one row that carries the active snapshot id. The search
 itself is the index's: on an HNSW index (the default) the graph with
-`precision='fast'`, on a flat index every vector. Pass the
+`precision='balanced'`, on a flat index every vector. Pass the
 query vector as the `query` parameter, not as an `ARRAY[...]` literal:
 Vertica needs about 7 ms to parse a literal of 128 numbers, the parameter
 costs nothing measurable. To build the text from a stored vector:
@@ -438,8 +448,9 @@ same value).
      200 |  5 | 0.140028014779091 |    2
 
 One statement with many queries is much faster than one statement per query:
-on the test machine 1000 queries on 1M vectors take 12 to 22 ms with HNSW
-(45,000 to 83,000 queries per second) and about 1.1 s with a flat index.
+on the test machine 1000 queries on 1M vectors take 25 to 35 ms with HNSW at
+the default precision (29,000 to 40,000 queries per second; 12 to 22 ms with
+`precision='fast'`) and about 1.1 s with a flat index.
 
 ### Precision, ef_search and exact search on an HNSW index
 
@@ -516,14 +527,14 @@ the snapshot too; applying them again changes nothing.
 
      id | del | has_ver | snapshot_id
     ----+-----+---------+-------------
-        |     | f       |         240
-      1 | f   | t       |         240
-      2 | f   | t       |         240
-      2 | t   | t       |         240
-      3 | f   | t       |         240
-      4 | f   | t       |         240
-      5 | f   | t       |         240
-      6 | f   | t       |         240
+        |     | f       |         342
+      1 | f   | t       |         342
+      2 | f   | t       |         342
+      2 | t   | t       |         342
+      3 | f   | t       |         342
+      4 | f   | t       |         342
+      5 | f   | t       |         342
+      6 | f   | t       |         342
 
 With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
 `snapshot` the result is the one of the last refresh:
@@ -597,14 +608,16 @@ queries, recall@10 = the share of the true 10 nearest neighbours found):
 
 | precision | ef_search | recall@10 | 1000 queries in one statement | one search in the engine |
 |---|---:|---:|---:|---:|
-| fast (default) | 2 x k, at least 32 | 0.893 | 12 ms | 0.05 ms |
-| balanced | 100 | 0.980 | 25 ms | 0.14 ms |
+| fast | 2 x k, at least 32 | 0.893 | 12 ms | 0.05 ms |
+| balanced (default) | 100 | 0.980 | 25 ms | 0.14 ms |
 | best | 400 | 0.999 | not measured | 0.44 ms |
 | exact | (every vector) | 0.999 (the rest are ties) | 1.1 s (measured on the flat index) | 9 ms (1 thread) |
 
 A single statement costs about 1.5 ms more than the engine time (see
 [Performance and results](#performance-and-results)), so for single searches
-`balanced` costs little more than `fast`. Recall depends on the data: measure
+`balanced` costs little more than `fast` (0.1 ms), and it is the default. Use
+`fast` for large batches where throughput counts more than the last 9% of
+recall. Recall depends on the data: measure
 it on your own vectors with `precision='exact'` as the reference. For 100
 queries of a query table (here SIFT1M in schema VVBENCH):
 
@@ -617,10 +630,10 @@ queries of a query table (here SIFT1M in schema VVBENCH):
 
      recall
     --------
-      0.930
+      0.990
 
 Add the settings you want to try to the parameters of `a`, for example
-`precision='balanced'` or `ef_search=150`.
+`precision='fast'` or `ef_search=150`.
 
 Build options of an HNSW index (`set_index_options`, then `refresh_index`):
 
@@ -636,7 +649,8 @@ vvector ef_search = '150'`) or per index (`set_index_options`).
 | If you want | Set |
 |---|---|
 | the lowest latency for single queries | the `query` parameter, `FROM <index>_snap`, deploy with `FENCED=mixed`; `vknn` is a little faster still but has no stale check |
-| higher recall | `precision='balanced'` or `'best'`, or a larger `ef_search`; for all queries of an index: `set_index_options` |
+| higher recall | `precision='best'`, or a larger `ef_search`; for all queries of an index: `set_index_options` |
+| more throughput in large batches | `precision='fast'` (recall 0.89 instead of 0.98 on SIFT1M) |
 | exact answers on an HNSW index | `precision='exact'` or `exact=true` for that query |
 | results that include every committed change | `freshness='exact'` and `FROM <index>_delta` (per query, session or index) |
 | many queries at once | one vsearch statement with all query rows (a table), not one statement per query |
@@ -698,24 +712,51 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
   through `vvector.probe`); every node answers from its own cache file.
   Tested on one node and on a 3-node Eon cluster. A search runs on the node
   that receives the statement; the index is not split over nodes.
-- **Journal on a cluster**: a statement over the `_delta` view reads the
-  journal on every node and sends the rows to the node that runs the search,
-  even when no row qualifies: 15 to 17 ms per statement on the 3-node test
-  cluster. A replicated projection of the journal, sorted by the version
-  column, makes that read local:
+- **Journal replica on a cluster**: a statement over the `_delta` view
+  reads the journal. With the journal segmented over the nodes, every node
+  scans its part and sends the rows to the node that runs the search, even
+  when no row qualifies: 15 to 17 ms per statement on the 3-node test
+  cluster. vvector therefore keeps a replica of the journal: a projection
+  `<schema>.<index>_journal_rep` of the id, vector, delete and version
+  columns, sorted by the version column, `UNSEGMENTED ALL NODES`, with
+  statistics on the version column. The planner then reads the delta on the
+  node that runs the search.
 
-      CREATE PROJECTION app.docs_rep AS SELECT id, vec, del, ts FROM app.docs ORDER BY ts UNSEGMENTED ALL NODES;
-      SELECT REFRESH('app.docs');
-      SELECT ANALYZE_STATISTICS('app.docs');
+  | Measured on the 3-node test cluster (100,000 x 128, mixed mode) | Without | With the replica |
+  |---|---:|---:|
+  | search over the `_delta` view, empty delta | 23.4 ms | 10.7 ms |
+  | the same with 1000 journal rows | 31.3 ms | 14.6 ms |
+  | storage per node | the node's share of the journal | a full copy of the journal (in Eon: in the depot of every node, one more copy in communal storage) |
+  | bulk insert into the journal (20,000 rows) | 250 to 340 ms | 830 ms |
+  | single-row insert and commit | about the same | about the same |
+  | `refresh_index` | no difference | no difference |
 
-  Check that `EXPLAIN SELECT ... FROM app.docs_delta` shows the scan of
-  `docs_rep` with "Execute on: Query Initiator". Without the statistics the
-  planner kept the segmented projection. Measured: the empty delta 4 ms
-  instead of 17 ms, 1000 journal rows 7 ms instead of 25 ms (mixed mode). The
-  price: every node stores the whole journal (81 MB per node for 100,000
-  vectors of 128 dimensions, against 27 MB segmented over 3 nodes), and every
-  insert writes to every node. Worth it when single searches with
-  `freshness='exact'` matter and the journal fits on every node.
+  Because the cost grows with the journal, the default mode `auto` keeps the
+  replica only where it is cheap: on a database with more than one node, when
+  one copy of the journal takes at most 2048 MB and at most 10% of the
+  smallest free disk space of a node. `register_index` and every
+  `refresh_index` apply the rule: they make the replica (and refresh its
+  statistics), or drop it when the journal has grown beyond the limit. On a
+  single node there is nothing to gain and nothing is made. Indexes on the
+  same journal columns share one replica; `unregister_index` drops it with
+  the last of them. Change the mode per index:
+
+      CALL vvector.set_journal_replica('docs', 'on');     -- always, whatever the size
+      CALL vvector.set_journal_replica('docs', 'off');    -- never (drops it)
+      CALL vvector.set_journal_replica('docs', 'auto');   -- the default rule
+
+  `register_index`, `refresh_index`, `set_journal_replica` and `status` print
+  what was done and why, for example
+  `journal replica: created app.docs_journal_rep (journal 79 MB, one copy on each of 3 nodes)` or
+  `journal replica: none: the journal takes 5120 MB, more than the limit of 2048 MB ...`.
+  A new replica is not made while another transaction writes to the journal
+  (Vertica's `CREATE PROJECTION` would wait for it to end): the message says
+  "postponed" and the next refresh tries again, so a refresh never hangs
+  behind a long load. Making the projection needs the right to create a
+  projection on the journal table. Without it nothing fails: the message says "not created",
+  gives the reason, and lists the three statements a DBA can run instead.
+  vvector never drops a projection it did not make, and in `auto` mode it
+  makes none when the table has an unsegmented projection already.
 - **What each node has**:
 
       SELECT node_name, index_name, snapshot_id, vector_count, dims, metric, index_type, freshness_default, loaded
@@ -723,7 +764,7 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
 
          node_name    | index_name | snapshot_id | vector_count | dims | metric | index_type | freshness_default | loaded
       ----------------+------------+-------------+--------------+------+--------+------------+-------------------+--------
-       v_vdb_node0001 | docs       |         240 |            5 |    3 | cosine | hnsw       | exact             | t
+       v_vdb_node0001 | docs       |         342 |            5 |    3 | cosine | hnsw       | exact             | t
 
   Without `index_name` it lists every index in the cache directory.
   Other columns: max_ver, quantization, graph_bytes, tombstones,
@@ -825,6 +866,8 @@ cache), starting with `vknn:`.
 | `vvector.<procedure>: index x is not registered` | a wrong index name | `SELECT index_name FROM vvector.manifest` |
 | `vvector.set_index_options: ...` | a value out of range or of a later milestone | see the option table |
 | `vvector.schedule_refresh: cron_expr may hold digits, spaces and * / , - only` | a bad cron expression | e.g. `'0 * * * *'` |
+| `vvector.set_journal_replica: mode must be auto, on or off` | a bad mode | `'auto'`, `'on'` or `'off'` |
+| `journal replica: not created: ... A DBA can run: CREATE PROJECTION ...` (a NOTICE) | the caller may not create a projection on the journal table, or the name is taken | run the three statements as the table owner, or ignore it (searches work, only the cluster delta read stays slower) |
 
 Warnings of `status` and `sizing` are explained in their text.
 
@@ -863,9 +906,9 @@ parameter):
 | Statement | Fenced | Mixed (or unfenced) |
 |---|---:|---:|
 | `SELECT 1` (the floor of any statement) | 0.8 ms | 0.8 ms |
-| HNSW: vsearch `FROM sift_hnsw_snap` | 7.8 ms | 1.9 ms |
-| HNSW: the same over `sift_hnsw_delta`, `freshness='exact'`, empty delta | 8.9 ms | 2.7 ms |
-| HNSW: `vknn ... FROM dual` | 7.8 ms | 1.4 ms |
+| HNSW (precision balanced): vsearch `FROM sift_hnsw_snap` | 7.1 ms | 1.9 ms |
+| HNSW: the same over `sift_hnsw_delta`, `freshness='exact'`, empty delta | 8.0 ms | 2.8 ms |
+| HNSW: `vknn ... FROM dual` | 7.4 ms | 1.6 ms |
 | flat: vsearch `FROM sift_snap` | 12.4 ms | 5.1 ms |
 | flat: the same over `sift_delta`, empty delta | 13.6 ms | 6.2 ms |
 | SQL full scan (`ORDER BY VECTOR_L2(vec, q) LIMIT 10`) | 7673 ms | |
@@ -884,8 +927,9 @@ parameter):
 On the 3-node Eon test cluster (x86_64, 2 cores and 15 GB per node, Vertica
 26.2.0-2; HNSW index of 100,000 random vectors of 128 dimensions) a statement
 costs more: `SELECT 1` 2.7 ms, vsearch `_snap` 12.8 ms fenced and 7.6 ms mixed,
-`vknn` 12.1 and 5.9 ms, the empty delta 27.9 and 24.2 ms (12 ms mixed with a
-replicated journal, see [Operations](#operations)).
+`vknn` 12.1 and 5.9 ms (precision fast). An exact search over the empty delta
+takes 10.7 ms mixed with the journal replica, which is made there by default,
+and 23.4 ms without it (see [Operations](#operations)).
 
 Fenced mode adds about 6 ms per statement, more than the search itself; for
 single searches `FENCED=mixed` gives the unfenced latency while the memory-
@@ -915,12 +959,14 @@ Vertica and SDK:
   Vertica 26.2 (INTERNAL 5445); cast to `ARRAY[FLOAT]` first.
 - Fenced mode adds about 6 ms per statement; unfenced functions run inside
   the Vertica process, where a fault stops the node.
-- On a multi-node cluster a statement over the `_delta` view reads the journal
-  on every node and sends the rows to the node that runs the search, even when
-  no row qualifies: 15 to 17 ms more per statement on the 3-node test cluster
-  (1 ms on one node). Snapshot-only statements (`_snap` view, `FROM dual`,
-  `vknn`) do not pay it; a replicated journal projection removes most of it
-  (see [Operations](#operations)).
+- On a multi-node cluster a statement over the `_delta` view without the
+  journal replica reads the journal on every node and sends the rows to the
+  node that runs the search: 15 to 17 ms more per statement on the 3-node test
+  cluster. The replica (automatic up to 2048 MB of journal, see
+  [Operations](#operations)) costs a full copy of the journal on every node
+  and makes bulk loads into the journal about 2.5 times slower.
+  Snapshot-only statements (`_snap` view, `FROM dual`, `vknn`) do not read
+  the journal at all.
 - An `ARRAY[...]` literal of many numbers is slow to parse (about 7 ms for
   128): use the `query` parameter.
 

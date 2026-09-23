@@ -195,3 +195,22 @@ Check again on other versions.
   the planner choose it. Before the statistics the planner kept the segmented projection. Then
   EXPLAIN shows the scan with "Execute on: Query Initiator" and no Send/Recv; the empty delta costs
   about 4 ms instead of 17 ms. `v_monitor.projection_storage` lists the full copy on every node.
+- The planner kept using that projection after the table had doubled without new statistics
+  (estimate 21K rows for the delta scan). A refresh build (`ROW_NUMBER() OVER(PARTITION BY id ...)`
+  over the whole journal) still reads the segmented projection on all nodes.
+- Eon: an UNSEGMENTED ALL NODES projection lives in the `replica` shard: `v_monitor.storage_containers`
+  lists each of its containers once per node with the same `sal_storage_id` (one copy in communal
+  storage); `v_monitor.projection_storage` shows the full size on every node (the depot).
+  Bulk `INSERT ... SELECT` into the table was about 2.5 times slower with it (20k rows of 128 FLOAT:
+  830 against 250 to 380 ms); single-row INSERT + COMMIT about the same.
+- `v_monitor.disk_storage` (node_name, storage_usage 'DATA,TEMP' / 'DEPOT' / 'CATALOG',
+  disk_space_free_mb) gives the free space per storage location, on Eon and on a single node.
+
+## PL/vSQL (verified 2026-09-23, 26.2.0-1)
+- `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END;` inside a procedure catches an error of dynamic SQL
+  (`EXECUTE 'CREATE PROJECTION ...'` on a name that exists: SQLSTATE 42710, SQLERRM `Object "x"
+  already exists`); the procedure continues. `CREATE PROJECTION`, `SELECT REFRESH('t')`,
+  `SELECT ANALYZE_STATISTICS('t.col')` and `DROP PROJECTION IF EXISTS` work through `EXECUTE`.
+- Eon 26.2.0-2: with another session holding an open INSERT on a table, `CREATE PROJECTION` on it
+  and `SELECT REFRESH('t')` wait until that transaction ends (12 s behind a writer that committed
+  after 15 s); `ANALYZE_STATISTICS('t.col')` (60 ms), `DROP PROJECTION` and `SELECT` do not wait.

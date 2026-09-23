@@ -5,6 +5,7 @@
 --                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
 --                             freshness_default, ef_search_default, threads_default)
 --   vvector.refresh_index(index_name)
+--   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
 --   vvector.status(index_name)
 --   vvector.sizing(vectors, dims, index_type, quantization)
@@ -96,6 +97,166 @@ BEGIN
     IF got IS NULL OR got < want THEN
         RAISE EXCEPTION 'vvector.push_options: index %: options written on % of % nodes', nm, COALESCE(got, 0), want;
     END IF;
+END;
+$$;
+
+-- The journal replica: an UNSEGMENTED ALL NODES projection of the journal, sorted by the version
+-- column. On a cluster a query over the delta view otherwise reads the journal on every node and sends
+-- the rows to the node that runs the search, even when no row qualifies (15 to 17 ms per statement on
+-- the 3-node test cluster; with the replica 4 ms). The planner uses the replica once it has statistics
+-- on the version column, so they are taken when it is made and at every refresh.
+-- Cost (measured, docs/design.md): a full copy of the journal on every node (in Eon: one more copy in
+-- communal storage plus the depot of every node), bulk loads into the journal about 2.5 times slower.
+-- Mode (manifest journal_replica, vvector.set_journal_replica):
+--   auto  kept while the database has more than one node and one copy of the journal is at most
+--         2048 MB and at most 10% of the smallest free disk of a node; made or dropped by
+--         register_index and by every refresh_index as the journal grows
+--   on    always kept (also on one node, where it only costs)
+--   off   never kept
+-- CREATE PROJECTION and REFRESH wait for open writers of the table, so the replica is not made while
+-- another transaction writes to it (postponed to the next check). Only a projection vvector made itself is ever dropped. Indexes on the same journal columns share
+-- one replica. A failure (for example no right to create a projection on the table) is not an error:
+-- replica_note says what happened and gives the statements for a DBA.
+-- The outcome goes to manifest replica_note: NOTICEs of a nested CALL do not reach the caller.
+CREATE OR REPLACE PROCEDURE vvector.apply_replica(nm VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    tab VARCHAR(256); sch VARCHAR(128); tbl VARCHAR(128); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128);
+    rmode VARCHAR(16); proj VARCHAR(256); other VARCHAR(256); foreign_proj VARCHAR(256); note VARCHAR(1000);
+    nodes INT; journal_mb INT; free_mb INT; limit_mb INT; keep BOOLEAN; users INT; ddl VARCHAR(2000); r VARCHAR(1000);
+    writers INT;
+BEGIN
+    tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
+    IF tab IS NULL THEN
+        RAISE EXCEPTION 'vvector.apply_replica: index % is not registered', nm;
+    END IF;
+    sch := SPLIT_PART(tab, '.', 1);
+    tbl := SPLIT_PART(tab, '.', 2);
+    idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
+    vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
+    op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
+    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
+    rmode := (SELECT COALESCE(MAX(journal_replica), 'auto') FROM vvector.manifest WHERE index_name = nm);
+    proj := (SELECT MAX(replica_projection) FROM vvector.manifest WHERE index_name = nm);
+
+    nodes := (SELECT COUNT(*) FROM v_catalog.nodes);
+    -- One copy of the journal: the largest segmented projection of the table, summed over the nodes.
+    journal_mb := (SELECT COALESCE(MAX(b), 0) FROM (
+                     SELECT SUM(used_bytes) // 1048576 AS b FROM v_monitor.projection_storage
+                     WHERE LOWER(anchor_table_schema) = LOWER(sch) AND LOWER(anchor_table_name) = LOWER(tbl)
+                       AND projection_name IN (SELECT projection_name FROM v_catalog.projections
+                                               WHERE LOWER(projection_schema) = LOWER(sch) AND LOWER(anchor_table_name) = LOWER(tbl)
+                                                 AND is_segmented)
+                     GROUP BY projection_name) s);
+    free_mb := (SELECT COALESCE(MIN(disk_space_free_mb), 0) FROM v_monitor.disk_storage
+                WHERE storage_usage ILIKE '%DATA%' OR storage_usage ILIKE '%DEPOT%');
+    limit_mb := LEAST(2048, free_mb // 10);
+    -- An unsegmented projection of the table that vvector did not make: the reads are local already.
+    foreign_proj := (SELECT MAX(projection_schema || '.' || projection_name) FROM v_catalog.projections
+                     WHERE LOWER(projection_schema) = LOWER(sch) AND LOWER(anchor_table_name) = LOWER(tbl) AND NOT is_segmented
+                       AND LOWER(projection_schema || '.' || projection_name) <> LOWER(COALESCE(proj, ''))
+                       AND LOWER(projection_schema || '.' || projection_name) NOT IN
+                           (SELECT LOWER(replica_projection) FROM vvector.manifest WHERE replica_projection IS NOT NULL));
+
+    keep := ver IS NOT NULL AND (rmode = 'on' OR (rmode = 'auto' AND nodes > 1 AND journal_mb <= limit_mb AND foreign_proj IS NULL));
+    note := '';
+    IF ver IS NULL THEN
+        note := 'none: a static index (no version column) has no delta view';
+    ELSIF rmode = 'off' THEN
+        note := 'none: journal_replica is off';
+    ELSIF rmode = 'auto' AND nodes = 1 THEN
+        note := 'none: a single node reads the delta locally already';
+    ELSIF rmode = 'auto' AND foreign_proj IS NOT NULL THEN
+        note := 'none: the table has an unsegmented projection already (' || foreign_proj || ')';
+    ELSIF rmode = 'auto' AND journal_mb > limit_mb THEN
+        note := 'none: the journal takes ' || journal_mb || ' MB, more than the limit of ' || limit_mb
+             || ' MB for a copy on every node (2048 MB, and at most 10% of the smallest free disk). CALL vvector.set_journal_replica('''
+             || nm || ''', ''on'') makes it anyway';
+    END IF;
+
+    writers := 0;
+    IF keep THEN
+        IF proj IS NOT NULL AND (SELECT COUNT(*) FROM v_catalog.projections
+                                 WHERE LOWER(projection_schema || '.' || projection_name) = LOWER(proj)) = 0 THEN
+            proj := NULL;                        -- dropped by someone else: make it again
+        END IF;
+        other := NULL;
+        IF proj IS NULL THEN
+            other := (SELECT MAX(replica_projection) FROM vvector.manifest
+                      WHERE LOWER(source_table) = LOWER(tab) AND index_name <> nm AND replica_projection IS NOT NULL
+                        AND LOWER(id_col) = LOWER(idc) AND LOWER(vec_col) = LOWER(vc) AND LOWER(ver_col) = LOWER(ver)
+                        AND LOWER(COALESCE(op_col, '')) = LOWER(COALESCE(op, '')));
+        END IF;
+        IF proj IS NOT NULL THEN
+            note := 'kept ' || proj;
+        ELSIF other IS NOT NULL THEN
+            proj := other;
+            note := 'shared ' || proj;
+        ELSE
+            -- CREATE PROJECTION and REFRESH wait until every open transaction that writes to the table
+            -- has ended. A refresh must not hang behind a long load: try again at the next refresh.
+            writers := (SELECT COUNT(DISTINCT transaction_id) FROM v_monitor.locks
+                        WHERE LOWER(object_name) = LOWER('Table:' || tab) AND (lock_mode ILIKE '%I%' OR lock_mode = 'X')
+                          AND transaction_id <> (SELECT transaction_id FROM v_monitor.current_session));
+        END IF;
+        IF proj IS NULL AND other IS NULL AND writers > 0 THEN
+            note := 'postponed: ' || writers || ' open transactions write to ' || tab
+                 || ' and a new projection would wait for them; the next refresh_index (or set_journal_replica) tries again';
+        ELSIF proj IS NULL AND other IS NULL THEN
+            ddl := 'CREATE PROJECTION ' || sch || '.' || nm || '_journal_rep AS SELECT ' || idc || ', ' || vc
+                || CASE WHEN op IS NULL THEN '' ELSE ', ' || op END || ', ' || ver || ' FROM ' || tab
+                || ' ORDER BY ' || ver || ' UNSEGMENTED ALL NODES';
+            BEGIN
+                EXECUTE ddl;
+                r := EXECUTE 'SELECT REFRESH(' || QUOTE_LITERAL(tab) || ')';
+                proj := sch || '.' || nm || '_journal_rep';
+                note := 'created ' || proj || ' (journal ' || journal_mb || ' MB, one copy on each of ' || nodes || ' nodes)';
+            EXCEPTION WHEN OTHERS THEN
+                proj := NULL;
+                note := 'not created: ' || LEFT(SQLERRM, 300) || '. A DBA can run: ' || ddl || '; SELECT REFRESH('
+                     || QUOTE_LITERAL(tab) || '); SELECT ANALYZE_STATISTICS(' || QUOTE_LITERAL(tab || '.' || ver) || ');';
+            END;
+        END IF;
+        IF proj IS NOT NULL THEN
+            BEGIN
+                r := EXECUTE 'SELECT ANALYZE_STATISTICS(' || QUOTE_LITERAL(tab || '.' || ver) || ')';
+            EXCEPTION WHEN OTHERS THEN
+                note := note || '; statistics on ' || ver || ' failed (' || LEFT(SQLERRM, 200) || '): the planner may not use it';
+            END;
+            IF nodes = 1 THEN
+                note := note || '; a single node gains nothing from it';
+            END IF;
+        END IF;
+    ELSIF proj IS NOT NULL THEN
+        users := (SELECT COUNT(*) FROM vvector.manifest WHERE LOWER(replica_projection) = LOWER(proj) AND index_name <> nm);
+        IF users = 0 THEN
+            BEGIN
+                EXECUTE 'DROP PROJECTION IF EXISTS ' || proj;
+                note := note || '; dropped ' || proj;
+            EXCEPTION WHEN OTHERS THEN
+                note := note || '; could not drop ' || proj || ': ' || LEFT(SQLERRM, 200);
+            END;
+        END IF;
+        proj := NULL;
+    END IF;
+    PERFORM UPDATE vvector.manifest SET replica_projection = proj, replica_note = note WHERE index_name = nm;
+    PERFORM COMMIT;
+END;
+$$;
+
+-- journal_replica mode of an index: auto (the default), on or off (see apply_replica). Applies at once.
+CREATE OR REPLACE PROCEDURE vvector.set_journal_replica(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
+BEGIN
+    IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) = 0 THEN
+        RAISE EXCEPTION 'vvector.set_journal_replica: index % is not registered', nm;
+    END IF;
+    IF x_mode IS NULL OR x_mode NOT IN ('auto', 'on', 'off') THEN
+        RAISE EXCEPTION 'vvector.set_journal_replica: mode must be auto, on or off';
+    END IF;
+    PERFORM UPDATE vvector.manifest SET journal_replica = x_mode WHERE index_name = nm;
+    PERFORM COMMIT;
+    PERFORM CALL vvector.apply_replica(nm);
+    RAISE NOTICE 'vvector: index %: journal replica %: %', nm, x_mode,
+                 (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
 END;
 $$;
 
@@ -196,6 +357,7 @@ BEGIN
             VALUES (nm, src_table, id_column, vec_column, op_column, ver_column, m, measure, kind);
     PERFORM COMMIT;
     PERFORM CALL vvector.make_views(nm);
+    PERFORM CALL vvector.apply_replica(nm);
 END;
 $$;
 
@@ -211,6 +373,7 @@ BEGIN
     ELSE
         RAISE NOTICE 'vvector: index % registered. Next: CALL vvector.refresh_index(''%''). Queries read %_snap (snapshot only) or %_delta (with the changes since the refresh) in schema %; grant SELECT on them to the users who may search the index.',
                      nm, nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
     END IF;
 END;
 $$;
@@ -226,6 +389,7 @@ BEGIN
     ELSE
         RAISE NOTICE 'vvector: index % registered. Next: CALL vvector.refresh_index(''%''). Queries read %_snap (snapshot only) or %_delta (with the changes since the refresh) in schema %; grant SELECT on them to the users who may search the index.',
                      nm, nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
     END IF;
 END;
 $$;
@@ -411,6 +575,9 @@ BEGIN
         IF n > 100000 THEN
             RAISE WARNING 'vvector: index %: the delta holds % rows. Every exact query searches them: refresh more often.', nm, n;
         END IF;
+        RAISE NOTICE 'vvector: index %: journal replica %: %', nm,
+                     (SELECT COALESCE(MAX(journal_replica), 'auto') FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT COALESCE(MAX(replica_note), 'not checked yet (the next refresh does it)') FROM vvector.manifest WHERE index_name = nm);
     END IF;
     n := (SELECT COUNT(DISTINCT transaction_id) FROM v_monitor.locks WHERE LOWER(object_name) = LOWER('Table:' || tab)
           AND (lock_mode ILIKE '%I%' OR lock_mode = 'X'));
@@ -592,6 +759,12 @@ BEGIN
     PERFORM COMMIT;
     RAISE NOTICE 'vvector: index % refreshed: snapshot %, % vectors of % dimensions, % MB, % seconds',
                  nm, sid, n_vec, n_dims, n_bytes // 1048576, secs;
+
+    -- 7. Journal replica: made, kept (with fresh statistics) or dropped as the journal grows.
+    IF ver IS NOT NULL THEN
+        PERFORM CALL vvector.apply_replica(nm);
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
+    END IF;
 END;
 $$;
 
@@ -613,7 +786,8 @@ BEGIN
 END;
 $$;
 
--- Removes the schedule, the views, the snapshots and the manifest row.
+-- Removes the schedule, the journal replica (unless another index shares it), the views, the snapshots
+-- and the manifest row.
 -- Cache files stay on the nodes: no vvector function deletes paths on request. Remove <cache_dir>/<index_name> by hand.
 CREATE OR REPLACE PROCEDURE vvector.unregister_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
@@ -625,6 +799,9 @@ BEGIN
     END IF;
     EXECUTE 'DROP TRIGGER IF EXISTS vvector.' || nm || '_refresh_trigger';
     EXECUTE 'DROP SCHEDULE IF EXISTS vvector.' || nm || '_refresh_schedule';
+    PERFORM UPDATE vvector.manifest SET journal_replica = 'off' WHERE index_name = nm;
+    PERFORM COMMIT;
+    PERFORM CALL vvector.apply_replica(nm);     -- drops the replica unless another index shares it
     EXECUTE 'DROP VIEW IF EXISTS ' || SPLIT_PART(tab, '.', 1) || '.' || nm || '_delta';
     EXECUTE 'DROP VIEW IF EXISTS ' || SPLIT_PART(tab, '.', 1) || '.' || nm || '_snap';
     PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm;
@@ -641,6 +818,8 @@ DROP PROCEDURE IF EXISTS vvector.make_delta_view(VARCHAR);
 -- Only sizing (an estimate from its arguments and the node memory) stays open to everyone.
 REVOKE EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) FROM PUBLIC;
@@ -656,6 +835,7 @@ GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VAR
 GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.status(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) TO vvector_admin;

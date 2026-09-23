@@ -106,7 +106,7 @@ for m in ${MODES//,/ }; do
     fi
     echo "flat index $IX:"
     scripts/latency.sh --index="$IX" --schema="$SCHEMA" --runs="$RUNS" --shapes=select1,vversion,snap,delta0,threads1 2>&1 | grep -v NOTICE
-    echo "HNSW index $HX (precision fast):"
+    echo "HNSW index $HX (precision balanced, the default):"
     scripts/latency.sh --index="$HX" --schema="$SCHEMA" --runs="$RUNS" --shapes=snap,dual,delta0,vknn,vknnrow 2>&1 | grep -v NOTICE
     batch() {   # LABEL WHAT SQL
         for i in 1 2 3; do sql "SELECT /*+LABEL(${TAG}_$1_$m)*/ COUNT(*) FROM ($3) r" > /dev/null; done
@@ -118,10 +118,10 @@ for m in ${MODES//,/ }; do
     batch flat "vsearch flat, $BATCH queries in one statement, median of 3" \
         "SELECT vvector.vsearch($V USING PARAMETERS index_name='$IX', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${IX}_snap UNION ALL $QS) x"
     batch hnsw "vsearch HNSW (fast), $BATCH queries in one statement" \
+        "SELECT vvector.vsearch($V USING PARAMETERS index_name='$HX', k=10, precision='fast') OVER() FROM (SELECT * FROM $SCHEMA.${HX}_snap UNION ALL $QS) x"
+    batch hnswb "vsearch HNSW (balanced, the default), $BATCH queries in one statement" \
         "SELECT vvector.vsearch($V USING PARAMETERS index_name='$HX', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${HX}_snap UNION ALL $QS) x"
-    batch hnswb "vsearch HNSW (balanced), $BATCH queries in one statement" \
-        "SELECT vvector.vsearch($V USING PARAMETERS index_name='$HX', k=10, precision='balanced') OVER() FROM (SELECT * FROM $SCHEMA.${HX}_snap UNION ALL $QS) x"
-    batch vknn "vknn HNSW (fast), $BATCH query rows in one statement" \
+    batch vknn "vknn HNSW (balanced), $BATCH query rows in one statement" \
         "SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='$HX', k=10) FROM $SCHEMA.sift_query q WHERE q.qid < $BATCH"
 done
 

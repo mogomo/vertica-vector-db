@@ -10,7 +10,7 @@
 #   same ids, scores within 1e-5, ranks), before and after 1000 journaled adds, 1000 deletes and
 #   500 replacements without a refresh; so does an ef_search larger than the index (the graph
 #   reaches every vector);
-# - recall@10 of the precision levels fast, balanced and best against the full scan;
+# - recall@10 of the precision levels fast, balanced (the default) and best against the full scan;
 # - freshness='exact' never returns a deleted id; 1 and 8 threads give the same results;
 # - vknn (no OVER(), one row in, k rows out) gives what vsearch gives with freshness snapshot;
 # - set_index_options m and ef_construction take effect at the next refresh;
@@ -88,8 +88,8 @@ compare "vh_l2: exact=true equals the full scan, k 100" l2 queries20 100 exact "
 compare "vh_cos: ef_search larger than the index reaches every vector" cos queries20 10 exact ", ef_search=$BIG"
 
 echo "== recall of the precision levels (random data, 16 dimensions)"
-recall "vh_l2: precision fast (the default) recall@10 >= 0.90" l2 queries 10 "" 0.90
-recall "vh_l2: precision balanced recall@10 >= 0.97" l2 queries 10 ", precision='balanced'" 0.97
+recall "vh_l2: precision fast recall@10 >= 0.90" l2 queries 10 ", precision='fast'" 0.90
+recall "vh_l2: precision balanced (the default) recall@10 >= 0.97" l2 queries 10 "" 0.97
 recall "vh_l2: precision best recall@10 >= 0.995" l2 queries 10 ", precision='best'" 0.995
 recall "vh_cos: precision balanced recall@10 >= 0.97" cos queries 10 ", precision='balanced'" 0.97
 recall "vh_dot: precision balanced recall@10 >= 0.97" dot queries 10 ", precision='balanced'" 0.97
