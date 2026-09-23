@@ -3,9 +3,12 @@
 // Output (node_name, index_name, snapshot_id, max_ver, vector_count, dims, metric, index_type,
 // quantization, graph_bytes, tombstones, base_snapshot, precision_default, freshness_default,
 // ef_search_default, threads_default, cache_file, loaded). The defaults are the index defaults of
-// set_index_options (NULL = the built-in default).
+// set_index_options (NULL = the built-in default). vector_count counts the live vectors; the
+// snapshot has vector_count + tombstones positions.
 // Without index_name it lists every index of the cache directory that has an ACTIVE file.
 #include "udx_common.h"
+
+#include <limits>
 
 using namespace Vertica;
 using namespace vvector_udx;
@@ -40,12 +43,14 @@ class VInfo : public TransformFunction
                 out.getStringRef(C_NODE).copy(node);
                 out.getStringRef(C_INDEX).copy(name);
                 try {
+                    // Always read ACTIVE again, not what this process trusted for the last 200 ms:
+                    // refresh_index calls vinfo right after a vload in the same session.
                     vvector::MappedSnapshot snap;
-                    snap.open_active(cache_dir, name);
+                    snap.open_active(cache_dir, name, std::numeric_limits<std::int64_t>::max());
                     const vvector::VectorSet &s = snap.vectors();
                     out.setInt(C_SNAPSHOT, snap.snapshot_id());
                     out.setInt(C_MAX_VER, s.max_ver);
-                    out.setInt(C_COUNT, (vint)s.count);
+                    out.setInt(C_COUNT, (vint)(s.count - s.tombstones));     // live vectors
                     out.setInt(C_DIMS, (vint)s.dims);
                     out.getStringRef(C_METRIC).copy(vvector::metric_name(s.metric));
                     out.getStringRef(C_TYPE).copy(s.has_graph() ? "hnsw" : "flat");

@@ -214,3 +214,29 @@ Check again on other versions.
 - Eon 26.2.0-2: with another session holding an open INSERT on a table, `CREATE PROJECTION` on it
   and `SELECT REFRESH('t')` wait until that transaction ends (12 s behind a writer that committed
   after 15 s); `ANALYZE_STATISTICS('t.col')` (60 ms), `DROP PROJECTION` and `SELECT` do not wait.
+
+## Verified in milestone M3 (26.2.0-1 single node, 2026-09-23)
+- `UPDATE` writes a new row version with a new commit epoch: the `epoch` pseudo-column of the
+  updated row changed from 83557 to 83559, and the row count of the table stays the same. So a
+  row count cannot see a physical UPDATE of an old journal row; incremental refresh therefore
+  detects only rows that are removed or added with old versions (count of rows up to the
+  previous boundary), and a physical UPDATE needs `refresh_index(name, 'full')`. Not used: row
+  epochs for detection. What mergeout does to the epoch of rows older than the AHM was not
+  verified (on the test VM the AHM did not move for several minutes, and `MAKE_AHM_NOW()`
+  would have changed the whole database's history).
+- `DO_TM_TASK('mergeout', 'schema.table')` runs a mergeout of one table.
+- Deleted rows of `vvector.snapshot` (an old snapshot of 574 to 612 MB every refresh) were purged
+  by the Tuple Mover by itself during 100 refreshes in 15 minutes: the disk use stayed within
+  7 GB of its start. Vertica stores the 8 MB chunks compressed to about half.
+- PL/vSQL: `x := SPLIT_PART(text_var, ' ', 1)::INT;` works (a cast on an expression, not a subquery).
+- `OCTET_LENGTH(chunk)` of LONG VARBINARY reads the value: `SUM(OCTET_LENGTH(chunk))` over a
+  574 MB snapshot takes 1.1 s. `MAX(byte_offset)` plus the length of that one chunk takes
+  milliseconds.
+- Stored procedures run with the rights of the caller, also for nested CALLs: a user with only the
+  role vvector_admin got "ERROR 3457: Function vvector.register_index_core(...) does not exist, or
+  permission is denied" until EXECUTE on the internal procedures was granted to vvector_admin
+  (found in M3; the gap existed since M1, when every test ran as dbadmin). With the grants such a
+  user registers, refreshes (full and incremental), asks status and unregisters, given USAGE and
+  CREATE on the schema of the source table and SELECT on it.
+- `v_monitor.locks` shows a non-superuser the locks of other users' sessions too (an open INSERT of
+  dbadmin was visible to a user with only vvector_admin): the delta boundary works for them.

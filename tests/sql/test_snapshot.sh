@@ -121,8 +121,8 @@ FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "quantization sq8 says when it comes" "quantization sq8 is not implemented yet (milestone M4)" "
 SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
-expect "base_snapshot says when it comes" "incremental builds are not implemented yet (milestone M3)" "
-SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5) OVER()
+expect "an incremental build needs its base snapshot in the node cache" "base snapshot 5 is not usable in the cache of .*refresh with mode full" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5$CD) OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "rows with del = true are left out of a full build; l1 is a metric" "^built: 2 vectors of 2$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (

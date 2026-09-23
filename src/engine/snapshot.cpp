@@ -45,8 +45,9 @@ std::int64_t VectorSet::find(std::int64_t id) const
         else hi = mid;
     }
     if (lo == count) return -1;
+    // With an id_index the first entry of an id is its highest position: the only one that can be live.
     const std::uint64_t pos = id_index ? id_index[lo] : lo;
-    return ids[pos] == id ? static_cast<std::int64_t>(pos) : -1;
+    return ids[pos] == id && !dead(pos) ? static_cast<std::int64_t>(pos) : -1;
 }
 
 // ---- SnapshotBuffer
@@ -213,18 +214,30 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
 
     if (verify) {
         if (snapshot_checksum(data, size) != h.checksum) fail("checksum mismatch");
-        for (std::uint64_t i = 1; i < s.count; ++i) {
-            const std::int64_t a = s.id_index ? s.ids[s.id_index[i - 1]] : s.ids[i - 1];
-            const std::int64_t b = s.id_index ? s.ids[s.id_index[i]] : s.ids[i];
-            if (a >= b) fail("ids are not unique and ascending");
-        }
-        if (s.id_index)
-            for (std::uint64_t i = 0; i < s.count; ++i)
-                if (s.id_index[i] >= s.count) fail("id_index points outside the vectors");
         if (s.tombstone_bits) {
             std::uint64_t dead = 0;
             for (std::uint64_t w = 0; w < (s.count + 63) / 64; ++w) dead += __builtin_popcountll(s.tombstone_bits[w]);
             if (dead != s.tombstones) fail("tombstone count does not match the bitset");
+            if (s.count % 64 && s.tombstone_bits[s.count / 64] >> (s.count % 64)) fail("tombstone bits beyond the vectors");
+        }
+        if (!s.id_index) {
+            for (std::uint64_t i = 1; i < s.count; ++i)
+                if (s.ids[i - 1] >= s.ids[i]) fail("ids are not unique and ascending");
+        } else {
+            // Every position once; ids ascending; an id at several positions (an incremental build
+            // appends a changed vector and tombstones the old position): highest position first,
+            // and only that one may be live.
+            std::vector<std::uint64_t> listed((s.count + 63) / 64, 0);
+            for (std::uint64_t i = 0; i < s.count; ++i) {
+                const std::uint32_t p = s.id_index[i];
+                if (p >= s.count) fail("id_index points outside the vectors");
+                if (listed[p >> 6] >> (p & 63) & 1u) fail("id_index lists a position twice");
+                listed[p >> 6] |= 1ull << (p & 63);
+                if (i == 0) continue;
+                const std::uint32_t q = s.id_index[i - 1];
+                if (s.ids[q] > s.ids[p]) fail("id_index is not sorted by id");
+                if (s.ids[q] == s.ids[p] && (q < p || !s.dead(p))) fail("an id is live at two positions");
+            }
         }
     }
     return s;

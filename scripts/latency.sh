@@ -3,12 +3,16 @@
 # and reports the median and 99th percentile, at the client (vsql \timing) and at the server
 # (v_monitor.query_requests, found by a LABEL hint unique to this run).
 #
-#   scripts/latency.sh --index=NAME --schema=SCHEMA [--runs=N] [--shapes=a,b,...] [--echo_only]
+#   scripts/latency.sh --index=NAME --schema=SCHEMA [--runs=N] [--shapes=a,b,...] [--first_call] [--echo_only]
 #
 #   --index    a registered index with a version column (for the delta shapes), for example the
 #              SIFT1M index of scripts/benchmark.sh; its query table <SCHEMA>.<data>_query supplies
 #              the query vector (--queries=TABLE to name another table with columns qid, qvec)
 #   --runs     repetitions per shape (default 200); the first 5 are warm-up and not counted
+#   --first_call  the cost of the first search of a session instead: every run opens a new vsql
+#              session and sends the statement twice; reports the median of the first and of the
+#              second (client ms). Fenced, every session starts a new fenced process, which maps the
+#              snapshot anew. Runs = --runs / 10, at least 10.
 #
 # Shapes (each isolates one more component):
 #   select1    SELECT 1: client round trip, parse, trivial plan
@@ -28,7 +32,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-INDEX= SCHEMA= RUNS=200 SHAPES=select1,vversion,tiny,snap,dual,literal,delta0,delta1000,threads1,threads2,threads4 QUERIES= ECHO_ONLY=no
+INDEX= SCHEMA= RUNS=200 SHAPES=select1,vversion,tiny,snap,dual,literal,delta0,delta1000,threads1,threads2,threads4 QUERIES= ECHO_ONLY=no FIRST=no
 for arg in "$@"; do
     case "$arg" in
         --index=*)   INDEX="${arg#*=}" ;;
@@ -36,8 +40,9 @@ for arg in "$@"; do
         --runs=*)    RUNS="${arg#*=}" ;;
         --shapes=*)  SHAPES="${arg#*=}" ;;
         --queries=*) QUERIES="${arg#*=}" ;;
+        --first_call) FIRST=yes ;;
         --echo_only) ECHO_ONLY=yes ;;
-        -h|--help)   sed -n '2,27p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,31p' "$0"; exit 0 ;;
         *) echo "latency.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -83,7 +88,21 @@ if [ "$ECHO_ONLY" = yes ]; then
 fi
 
 [[ ",$SHAPES," == *,tiny,* ]] && setup_tiny
-printf "%-10s %10s %10s %10s %10s   %s\n" shape client_p50 client_p99 server_p50 server_p99 "(ms, $RUNS runs, vsearch $(vsql -X -A -t -c "SELECT CASE WHEN MIN(is_fenced::INT) = 1 THEN 'fenced' ELSE 'not fenced' END FROM v_catalog.user_functions WHERE schema_name = 'vvector' AND function_name = 'vsearch'"))"
+FENCING=$(vsql -X -A -t -c "SELECT CASE WHEN MIN(is_fenced::INT) = 1 THEN 'fenced' ELSE 'not fenced' END FROM v_catalog.user_functions WHERE schema_name = 'vvector' AND function_name = 'vsearch'")
+if [ "$FIRST" = yes ]; then
+    n=$((RUNS / 10)); [ "$n" -lt 10 ] && n=10
+    printf "%-10s %10s %10s   %s\n" shape first_p50 second_p50 "(client ms, $n new sessions, vsearch $FENCING)"
+    for s in ${SHAPES//,/ }; do
+        stmt=$(statement "$s")
+        for ((i = 0; i < n; i++)); do
+            { echo '\timing on'; echo "$stmt"; echo "$stmt"; } | vsql -X -q -A -t 2>&1 |
+                sed -n 's/.*All rows formatted: \([0-9.]*\) ms.*/\1/p' | paste -sd' ' -
+        done | awk '{f[NR]=$1; g[NR]=$2} END {n=asort(f); asort(g); printf "%.2f %.2f\n", f[int((n+1)/2)], g[int((n+1)/2)]}' |
+            { read -r a b; printf "%-10s %10s %10s\n" "$s" "$a" "$b"; }
+    done
+    exit 0
+fi
+printf "%-10s %10s %10s %10s %10s   %s\n" shape client_p50 client_p99 server_p50 server_p99 "(ms, $RUNS runs, vsearch $FENCING)"
 for s in ${SHAPES//,/ }; do
     if [ "$s" = delta1000 ]; then
         JT=$(vsql -X -A -t -c "SELECT source_table FROM vvector.manifest WHERE index_name = '$INDEX'")

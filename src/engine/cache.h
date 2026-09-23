@@ -62,7 +62,8 @@ public:
     // Opens the active snapshot of an index. The mapping is kept by the process and shared by later
     // calls: a new mapping of a large file pays a page fault for every page a search touches, which
     // costs several times the search. What ACTIVE and OPTIONS say is trusted for ACTIVE_CHECK_MS;
-    // after that, or when the kept snapshot is older than at_least, both are read again. A kept
+    // after that, or when the kept snapshot is older than at_least, both are read again (at_least =
+    // the largest int64: always read them again). A kept
     // mapping is dropped when its file is gone or replaced, or its index has a newer snapshot.
     void open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least = 0);
 

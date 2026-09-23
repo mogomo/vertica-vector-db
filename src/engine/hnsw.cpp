@@ -145,7 +145,15 @@ public:
         upper_ = reinterpret_cast<std::uint32_t *>(section + l.upper);
     }
 
-    // Inserts position p (Algorithm 1 of the paper, as hnswlib's addPoint).
+    // Continues the graph of a base snapshot (incremental build): its links are in the section already.
+    void start_from(std::uint32_t entry, std::uint32_t max_level)
+    {
+        entry_ = entry;
+        max_level_ = static_cast<int>(max_level);
+    }
+
+    // Inserts position p (Algorithm 1 of the paper, as hnswlib's addPoint). Tombstoned positions
+    // (incremental builds) are passed through but never chosen as neighbours, as in hnswlib.
     void insert(std::uint32_t p, Worker &w)
     {
         const std::uint32_t level = levels_[p];
@@ -164,10 +172,10 @@ public:
         Cand cur{distance_key(s_.metric, q, s_.vector(start), s_.row_stride), start};
         for (int l = top_level; l > static_cast<int>(level); --l) cur = greedy(q, cur, static_cast<std::uint32_t>(l), w);
         for (int l = std::min(static_cast<int>(level), top_level); l >= 0; --l) {
-            search_layer(q, cur, static_cast<std::uint32_t>(l), w);
+            search_layer(q, cur, static_cast<std::uint32_t>(l), w, true);
             std::sort(w.top.begin(), w.top.end(), nearer);
             select(w.top, m_, w.sel);
-            cur = w.sel.front();
+            if (!w.sel.empty()) cur = w.sel.front();     // empty only when every node found is tombstoned
             connect(p, static_cast<std::uint32_t>(l), w);
         }
         if (static_cast<int>(level) > top_level) {
@@ -182,7 +190,8 @@ public:
     // reachable; every node it misses is linked from a reachable node: the nearest one with room
     // in its list among the results of a search for it; else the node linked just before, when it
     // is as near as those results (runs of equal vectors); else the nearest result gives up its
-    // farthest link. Runs on one thread after the inserts. Returns the number of links made.
+    // farthest link. Tombstoned nodes are not repaired, but serve as links. Runs on one thread
+    // after the inserts. Returns the number of links made.
     std::uint64_t repair(Worker &w)
     {
         const std::uint64_t n = s_.count;
@@ -212,10 +221,10 @@ public:
             std::uint64_t made = 0;
             std::uint32_t last = HNSW_NO_UPPER;
             for (std::uint32_t p = 0; p < n; ++p) {
-                if (is_seen(p)) continue;
+                if (is_seen(p) || s_.dead(p)) continue;
                 // A search from the entry point only visits reachable nodes.
                 const float *q = s_.vector(p);
-                search_layer(q, Cand{distance_key(s_.metric, q, s_.vector(entry_), s_.row_stride), entry_}, 0, w);
+                search_layer(q, Cand{distance_key(s_.metric, q, s_.vector(entry_), s_.row_stride), entry_}, 0, w, false);
                 std::sort(w.top.begin(), w.top.end(), nearer);
                 const Cand *room = nullptr, *nearest = nullptr;
                 for (const Cand &c : w.top) {
@@ -297,13 +306,15 @@ private:
         }
     }
 
-    // Beam search of one level from ep with ef_construction: w.top holds the nearest found.
-    void search_layer(const float *q, Cand ep, std::uint32_t level, Worker &w)
+    // Beam search of one level from ep with ef_construction: w.top holds the nearest found; with
+    // live_only, tombstoned nodes are passed through but not kept in w.top.
+    void search_layer(const float *q, Cand ep, std::uint32_t level, Worker &w, bool live_only)
     {
         Visited &seen = *w.visited;
         seen.next();
         seen.test_set(ep.pos);
-        w.top.assign(1, ep);
+        w.top.clear();
+        if (!(live_only && s_.dead(ep.pos))) w.top.push_back(ep);
         w.cand.assign(1, ep);
         while (!w.cand.empty()) {
             const Cand c = w.cand.front();
@@ -321,6 +332,7 @@ private:
                 if (w.top.size() < efc_ || nearer(x, w.top.front())) {
                     w.cand.push_back(x);
                     std::push_heap(w.cand.begin(), w.cand.end(), NearerTop());
+                    if (live_only && s_.dead(x.pos)) continue;
                     w.top.push_back(x);
                     std::push_heap(w.top.begin(), w.top.end(), FartherTop());
                     if (w.top.size() > efc_) {
@@ -528,6 +540,66 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, 
             for (std::uint64_t i = r0; i < r1; ++i) b.insert(static_cast<std::uint32_t>(i + 1), workers[t]);
         }, poll);
     if (poll && poll()) throw Cancelled();
+    b.repair(workers[0]);
+
+    HnswHeader h;
+    std::memset(&h, 0, sizeof(h));
+    h.m = p.m;
+    h.m0 = 2 * p.m;
+    h.ef_construction = p.ef_construction;
+    h.max_level = b.max_level();
+    h.entry_point = b.entry();
+    h.count = n;
+    h.level_seed = HNSW_LEVEL_SEED;
+    h.upper_blocks = blocks;
+    std::memcpy(section, &h, sizeof(h));
+}
+
+std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new)
+{
+    std::uint64_t blocks = base.upper_blocks;
+    for (std::uint64_t i = 0; i < n_new; ++i) blocks += hnsw_level(new_ids[i], base.m);
+    if (blocks >= HNSW_NO_UPPER) throw std::runtime_error("too many vectors for an HNSW graph with m = " + std::to_string(base.m));
+    return graph_layout(base.count + n_new, base.m, blocks).bytes;
+}
+
+void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *section, const HnswParams &p,
+                 const std::function<bool()> &poll)
+{
+    if (p.m != base.m) throw std::runtime_error("m is " + std::to_string(p.m) + ", the base graph has " + std::to_string(base.m));
+    if (s.count < base.count) throw std::logic_error("hnsw_extend: fewer positions than the base graph");
+    const std::uint64_t n0 = base.count, n = s.count;
+
+    // The base parts at the same place in the new layout, then the levels of the new positions.
+    std::uint64_t blocks = base.upper_blocks;
+    std::vector<std::uint32_t> first(n - n0);
+    std::vector<std::uint8_t> levels(n - n0);
+    for (std::uint64_t i = n0; i < n; ++i) {
+        const std::uint32_t l = hnsw_level(s.ids[i], p.m);
+        levels[i - n0] = static_cast<std::uint8_t>(l);
+        first[i - n0] = l == 0 ? HNSW_NO_UPPER : static_cast<std::uint32_t>(blocks);
+        blocks += l;
+    }
+    const GraphLayout layout = graph_layout(n, p.m, blocks);
+    std::memcpy(section + layout.levels, base.levels, n0);
+    std::memcpy(section + layout.levels + n0, levels.data(), n - n0);
+    std::memcpy(section + layout.level0, base.level0, n0 * (2 * std::uint64_t(p.m) + 1) * 4);
+    std::memcpy(section + layout.upper_index, base.upper_index, n0 * 4);
+    std::memcpy(section + layout.upper_index + n0 * 4, first.data(), (n - n0) * 4);
+    std::memcpy(section + layout.upper, base.upper, base.upper_blocks * (std::uint64_t(p.m) + 1) * 4);
+
+    Builder b(s, section, layout, p);
+    b.start_from(base.entry_point, base.max_level);
+    const int threads = std::max(1, std::min<int>(p.threads, static_cast<int>(std::min<std::uint64_t>(std::max<std::uint64_t>(n - n0, 1), 64))));
+    std::vector<Worker> workers;
+    workers.reserve(threads);
+    for (int t = 0; t < threads; ++t) workers.emplace_back(n);
+    if (n > n0)
+        parallel_ranges(n - n0, 64, threads, [&](int t, std::uint64_t, std::uint64_t r0, std::uint64_t r1) {
+            for (std::uint64_t i = r0; i < r1; ++i) b.insert(static_cast<std::uint32_t>(n0 + i), workers[t]);
+        }, poll);
+    if (poll && poll()) throw Cancelled();
+    // Shrunk link lists can leave a node unreachable, as in a full build.
     b.repair(workers[0]);
 
     HnswHeader h;

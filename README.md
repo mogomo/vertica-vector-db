@@ -6,18 +6,19 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M2 (HNSW).** Two index types: `hnsw` (a graph index,
-approximate, the default) and `flat` (exact). k-nearest-neighbour search works
-for the metrics l2, cosine, dot and l1, for one query or thousands in one
-statement, with or without the rows written since the last refresh. Exact
-results are tested to equal a full scan with Vertica's built-in functions;
-HNSW recall is measured on SIFT1M. Tested on Vertica 26.2 on one node
-(aarch64, Rocky Linux 9, g++ 11.5) and on a 3-node Eon cluster (x86_64, Red
-Hat Enterprise Linux 8, g++ 8.5), fenced, unfenced and mixed. Not yet
-available: incremental refresh (M3; every refresh rebuilds the index), int8
-quantisation (M4), filtered search, range search on the graph and vector
-functions (M5). Treat this as a preview: try it on your own systems before you
-rely on it.
+**Status: milestone M3 (incremental refresh).** Two index types: `hnsw` (a
+graph index, approximate, the default) and `flat` (exact). k-nearest-neighbour
+search works for the metrics l2, cosine, dot and l1, for one query or
+thousands in one statement, with or without the rows written since the last
+refresh. A refresh adds only the changes since the last one to the index and
+rebuilds it in full only when that is needed. Exact results are tested to
+equal a full scan with Vertica's built-in functions; HNSW recall is measured on
+SIFT1M, also after 100 incremental refreshes. Tested on Vertica 26.2 on one
+node (aarch64, Rocky Linux 9, g++ 11.5) and on a 3-node Eon cluster (x86_64,
+Red Hat Enterprise Linux 8, g++ 8.5), fenced, unfenced and mixed. Not yet
+available: int8 quantisation (M4), filtered search, range search on the graph
+and vector functions (M5). Treat this as a preview: try it on your own systems
+before you rely on it.
 
 Contents: [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
 [Prepare a table](#prepare-a-table) · [Register, refresh, schedule](#register-refresh-schedule) ·
@@ -146,7 +147,10 @@ open because Vertica 26.2 cannot grant a single function that has an ARRAY
 argument; it writes nothing, and storing its output needs rights on
 `vvector.snapshot`. The views of an index are not granted to anyone: grant
 SELECT on them to the users who may search (the `_delta` view shows the rows
-of the journal).
+of the journal). A user who registers and refreshes an index needs,
+besides `vvector_admin`, USAGE and CREATE on the schema of the source table
+(the views go there) and SELECT on the table; tested with a user that has no
+other rights.
 
 ## Prepare a table
 
@@ -188,10 +192,13 @@ their own storage and are found quickly:
     INSERT INTO app.docs (id, vec) VALUES (7, ARRAY[0.1, 0.2, 0.3]);   -- add or change
     INSERT INTO app.docs (id, del) VALUES (8, TRUE);                    -- delete
 
-A physical `UPDATE` or `DELETE` on the table is allowed, but queries see it
-only after the next refresh. A table without a version column is a **static
-index**: queries see the snapshot only, every id must appear once, and
-changes show up at the next refresh.
+A physical `DELETE` on the table (or a dropped partition) is allowed, but
+queries see it only after the next refresh, which notices it and rebuilds the
+index in full. A physical `UPDATE` of an older row is not noticed by an
+incremental refresh: run `CALL vvector.refresh_index('docs', 'full')` after
+one. A table without a version column is a **static index**: queries see the
+snapshot only, every id must appear once, changes show up at the next refresh,
+and every refresh is a full build.
 
 ## Register, refresh, schedule
 
@@ -224,20 +231,76 @@ on a cluster it names the projection that was made.
 
 ### refresh_index
 
-    CALL vvector.refresh_index('docs');
+    CALL vvector.refresh_index(index_name [, mode]);
+    CALL vvector.refresh_index('docs');                  -- the index's refresh_mode (default auto)
+    CALL vvector.refresh_index('docs', 'full');          -- rebuild from every row of the table
 
-    NOTICE 2005:  vvector: index docs refreshed: snapshot 342, 5 vectors of 3 dimensions, 0 MB, 0.267 seconds
+The first refresh of the quick start, then refreshes after an added and a
+deleted vector (the output of each call):
+
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 656, full build (first build), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.288 seconds
     NOTICE 2005:  vvector: index docs: journal replica: none: a single node reads the delta locally already
 
-It takes the delta boundary, builds a new snapshot from the latest row of
-every id (deletes left out), stores it in `vvector.snapshot`, loads it on
-every node, writes the index defaults to every node, updates the manifest and
-the views, deletes snapshots older than the previous one, and makes, keeps
-or drops the journal replica. Queries keep
-working during a refresh. Every refresh is a full rebuild until milestone M3.
-On the test machine 1,000,000 vectors of 128 dimensions take 11 s as a flat
-index and 46 s as an HNSW index (the graph build uses every core of the node
-that runs the refresh).
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 657, incremental from snapshot 656 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.335 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 657 kept, no vector changed since it was built; the delta starts at the new boundary; 0.145 seconds
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 659, full build (mode full), 5 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.277 seconds
+
+It takes the delta boundary, builds a new snapshot, stores it in
+`vvector.snapshot`, loads it on every node, writes the index defaults to every
+node, updates the manifest and the views, deletes snapshots older than the
+previous one, and makes, keeps or drops the journal replica. Queries keep
+working during a refresh. The first line says what was built and why.
+
+There are two ways to build:
+
+- **incremental**: starts from the active snapshot in the cache of the node
+  that runs the refresh and reads only the journal rows written after the
+  previous boundary (the latest row of each id). A new or changed vector is
+  added to the snapshot (and inserted into the graph of an HNSW index); the
+  old vector of a changed or deleted id stays in the snapshot as a
+  **tombstone**: searches skip it. A row that repeats the vector the index
+  already has, or deletes an id that is not there, changes nothing. When
+  nothing changed, the snapshot is kept and only the boundary moves ("kept, no
+  vector changed").
+- **full**: reads every row of the table (the latest row of each id, deletes
+  left out) and builds a new snapshot without tombstones.
+
+`mode` (or the index's `refresh_mode`, see `set_index_options`):
+
+| mode | Builds |
+|---|---|
+| `auto` (default) | incremental; full when the tombstones exceed `tombstone_ratio` (default 0.2) of the snapshot, or after `rebuild_every` incremental refreshes (default: never by count) |
+| `incremental` | incremental; the ratio and the count are ignored (`status` warns when the tombstones pass the ratio): schedule `refresh_index(name, 'full')` yourself, for example at night |
+| `full` | full, always |
+
+In every mode the build is full when an incremental one cannot give the right
+answer: the first build; a static index (no version column); changed build
+options (`index_type`, `m`, `ef_construction`, `quantization`) or a new
+snapshot format; a node whose cache does not hold the active snapshot; and a
+journal that lost or gained rows up to the previous boundary (a physical
+`DELETE`, a dropped partition, versions set by hand). The refresh counts
+those rows every time and compares the count at the next one.
+
+Measured on the test machine (`scripts/benchmark.sh --parts=incremental`,
+fenced; 900,000 SIFT1M vectors of 128 dimensions, then changes of growing
+size, each followed by `refresh_index`):
+
+| Change since the last refresh | flat | hnsw |
+|---|---:|---:|
+| none (the snapshot is kept) | 0.5 s | 0.5 s |
+| 100 adds, 50 deletes | 4.4 s | 6.5 s |
+| 1,000 adds, 500 deletes | 4.4 s | 6.5 s |
+| 10,000 adds, 5,000 deletes | 4.7 s | 7.2 s |
+| 50,000 adds, 25,000 deletes | 5.1 s | 9.2 s |
+| full build of the same 930,550 vectors | 8.5 s | 42.4 s |
+
+An incremental refresh costs a fixed part plus a small part per change. The
+fixed part is the whole snapshot being written to `vvector.snapshot` and
+loaded on every node again (about 4 s for 450 to 600 MB); the build itself
+takes 0.25 s for 1000 adds and 500 deletes on 1M vectors. A full build of an
+HNSW index spends most of its time on the graph; the graph after 100
+incremental refreshes finds as much as a new one (recall@10 0.9845 against
+0.9837 at `ef_search` 100 on SIFT1M, `make test DATA_DIR=...`).
 
 ### schedule_refresh
 
@@ -272,8 +335,9 @@ to later milestones are refused with a message that names the milestone.
 | index_type | flat, hnsw | hnsw (as registered) | in use |
 | m, ef_construction | 2 to 256, 1 to 100000 | 16, 200 | in use (HNSW) |
 | quantization | none, sq8 | none | none only (sq8: M4) |
-| refresh_mode | auto, incremental, full | auto | every refresh is full (incremental: M3) |
-| tombstone_ratio, rebuild_every | above 0 to 1; 0 = never | 0.2; never | stored for M3 |
+| refresh_mode | auto, incremental, full | auto | in use (see [refresh_index](#refresh_index)) |
+| tombstone_ratio | above 0 to 1 | 0.2 | in use: `auto` builds in full once the tombstones exceed this share of the snapshot |
+| rebuild_every | 0 (never) or more | never | in use: `auto` builds in full after this many incremental refreshes |
 | memory_mode | ram, compact | ram | ram only (compact: M4) |
 | precision_default | fast, balanced, best, exact | balanced | in use (HNSW); a flat index is always exact |
 | freshness_default | snapshot, exact | snapshot | in use |
@@ -284,19 +348,20 @@ to later milestones are refused with a message that names the milestone.
 
     CALL vvector.status('docs');
 
-    NOTICE 2005:  vvector: index docs: hnsw index, refresh_mode auto, 0 tombstones
-    NOTICE 2005:  vvector: index docs: 7 journal rows in the delta, read in 8 ms
+    NOTICE 2005:  vvector: index docs: hnsw index, 5 live vectors, 1 tombstones (tombstone_ratio 0.2), refresh_mode auto, 1 incremental refreshes since the last full build (rebuild_every never)
+    NOTICE 2005:  vvector: index docs: last refresh: refreshed: snapshot 660, incremental from snapshot 659 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.319 seconds
+    NOTICE 2005:  vvector: index docs: 3 journal rows in the delta, read in 8 ms
     NOTICE 2005:  vvector: index docs: journal replica auto: none: a single node reads the delta locally already
-    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (30746 MB free or cache), 8 cores
+    NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (29374 MB free or cache), 8 cores
 
-`status` reports the rows in the delta and how long they take to read, the
-journal replica, open
-transactions that write to the table, versions in the future (a sign that an
-application sets the version column itself), and a sizing check: index size
-against node memory, the memory a refresh needs against
-`FencedUDxMemoryLimitMB` and free memory, `threads_default` against cores, and
-all indexes together against the page cache. Each problem is a WARNING with
-the recommended fix. It never changes anything. `refresh_index` runs it first.
+`status` reports the live vectors and the tombstones, the refresh mode, what
+the last refresh did, the rows in the delta and how long they take to read,
+the journal replica, open transactions that write to the table, versions in
+the future (a sign that an application sets the version column itself), and a
+sizing check: index size against node memory, the memory a refresh needs
+against `FencedUDxMemoryLimitMB` and free memory, `threads_default` against
+cores, and all indexes together against the page cache. Each problem is a
+WARNING with the recommended fix. It never changes anything.
 
 `sizing` estimates the memory of an index before you load the table; anyone
 may call it:
@@ -323,6 +388,7 @@ The same from the shell:
 
     scripts/register.sh --index=docs --table=app.docs --id=id --vec=vec --op=del --ver=ts --metric=cosine
     scripts/refresh.sh --index=docs                        # refresh_index
+    scripts/refresh.sh --index=docs --mode=full            # refresh_index('docs', 'full')
     scripts/refresh.sh --index=docs --schedule='0 * * * *' # schedule_refresh
     scripts/refresh.sh --index=docs --status               # status
     scripts/refresh.sh --index=docs --load_only            # load_all
@@ -333,17 +399,23 @@ The same from the shell:
 (`source_table`, `id_col`, `vec_col`, `op_col`, `ver_col`, `ver_margin`,
 `metric`), the options of `set_index_options`, and the state of the active
 snapshot (`active_snapshot`, `active_max_ver`, `delta_from` = the boundary of
-the delta view, `vector_count`, `dims`, `graph_bytes` (the HNSW graph), `index_bytes` (the whole snapshot), `built_at`,
-`build_seconds`, `format_version`), and the journal replica (`journal_replica`
-= auto, on or off; `replica_projection`, the projection vvector made;
-`replica_note`, what the last check did and why).
+the delta view, `vector_count` (live vectors), `tombstones`, `base_snapshot`
+(the snapshot an incremental build started from, 0 after a full build),
+`dims`, `graph_bytes` (the HNSW graph), `index_bytes` (the whole snapshot),
+`built_at`, `build_seconds`, `format_version`, `active_options` (the build
+options of the active snapshot), `incremental_count` (incremental refreshes
+since the last full build), `boundary_rows` (journal rows up to the boundary,
+compared at the next refresh), `refresh_note` (what the last refresh did and
+why)), and the journal replica (`journal_replica` = auto, on or off;
+`replica_projection`, the projection vvector made; `replica_note`, what the
+last check did and why).
 
     SELECT index_name, source_table, metric, index_type, active_snapshot, vector_count, dims, graph_bytes, index_bytes, build_seconds
     FROM vvector.manifest WHERE index_name = 'docs';
 
      index_name | source_table | metric | index_type | active_snapshot | vector_count | dims | graph_bytes | index_bytes | build_seconds
     ------------+--------------+--------+------------+-----------------+--------------+------+-------------+-------------+---------------
-     docs       | app.docs     | cosine | hnsw       |             342 |            5 |    3 |         896 |        1536 |         0.267
+     docs       | app.docs     | cosine | hnsw       |             656 |            5 |    3 |         896 |        1536 |         0.288
 
 ## Search
 
@@ -527,14 +599,14 @@ the snapshot too; applying them again changes nothing.
 
      id | del | has_ver | snapshot_id
     ----+-----+---------+-------------
-        |     | f       |         342
-      1 | f   | t       |         342
-      2 | f   | t       |         342
-      2 | t   | t       |         342
-      3 | f   | t       |         342
-      4 | f   | t       |         342
-      5 | f   | t       |         342
-      6 | f   | t       |         342
+        |     | f       |         656
+      1 | f   | t       |         656
+      2 | f   | t       |         656
+      2 | t   | t       |         656
+      3 | f   | t       |         656
+      4 | f   | t       |         656
+      5 | f   | t       |         656
+      6 | f   | t       |         656
 
 With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
 `snapshot` the result is the one of the last refresh:
@@ -663,7 +735,7 @@ Memory:
 |---|---|
 | snapshot and cache file per node | 256 bytes + (4 x row_stride + 8) bytes per vector; row_stride = dims rounded up to a multiple of 16 |
 | HNSW graph (in the snapshot) | about (2m + 1) x 4 + 5 + (m + 1) x 4 / (m - 1) bytes per vector: 141 bytes with m = 16 |
-| a refresh (on one node) | about the snapshot size + 4 bytes per vector; HNSW adds 5 + 2 x cores bytes per vector; fenced it counts against `FencedUDxMemoryLimitMB` (-1 = no limit) |
+| a refresh (on one node) | full build: about the snapshot size + 4 bytes per vector; HNSW adds 5 + 2 x cores bytes per vector. Incremental: the new snapshot + 4 x row_stride bytes per changed row + 2 x cores bytes per vector (HNSW); the base is read from the cache file. Fenced it counts against `FencedUDxMemoryLimitMB` (-1 = no limit) |
 | a query | 4 x row_stride bytes per query and per journal row, plus 1 bit per vector when the journal has rows; HNSW: 2 bytes per vector per search thread for the visited marks, kept by the process between queries |
 
 1,000,000 vectors of 128 dimensions take 496 MB as a flat index and 631 MB as
@@ -692,7 +764,13 @@ estimates an index before you load it.
   read also costs a transfer between nodes (see [Operations](#operations)).
 - The journal works the same with both index types: journal rows are searched
   exactly and merged with the result of the graph or flat search; ids changed
-  or deleted in the journal are never returned from the snapshot.
+  or deleted in the journal are never returned from the snapshot. Tested on
+  flat and HNSW indexes: with `precision='exact'` the result equals the full
+  scan of the live rows, before and after the next refresh.
+- An incremental refresh folds the delta into the snapshot: it reads the same
+  rows the delta view shows (the journal after the previous boundary), so the
+  refresh costs the reading of the delta plus the writing of the snapshot, not
+  a pass over the whole table.
 - If a node answers with `snapshot cache stale on <node>: run vload`, its
   cache is older than the view: `CALL vvector.load_all('<index>')`.
 - Grant SELECT on `<index>_snap` and `<index>_delta` to the users who search.
@@ -764,7 +842,7 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
 
          node_name    | index_name | snapshot_id | vector_count | dims | metric | index_type | freshness_default | loaded
       ----------------+------------+-------------+--------------+------+--------+------------+-------------------+--------
-       v_vdb_node0001 | docs       |         342 |            5 |    3 | cosine | hnsw       | exact             | t
+       v_vdb_node0001 | docs       |         656 |            5 |    3 | cosine | hnsw       | exact             | t
 
   Without `index_name` it lists every index in the cache directory.
   Other columns: max_ver, quantization, graph_bytes, tombstones,
@@ -778,9 +856,13 @@ use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options
   are rows of `vvector.manifest`: a backup of the database contains them.
 - **Disk space**: a refresh keeps the active and the previous snapshot in the
-  table and in every cache. Deleted rows of `vvector.snapshot` keep using
-  space until Vertica purges them: `SELECT PURGE_TABLE('vvector.snapshot');`
-  after many refreshes.
+  table and in every cache. Every refresh that changes the index writes a
+  whole new snapshot, also an incremental one (631 MB for 1M vectors of 128
+  dimensions with HNSW; Vertica compresses it to about half). The older one is
+  deleted, and its rows keep using space until Vertica's Tuple Mover purges
+  them; on the test VM that happened by itself within minutes (100 refreshes
+  in 15 minutes never used more than 7 GB above the start). To free it at once:
+  `SELECT PURGE_TABLE('vvector.snapshot');`.
 - **Library version**: `SELECT vvector.vversion() OVER();`
 
        library_version | format_version |                           build_flags
@@ -802,7 +884,7 @@ by hand.
 
 | Function | Rights | What it does |
 |---|---|---|
-| `vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir) OVER()` | PUBLIC | turns (id, vector) rows into a snapshot; returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build |
+| `vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir) OVER()` | PUBLIC | turns (id, vector) rows into a snapshot; returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
 | `vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time |
 | `vconfig(k USING PARAMETERS index_name, options, cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; returns (node_name, status) |
 | `vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | PUBLIC | one row per node: (node_name, k); used to send every chunk to every node exactly once |
@@ -847,20 +929,25 @@ cache), starting with `vknn:`.
 | `vsearch: k must be 1 to 16384`, `precision must be ...`, `freshness must be ...`, `ef_search must be ...`, `oversampling must be 1 to 100`, `threads must be 0 (one per core) to 64`, `radius must be a finite number` | a parameter out of range | use a value from the parameter table |
 | `vsearch: session parameter NAME = 'v' is not an integer` (or `index default ...`) | a bad session value or index default | `ALTER SESSION SET UDPARAMETER FOR vvector NAME = ...`, or `set_index_options` |
 | `vsearch: the snapshot of index 'x' changed while the query ran: run it again` | a refresh changed the dimensions during the query | run the query again |
-| `vbuild: id I appears twice` | a static index (no version column) with a repeated id | make the ids unique, or register a version column |
+| `vbuild: id I appears twice` | a static index (no version column) with a repeated id (or the same id twice in the changes of a hand-made incremental build) | make the ids unique, or register a version column |
+| `vbuild: index 'x': base snapshot S is not usable in the cache of NODE (...): refresh with mode full` | an incremental build found no valid active snapshot on the node that runs it (a refresh checks this first and builds in full; a hand-made build does not) | `CALL vvector.refresh_index('x', 'full')` |
+| `vbuild: ... the base snapshot has metric M, not N`, `... is an HNSW index, the build is flat`, `... is a flat index, the build is hnsw`, `m is N, the base snapshot was built with m M`: `... a full build is needed` | a hand-made incremental build with other options than the base | build in full, or use the base's options |
+| `vbuild: vector of id I has N elements, the index has M` | a change of another length than the index | one length per index |
+| `vbuild: base_snapshot must be a snapshot id, or 0 for a full build` | a negative base_snapshot | a snapshot id from the manifest |
 | `vbuild: the vector of id I is NULL (a delete needs del = true)`, `... has a NULL element`, `... element N is not a finite float32 value` | a missing vector, a NULL, NaN, Infinity or a value beyond +-3.4e38 | fix the row |
 | `vbuild: vector of id I has N elements, the ones before have M` | vectors of different lengths | one length per index |
 | `vbuild: vectors have N elements, at most 32768 are supported` | too many dimensions | reduce the dimensions |
 | `vbuild: metric must be l2, cosine, dot or l1`, `index_type must be flat or hnsw`, `quantization ...`, `m must be 2 to 256`, `ef_construction must be 1 to 100000` | bad build parameter | see the parameter tables |
 | `vbuild: ... too many vectors for an HNSW graph with m = N` | the upper levels of the graph would need more than 4,294,967,294 blocks | a larger `m`, or split the index |
 | `vload: on NODE: bad snapshot graph: ... in FILE`, `vsearch: bad snapshot graph: ...` | the graph section of the snapshot or cache file is damaged (vload checks every link) | `CALL vvector.refresh_index('x')` |
-| `... is not implemented yet (milestone Mn)` | a feature of a later milestone | use what the message says is available |
+| `... is not implemented yet (milestone Mn)`, `... not supported yet (milestone Mn)` | a feature of a later milestone | use what the message says is available |
 | `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
 | `vload: on NODE: pieces are missing or duplicated`, `bad snapshot: checksum mismatch`, `cannot write ...` | a damaged transfer or a full disk | check disk space of cache_dir; `load_all` |
 | `vload`, `vinfo`, `vsearch`: `cache_dir '...' must be an absolute path`, `index name '...' is not valid` | bad cache_dir or index name | use `/path` and letters, digits, underscore |
 | `vsearch: index 'x': OPTIONS file in the cache: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
 | `vvector.register_index: ...` (table, column, type, metric, margin, op_col needs ver_col, already registered) | a bad argument; the message names it | fix the argument |
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
+| `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
 | `vvector.load_on_nodes: index x, snapshot S: loaded on N of M nodes` | a node could not load (disk, rights) | vinfo shows the cause per node; `load_all` |
 | `vvector.push_options: index x: options written on N of M nodes` | a node could not write its cache directory | check the cache directory; `load_all` |
 | `vvector.<procedure>: index x is not registered` | a wrong index name | `SELECT index_name FROM vvector.manifest` |
@@ -922,7 +1009,9 @@ parameter):
 | vknn HNSW, precision fast, 1000 rows | 71 ms (14,000 queries/s) | 55 ms (18,000 queries/s) |
 | vsearch flat | 1076 ms (930 queries/s) | 1098 ms (910 queries/s) |
 | recall@10 against the ground truth: HNSW fast / balanced / best / exact; flat | 0.893 / 0.980 / 0.999 / 0.999; 0.999 | |
-| `refresh_index`, 1M vectors: HNSW / flat | 46 s / 11 s | |
+| `refresh_index`, 1M vectors, full build: HNSW / flat | 46 s / 11 s | |
+| `refresh_index` after 1000 adds and 500 deletes, 900,000 vectors, incremental: HNSW / flat | 6.5 s / 4.4 s | |
+| `refresh_index` with nothing changed | 0.5 s | |
 
 On the 3-node Eon test cluster (x86_64, 2 cores and 15 GB per node, Vertica
 26.2.0-2; HNSW index of 100,000 random vectors of 128 dimensions) a statement
@@ -930,6 +1019,11 @@ costs more: `SELECT 1` 2.7 ms, vsearch `_snap` 12.8 ms fenced and 7.6 ms mixed,
 `vknn` 12.1 and 5.9 ms (precision fast). An exact search over the empty delta
 takes 10.7 ms mixed with the journal replica, which is made there by default,
 and 23.4 ms without it (see [Operations](#operations)).
+
+The first search of a session costs more when vsearch is fenced, because the
+session starts its own fenced process and maps the index: 13.3 ms instead of
+7.6 ms (HNSW, 1M vectors); in mixed mode 2.4 ms instead of 2.1 ms. Keep
+sessions open (a connection pool) for single searches.
 
 Fenced mode adds about 6 ms per statement, more than the search itself; for
 single searches `FENCED=mixed` gives the unfenced latency while the memory-
@@ -957,8 +1051,9 @@ Vertica and SDK:
   an ARRAY argument); vbuild is PUBLIC.
 - A UNION ALL of `ARRAY[INT]` and `ARRAY[NUMERIC]` columns fails inside
   Vertica 26.2 (INTERNAL 5445); cast to `ARRAY[FLOAT]` first.
-- Fenced mode adds about 6 ms per statement; unfenced functions run inside
-  the Vertica process, where a fault stops the node.
+- Fenced mode adds about 6 ms per statement, and about 6 ms more to the first
+  search of every session; unfenced functions run inside the Vertica process,
+  where a fault stops the node.
 - On a multi-node cluster a statement over the `_delta` view without the
   journal replica reads the journal on every node and sends the rows to the
   node that runs the search: 15 to 17 ms more per statement on the 3-node test
@@ -974,8 +1069,11 @@ Data model:
 - Ids are INT and unique per index; every vector of an index has the same
   number of elements, at most 32768; NULL elements, NaN, Infinity and values
   beyond +-3.4e38 are refused.
-- The table is a journal: adds and deletes are INSERTs; a physical UPDATE or
-  DELETE becomes visible at the next refresh.
+- The table is a journal: adds and deletes are INSERTs. A physical DELETE (or
+  a dropped partition) becomes visible at the next refresh, which rebuilds in
+  full because of it. A physical UPDATE of a row older than the last refresh
+  is not noticed by an incremental refresh: follow it with
+  `refresh_index(name, 'full')`.
 - Without a version column the index is static and every id must appear once.
 - The version column must be filled by the database (`DEFAULT
   CLOCK_TIMESTAMP()`); versions set by an application can make results wrong
@@ -1021,9 +1119,18 @@ Operations:
 - A node that missed a refresh answers "snapshot cache stale ... run vload"
   until `load_all` runs.
 - A new snapshot format needs a refresh of every index; the error says so.
-- Every refresh rebuilds the whole index (incremental refresh: M3); on the
-  test VM 1M x 128 takes 11 s as a flat index and 46 s as an HNSW index. The
-  graph of a parallel build depends on the order in which threads insert:
+- An incremental refresh reads only the changes, but writes and loads the
+  whole snapshot again: its cost has a part that grows with the index size
+  (about 6.5 s for 900,000 x 128 HNSW, 4.4 s flat, on the test VM) besides the part that grows
+  with the changes. A full build of 1M x 128 takes 11 s as a flat index and
+  46 s as an HNSW index.
+- Tombstones (the old positions of changed and deleted vectors) stay in the
+  snapshot until the next full build: they take memory, and an HNSW search
+  passes through them. `refresh_mode auto` rebuilds in full at
+  `tombstone_ratio`; with `refresh_mode incremental` schedule full refreshes
+  yourself.
+- A static index (no version column) is rebuilt in full at every refresh.
+- The graph of a parallel build depends on the order in which threads insert:
   two builds of the same data give slightly different graphs (and recall);
   the results of a search on a given snapshot are always the same.
 
@@ -1032,13 +1139,13 @@ Operations:
 | File | What it does |
 |---|---|
 | `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed]`, `make undeploy` |
-| `src/engine/` | pure C++17, no Vertica includes: snapshot format, node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), threads, query text |
+| `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), threads, query text |
 | `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M) to text for COPY |
-| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp`, and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`; `run_all.sh` runs them in every mode |
+| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp` and `test_delta.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp`, and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M); `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

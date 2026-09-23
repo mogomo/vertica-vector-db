@@ -4,7 +4,7 @@
 --   vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
 --                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
 --                             freshness_default, ef_search_default, threads_default)
---   vvector.refresh_index(index_name)
+--   vvector.refresh_index(index_name [, mode])
 --   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
 --   vvector.status(index_name)
@@ -423,9 +423,6 @@ BEGIN
     IF x_refresh IS NOT NULL AND x_refresh NOT IN ('auto', 'incremental', 'full') THEN
         RAISE EXCEPTION 'vvector.set_index_options: refresh_mode must be auto, incremental or full';
     END IF;
-    IF COALESCE(x_refresh, '') = 'incremental' THEN
-        RAISE EXCEPTION 'vvector.set_index_options: refresh_mode incremental is not implemented yet (milestone M3); auto and full rebuild the snapshot';
-    END IF;
     IF x_ratio IS NOT NULL AND NOT (x_ratio > 0 AND x_ratio <= 1) THEN
         RAISE EXCEPTION 'vvector.set_index_options: tombstone_ratio must be above 0 and at most 1';
     END IF;
@@ -550,7 +547,7 @@ CREATE OR REPLACE PROCEDURE vvector.status(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     tab VARCHAR(256); ver VARCHAR(128); n INT; t0 TIMESTAMPTZ; ms INT; sch VARCHAR(128); tbl VARCHAR(128);
     bytes INT; all_bytes INT; vectors INT; mem INT; free_mem INT; cores INT; fenced_mb INT; thr INT; build INT;
-    rmode VARCHAR(16); tomb INT; kind VARCHAR(16); ver_type VARCHAR(128);
+    rmode VARCHAR(16); tomb INT; kind VARCHAR(16); ver_type VARCHAR(128); live INT; ratio FLOAT; since INT; every INT;
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
@@ -561,8 +558,18 @@ BEGIN
     ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
     kind := (SELECT MAX(index_type) FROM vvector.manifest WHERE index_name = nm);
     rmode := (SELECT MAX(refresh_mode) FROM vvector.manifest WHERE index_name = nm);
-    tomb := (SELECT MAX(tombstones) FROM vvector.manifest WHERE index_name = nm);
-    RAISE NOTICE 'vvector: index %: % index, refresh_mode %, % tombstones', nm, kind, COALESCE(rmode, 'auto'), COALESCE(tomb, 0);
+    tomb := (SELECT COALESCE(MAX(tombstones), 0) FROM vvector.manifest WHERE index_name = nm);
+    live := (SELECT COALESCE(MAX(vector_count), 0) FROM vvector.manifest WHERE index_name = nm);
+    ratio := (SELECT COALESCE(MAX(tombstone_ratio), 0.2) FROM vvector.manifest WHERE index_name = nm);
+    since := (SELECT COALESCE(MAX(incremental_count), 0) FROM vvector.manifest WHERE index_name = nm);
+    every := (SELECT MAX(rebuild_every) FROM vvector.manifest WHERE index_name = nm);
+    RAISE NOTICE 'vvector: index %: % index, % live vectors, % tombstones (tombstone_ratio %), refresh_mode %, % incremental refreshes since the last full build (rebuild_every %)',
+                 nm, kind, live, tomb, ratio, COALESCE(rmode, 'auto'), since, COALESCE(every::VARCHAR, 'never');
+    RAISE NOTICE 'vvector: index %: last refresh: %', nm,
+                 (SELECT COALESCE(MAX(refresh_note), 'none yet') FROM vvector.manifest WHERE index_name = nm);
+    IF tomb > ratio * (live + tomb) AND COALESCE(rmode, 'auto') = 'incremental' THEN
+        RAISE WARNING 'vvector: index %: % of % positions are tombstones: searches pass through them. refresh_mode incremental never rebuilds by itself: run CALL vvector.refresh_index(''%'', ''full'') when the node is quiet.', nm, tomb, live + tomb, nm;
+    END IF;
     n := 0;
     IF ver IS NOT NULL THEN
         t0 := (SELECT CLOCK_TIMESTAMP());
@@ -599,7 +606,7 @@ BEGIN
 
     -- Sizing check.
     bytes := (SELECT MAX(index_bytes) FROM vvector.manifest WHERE index_name = nm);
-    vectors := (SELECT MAX(vector_count) FROM vvector.manifest WHERE index_name = nm);
+    vectors := (SELECT COALESCE(MAX(vector_count), 0) + COALESCE(MAX(tombstones), 0) FROM vvector.manifest WHERE index_name = nm);
     IF bytes IS NULL THEN
         RAISE NOTICE 'vvector: index %: no snapshot yet, no sizing check. For an estimate: CALL vvector.sizing(vectors, dims, index_type, quantization)', nm;
         RETURN;
@@ -630,19 +637,38 @@ BEGIN
 END;
 $$;
 
--- boundary -> build -> insert chunks -> vload on all nodes -> update manifest and views -> delete older snapshots.
-CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
+-- Refresh order, never changed: boundary -> build -> insert chunks -> vload on all nodes -> update
+-- manifest and views -> delete older snapshots.
+-- Mode (x_mode, else the manifest's refresh_mode, else auto):
+--   full         builds from every row of the journal
+--   incremental  builds from the active snapshot in the node cache and the journal rows after the
+--                previous delta boundary; full only when it cannot be done (below)
+--   auto         incremental, and full as well when the tombstones pass tombstone_ratio or after
+--                rebuild_every incremental refreshes
+-- A full build is always made for the first build, a static index (no version column), changed
+-- build options (index_type, metric, m, ef_construction, quantization) or library format, a node
+-- whose cache does not hold the active snapshot, and when rows up to the previous boundary were
+-- removed or added afterwards (a physical DELETE, dropped partitions, versions set by hand): the
+-- number of those rows is counted at every refresh and compared at the next.
+-- The outcome goes to manifest refresh_note: NOTICEs of a nested CALL do not reach the caller.
+CREATE OR REPLACE PROCEDURE vvector.refresh_index_core(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128); sch VARCHAR(128); tbl VARCHAR(128);
     measure VARCHAR(16); kind VARCHAR(16); quant VARCHAR(16); hm INT; hefc INT; margin INT;
     op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
-    prev INT; sid INT; chunks INT; max_ver INT; v_from VARCHAR(64);
+    prev INT; sid INT; chunks INT; max_ver INT; v_from VARCHAR(64); prev_from VARCHAR(64);
     source VARCHAR(4000); del_expr VARCHAR(400); v_expr VARCHAR(400);
-    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT; n_graph INT;
+    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT; n_graph INT; n_tomb INT;
+    rmode VARCHAR(16); ratio FLOAT; every INT; since INT; opts VARCHAR(200); prev_opts VARCHAR(200); prev_fmt INT;
+    prev_vec INT; prev_tomb INT; prev_max INT; rows_then INT; rows_now INT; rows_next INT; want INT; got INT; counts VARCHAR(64);
+    why VARCHAR(600); r_note VARCHAR(1000); build_opts VARCHAR(400);
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
+    END IF;
+    IF x_mode IS NOT NULL AND x_mode NOT IN ('auto', 'incremental', 'full') THEN
+        RAISE EXCEPTION 'vvector.refresh_index: mode must be auto, incremental or full';
     END IF;
     sch := SPLIT_PART(tab, '.', 1);
     tbl := SPLIT_PART(tab, '.', 2);
@@ -657,13 +683,31 @@ BEGIN
     hefc := (SELECT COALESCE(m.hnsw_ef_construction, 200) FROM vvector.manifest m WHERE m.index_name = nm);
     margin := (SELECT ver_margin FROM vvector.manifest WHERE index_name = nm);
     prev := (SELECT active_snapshot FROM vvector.manifest WHERE index_name = nm);
+    prev_from := (SELECT m.delta_from FROM vvector.manifest m WHERE m.index_name = nm);
+    rmode := (SELECT COALESCE(x_mode, MAX(m.refresh_mode), 'auto') FROM vvector.manifest m WHERE m.index_name = nm);
+    ratio := (SELECT COALESCE(MAX(m.tombstone_ratio), 0.2) FROM vvector.manifest m WHERE m.index_name = nm);
+    every := (SELECT MAX(m.rebuild_every) FROM vvector.manifest m WHERE m.index_name = nm);
+    since := (SELECT COALESCE(MAX(m.incremental_count), 0) FROM vvector.manifest m WHERE m.index_name = nm);
+    prev_opts := (SELECT MAX(m.active_options) FROM vvector.manifest m WHERE m.index_name = nm);
+    prev_fmt := (SELECT MAX(m.format_version) FROM vvector.manifest m WHERE m.index_name = nm);
+    prev_vec := (SELECT COALESCE(MAX(m.vector_count), 0) FROM vvector.manifest m WHERE m.index_name = nm);
+    prev_tomb := (SELECT COALESCE(MAX(m.tombstones), 0) FROM vvector.manifest m WHERE m.index_name = nm);
+    rows_then := (SELECT MAX(m.boundary_rows) FROM vvector.manifest m WHERE m.index_name = nm);
+    prev_max := (SELECT MAX(m.active_max_ver) FROM vvector.manifest m WHERE m.index_name = nm);
+    fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
+    -- The options a snapshot is built with. A snapshot can only be continued with the same ones.
+    opts := kind || ' ' || measure || ' ' || quant || CASE WHEN kind = 'hnsw' THEN ' m=' || hm || ' ef_construction=' || hefc ELSE '' END;
     vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
                 AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vc));
     v_expr := CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END;
-
-    IF prev IS NOT NULL THEN
-        PERFORM CALL vvector.status(nm);      -- reports a slow or large delta before it is folded into the new snapshot
+    IF op IS NULL THEN
+        del_expr := 'FALSE';
+    ELSE
+        op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
+        del_expr := CASE WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)' ELSE '(COALESCE(' || op || ', 1) < 0)' END;
     END IF;
+
     t0 := (SELECT CLOCK_TIMESTAMP());
 
     -- 1. Delta boundary, taken BEFORE the build reads the table.
@@ -676,16 +720,23 @@ BEGIN
     --    start (SYSDATE) instead of at write time (CLOCK_TIMESTAMP).
     --    INT version: highest version minus the margin; the margin has to cover open writers.
     --    Rows that are in both the snapshot and the delta are harmless.
+    --    The highest version (the watermark in the manifest and the snapshot header; for an INT version
+    --    also the boundary) is read from the rows after the previous boundary only: the rows before it
+    --    were there at the last refresh, which recorded their highest version.
     max_ver := 0;
     v_from := NULL;
     IF ver IS NOT NULL THEN
         ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
                      AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
         IF ver_type ILIKE 'int%' THEN
-            max_ver := EXECUTE 'SELECT MAX(' || ver || ')::INT FROM ' || tab;
+            max_ver := EXECUTE 'SELECT MAX(' || ver || ')::INT FROM ' || tab
+                || CASE WHEN prev_from IS NULL OR prev_max IS NULL THEN '' ELSE ' WHERE ' || ver || ' > ' || prev_from END;
+            max_ver := GREATEST(COALESCE(max_ver, 0), COALESCE(prev_max, 0));
             v_from := (max_ver - margin)::VARCHAR;
         ELSE
-            max_ver := EXECUTE 'SELECT MAX((EXTRACT(EPOCH FROM ' || ver || ') * 1000000)::INT) FROM ' || tab;
+            max_ver := EXECUTE 'SELECT MAX((EXTRACT(EPOCH FROM ' || ver || ') * 1000000)::INT) FROM ' || tab
+                || CASE WHEN prev_from IS NULL OR prev_max IS NULL THEN '' ELSE ' WHERE ' || ver || ' > ' || prev_from END;
+            max_ver := GREATEST(COALESCE(max_ver, 0), COALESCE(prev_max, 0));
             cut := (SELECT LEAST(CLOCK_TIMESTAMP(), COALESCE(MIN(request_timestamp), CLOCK_TIMESTAMP()))
                     FROM v_monitor.locks
                     WHERE LOWER(object_name) = LOWER('Table:' || tab)
@@ -700,69 +751,157 @@ BEGIN
                 v_from := (SELECT 'TIMESTAMP ''' || TO_CHAR(cut::TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.US') || '''');
             END IF;
         END IF;
+        max_ver := COALESCE(max_ver, 0);
     END IF;
 
-    -- 2. Consolidated vectors: the latest row of every id by version, kept if it is not a delete.
-    --    Two rows of one id with the same version: the delete wins.
-    --    Without a version column every id must appear once (vbuild refuses a repeated id).
-    IF ver IS NULL THEN
-        source := 'SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL';
-    ELSE
-        IF op IS NULL THEN
-            del_expr := 'FALSE';
-        ELSE
-            op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                        AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
-            del_expr := CASE WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)' ELSE '(COALESCE(' || op || ', 1) < 0)' END;
+    -- 2. Full or incremental. why = the reason for a full build.
+    why := NULL;
+    IF rmode = 'full' THEN
+        why := 'mode full';
+    ELSIF prev IS NULL THEN
+        why := 'first build';
+    ELSIF ver IS NULL THEN
+        why := 'a static index (no version column) is always built in full';
+    ELSIF prev_from IS NULL OR rows_then IS NULL OR prev_opts IS NULL THEN
+        why := 'the active snapshot was made by an older vvector version';
+    ELSIF prev_opts <> opts THEN
+        why := 'build options changed from ' || prev_opts || ' to ' || opts;
+    ELSIF COALESCE(prev_fmt, 0) <> fmt THEN
+        why := 'the library writes format version ' || fmt || ', the active snapshot has ' || COALESCE(prev_fmt, 0);
+    ELSIF rmode = 'auto' AND prev_tomb > ratio * (prev_vec + prev_tomb) THEN
+        why := prev_tomb || ' tombstones in ' || (prev_vec + prev_tomb) || ' positions, more than tombstone_ratio ' || ratio;
+    ELSIF rmode = 'auto' AND every IS NOT NULL AND since >= every THEN
+        why := since || ' incremental refreshes since the last full build (rebuild_every ' || every || ')';
+    END IF;
+    IF why IS NULL THEN
+        want := (SELECT COUNT(*) FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+        got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm)
+            || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE loaded AND snapshot_id = ' || prev;
+        IF COALESCE(got, 0) < want THEN
+            why := 'the active snapshot ' || prev || ' is in the cache of ' || COALESCE(got, 0) || ' of ' || want || ' nodes';
         END IF;
-        source := 'SELECT id, vec FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
+    END IF;
+    -- Rows up to the previous boundary, compared with the count of the last refresh, and rows up to
+    -- the new boundary, compared at the next refresh. One scan of the version column.
+    rows_next := NULL;
+    IF why IS NULL THEN
+        counts := EXECUTE 'SELECT COUNT(CASE WHEN ' || ver || ' <= ' || prev_from || ' THEN 1 END) || '' '' || COUNT(CASE WHEN '
+            || ver || ' <= ' || v_from || ' THEN 1 END) FROM ' || tab;
+        rows_now := SPLIT_PART(counts, ' ', 1)::INT;
+        rows_next := SPLIT_PART(counts, ' ', 2)::INT;
+        IF rows_now <> rows_then THEN
+            why := 'the journal has ' || rows_now || ' rows up to the previous boundary, the last refresh counted ' || rows_then
+                || ' (a physical DELETE, dropped partitions, or versions set by hand)';
+        END IF;
+    ELSIF ver IS NOT NULL THEN
+        rows_next := EXECUTE 'SELECT COUNT(*) FROM ' || tab || ' WHERE ' || ver || ' <= ' || v_from;
+    END IF;
+
+    -- 3. The rows to build from.
+    --    Full: the latest row of every id by version, kept if it is not a delete. Two rows of one id
+    --    with the same version: the delete wins. Without a version column every id must appear once
+    --    (vbuild refuses a repeated id).
+    --    Incremental: the latest row of every id after the previous boundary, deletes included.
+    IF why IS NULL THEN
+        source := 'SELECT id, vec, del FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
+               || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC, ' || del_expr || ' DESC) AS rn FROM ' || tab
+               || ' WHERE ' || idc || ' IS NOT NULL AND ' || ver || ' > ' || prev_from || ') j WHERE rn = 1';
+    ELSIF ver IS NULL THEN
+        source := 'SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, FALSE AS del FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL';
+    ELSE
+        source := 'SELECT id, vec, FALSE AS del FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
                || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC, ' || del_expr || ' DESC) AS rn FROM ' || tab
                || ' WHERE ' || idc || ' IS NOT NULL) j WHERE rn = 1 AND NOT del';
     END IF;
 
-    -- 3. Build and store the chunks. vbuild sorts by id itself: no ORDER BY, no sort of the table.
+    -- 4. Build and store the chunks. vbuild sorts by id itself: no ORDER BY, no sort of the table.
     --    Snapshot ids come from a sequence: they never repeat, also not after unregister and register,
     --    so a cache file left behind by an older index of the same name is always recognised as stale.
     sid := (SELECT NEXTVAL('vvector.snapshot_seq'));
+    build_opts := 'index_name=' || QUOTE_LITERAL(nm) || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind)
+               || ', quantization=' || QUOTE_LITERAL(quant) || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || max_ver
+               || CASE WHEN why IS NULL THEN ', base_snapshot=' || prev ELSE '' END;
     EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
-         || ', byte_offset, chunk FROM (SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name=' || QUOTE_LITERAL(nm)
-         || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind) || ', quantization=' || QUOTE_LITERAL(quant)
-         || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || COALESCE(max_ver, 0)
+         || ', byte_offset, chunk FROM (SELECT vvector.vbuild(id, vec, del USING PARAMETERS ' || build_opts
          || ') OVER() FROM (' || source || ') e) b';
     PERFORM COMMIT;
     chunks := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
-    IF chunks = 0 THEN
+    IF chunks = 0 AND why IS NOT NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index %: table % has no vectors, nothing to build', nm, tab;
     END IF;
 
-    -- 4. Load on every node, with the index defaults. Until the manifest and the views change, queries
-    --    keep using the previous snapshot's views.
-    PERFORM CALL vvector.load_on_nodes(nm, sid);
-    PERFORM CALL vvector.push_options(nm);
+    IF chunks = 0 THEN
+        -- Incremental and no vector changed: the active snapshot holds the live vectors up to the new
+        -- boundary. Only the boundary moves; nothing is loaded.
+        secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
+        r_note := 'refreshed: snapshot ' || prev || ' kept, no vector changed since it was built; the delta starts at the new boundary; '
+               || secs || ' seconds';
+        PERFORM UPDATE vvector.manifest SET active_max_ver = max_ver, delta_from = v_from, boundary_rows = rows_next,
+                       built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = r_note
+                WHERE index_name = nm;
+        PERFORM COMMIT;
+        PERFORM CALL vvector.make_views(nm);
+    ELSE
+        -- 5. Load on every node, with the index defaults. Until the manifest and the views change,
+        --    queries keep using the previous snapshot's views.
+        PERFORM CALL vvector.load_on_nodes(nm, sid);
+        PERFORM CALL vvector.push_options(nm);
 
-    -- 5. Manifest and views.
-    n_vec := EXECUTE 'SELECT MAX(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
-    n_dims := EXECUTE 'SELECT MAX(dims) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
-    n_graph := EXECUTE 'SELECT MAX(graph_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
-    n_bytes := (SELECT SUM(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
-    fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
-    secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
-    PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
-                   base_snapshot = 0, vector_count = n_vec, dims = n_dims, tombstones = 0, graph_bytes = n_graph, index_bytes = n_bytes,
-                   built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt
-            WHERE index_name = nm;
-    PERFORM COMMIT;
-    PERFORM CALL vvector.make_views(nm);
+        -- 6. Manifest and views.
+        n_vec := EXECUTE 'SELECT MAX(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        n_dims := EXECUTE 'SELECT MAX(dims) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        n_graph := EXECUTE 'SELECT MAX(graph_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        n_tomb := EXECUTE 'SELECT MAX(tombstones) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        -- The size: offset and length of the last chunk (reading every chunk would take seconds).
+        n_bytes := (SELECT MAX(byte_offset) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+        n_bytes := n_bytes + (SELECT MAX(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid AND byte_offset = n_bytes);
+        secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
+        IF why IS NULL THEN
+            r_note := 'refreshed: snapshot ' || sid || ', incremental from snapshot ' || prev || ' (' || ((n_vec + n_tomb) - (prev_vec + prev_tomb))
+                   || ' vectors appended, ' || (n_tomb - prev_tomb) || ' tombstoned), ';
+        ELSE
+            r_note := 'refreshed: snapshot ' || sid || ', full build (' || why || '), ';
+        END IF;
+        r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
+               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds';
+        PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
+                       base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
+                       graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
+                       active_options = opts, incremental_count = CASE WHEN why IS NULL THEN since + 1 ELSE 0 END,
+                       boundary_rows = rows_next, refresh_note = r_note
+                WHERE index_name = nm;
+        PERFORM COMMIT;
+        PERFORM CALL vvector.make_views(nm);
 
-    -- 6. Keep the active and the previous snapshot.
-    PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id < COALESCE(prev, sid);
-    PERFORM COMMIT;
-    RAISE NOTICE 'vvector: index % refreshed: snapshot %, % vectors of % dimensions, % MB, % seconds',
-                 nm, sid, n_vec, n_dims, n_bytes // 1048576, secs;
+        -- 7. Keep the active and the previous snapshot.
+        PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id < COALESCE(prev, sid);
+        PERFORM COMMIT;
+    END IF;
 
-    -- 7. Journal replica: made, kept (with fresh statistics) or dropped as the journal grows.
+    -- 8. Journal replica: made, kept (with fresh statistics) or dropped as the journal grows.
     IF ver IS NOT NULL THEN
         PERFORM CALL vvector.apply_replica(nm);
+    END IF;
+END;
+$$;
+
+-- refresh_index(index_name [, mode]): mode auto, incremental or full; NULL or left out = the index's
+-- refresh_mode (set_index_options). Prints what was done and why.
+CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.refresh_index_core(nm, x_mode);
+    RAISE NOTICE 'vvector: index % %', nm, (SELECT MAX(refresh_note) FROM vvector.manifest WHERE index_name = nm);
+    IF (SELECT COUNT(ver_col) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.refresh_index_core(nm, NULL);
+    RAISE NOTICE 'vvector: index % %', nm, (SELECT MAX(refresh_note) FROM vvector.manifest WHERE index_name = nm);
+    IF (SELECT COUNT(ver_col) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
         RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
     END IF;
 END;
@@ -826,6 +965,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VA
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM PUBLIC;
@@ -835,9 +976,17 @@ GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VAR
 GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.status(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.sizing(INT, INT, VARCHAR, VARCHAR) TO PUBLIC;
+-- The procedures above call these; Vertica checks the caller's right on every nested CALL.
+GRANT EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) TO vvector_admin;

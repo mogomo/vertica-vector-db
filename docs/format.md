@@ -46,8 +46,8 @@ Flags:
 | 1 | FLAG_HNSW | graph section present (milestone M2) |
 | 2 | FLAG_NORMALISED | vectors have unit length; set for cosine indexes and only for them |
 | 4 | FLAG_SQ8 | int8 codes section present (milestone M4) |
-| 8 | FLAG_ID_INDEX | id_index section present; ids are then in any order (milestone M3) |
-| 16 | FLAG_TOMBSTONES | tombstones section present (milestone M3) |
+| 8 | FLAG_ID_INDEX | id_index section present; ids are then in any order (incremental builds, milestone M3) |
+| 16 | FLAG_TOMBSTONES | tombstones section present (incremental builds, milestone M3) |
 
 ## Sections
 
@@ -58,11 +58,19 @@ In this order, each starting on the next 64-byte boundary after the one before:
    snapshot stores 32 bits per element. Cosine rows have unit length (a zero
    vector stays zero).
 2. `ids`: int64[count], the id of position i. Strictly ascending when
-   FLAG_ID_INDEX is absent (every full build).
-3. `id_index` (FLAG_ID_INDEX): uint32[count], the positions sorted by id.
-   An id is found by a binary search over `ids[id_index[k]]`.
+   FLAG_ID_INDEX is absent (every full build, and an incremental build that
+   only appended ids larger than all before). With FLAG_ID_INDEX in any
+   order, and an id can be at several positions: an incremental build
+   appends a changed vector and tombstones its old position. At most one of
+   them is live, and it is the highest.
+3. `id_index` (FLAG_ID_INDEX): uint32[count], every position once, sorted
+   by id and, for one id, by position from high to low. An id is found by a
+   binary search over `ids[id_index[k]]`: its first entry is the only one
+   that can be live.
 4. `tombstones` (FLAG_TOMBSTONES): uint64[(count + 63) / 64], one bit per
-   position (bit i % 64 of word i / 64); 1 = the position is deleted.
+   position (bit i % 64 of word i / 64); 1 = the position is deleted. Bits
+   from count on are 0. A tombstoned position keeps its row, its id and its
+   links in the graph: searches pass through it but never return it.
 5. `sq8` (FLAG_SQ8): int8 codes and their scale. Defined with milestone M4.
 6. `graph` (FLAG_HNSW): the HNSW links, see below.
 
@@ -115,6 +123,28 @@ XOR over all 8-byte words w at word position p (offset / 8) of the file, the
 checksum field itself counted as 0, of splitmix64(w + (p + 1) x
 0x9E3779B97F4A7C15). Zero words contribute nothing. Because of the XOR, parts
 of the file can be summed separately and combined in any order.
-vload verifies it, and that the ids are unique and ascending (through the
-id_index when present), that the tombstone count matches, and the graph links;
-queries check the headers only.
+vload verifies it, the ids (without id_index: unique and ascending; with it:
+every position listed once, sorted as above, no id live at two positions),
+that the tombstone count matches the bits, and the graph links; queries check
+the headers only.
+
+## Incremental builds
+
+`base_snapshot` in the header names the snapshot an incremental build
+started from (0 = a full build). Such a build copies the sections of the
+base, then:
+
+- appends the new and the changed vectors (in id order) as positions
+  `count_base` to `count - 1`, with their ids;
+- sets the tombstone bit of every deleted or changed id's old position;
+- writes an id_index when an appended id is not larger than every id
+  before it, or when the base had one;
+- extends the graph: `levels`, `level0` and `upper_index` of the base are
+  copied to the same positions, the base's `upper` blocks come first in
+  `upper` (so a base position keeps its block index), the new positions get
+  their levels and blocks after them, and the new nodes are inserted with
+  the insertion code of the full build. New nodes are never linked to
+  tombstoned ones; a base node's list can change when a new node links back
+  to it. The entry point and max_level can change.
+
+A full rebuild writes neither tombstones nor an id_index.

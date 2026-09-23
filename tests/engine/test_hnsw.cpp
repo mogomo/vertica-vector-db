@@ -326,25 +326,6 @@ static void test_threads_and_determinism()
     CHECK(cancelled);
 }
 
-// Reads a .fvecs or .ivecs file.
-template <class T> static bool read_vecs(const std::string &path, std::vector<T> &out, std::uint32_t &dims, std::uint64_t &n)
-{
-    std::FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    out.clear();
-    n = 0;
-    std::int32_t d;
-    while (std::fread(&d, 4, 1, f) == 1) {
-        dims = static_cast<std::uint32_t>(d);
-        const std::size_t at = out.size();
-        out.resize(at + d);
-        if (std::fread(out.data() + at, 4, d, f) != static_cast<std::size_t>(d)) { std::fclose(f); return false; }
-        ++n;
-    }
-    std::fclose(f);
-    return true;
-}
-
 static void test_sift(const std::string &dir)
 {
     if (dir.empty()) {

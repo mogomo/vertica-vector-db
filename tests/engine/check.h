@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static int failures = 0;
@@ -74,6 +75,25 @@ inline void build(TestSet &t, std::uint64_t count, std::uint32_t dims, Order ord
     }
     b.finish(max_ver, t.buffer);
     t.set = vvector::snapshot_open(t.buffer.data(), t.buffer.size(), true);
+}
+
+// Reads a .fvecs or .ivecs file (SIFT1M): n vectors of dims elements.
+template <class T> bool read_vecs(const std::string &path, std::vector<T> &out, std::uint32_t &dims, std::uint64_t &n)
+{
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    out.clear();
+    n = 0;
+    std::int32_t d;
+    while (std::fread(&d, 4, 1, f) == 1) {
+        dims = static_cast<std::uint32_t>(d);
+        const std::size_t at = out.size();
+        out.resize(at + d);
+        if (std::fread(out.data() + at, 4, d, f) != static_cast<std::size_t>(d)) { std::fclose(f); return false; }
+        ++n;
+    }
+    std::fclose(f);
+    return true;
 }
 
 #endif

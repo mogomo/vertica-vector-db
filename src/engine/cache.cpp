@@ -233,6 +233,11 @@ void MappedSnapshot::open(const std::string &path, bool verify)
     void *m = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (m == MAP_FAILED) fail("cannot mmap", path);
+    // A mapping for queries: ask the kernel to read the file ahead. It costs nothing measurable when
+    // the file is in the page cache (vload reads all of it to verify it), and after a restart it
+    // reads the file in large pieces instead of page by page as the search touches it. Pre-mapping
+    // every page (MAP_POPULATE) was measured: it makes the first query of a session slower.
+    if (!verify) madvise(m, st.st_size, MADV_WILLNEED);
     if (map_ && !kept_) munmap(map_, size_);
     kept_.reset();
     map_ = m;

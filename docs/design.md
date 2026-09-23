@@ -198,6 +198,11 @@ project this code comes from):
 - HNSW build: in addition, the graph section (below) and, per build thread,
   2 bytes per vector of visited marks; 5 bytes per vector for a moment while
   the levels are laid out.
+- Incremental build: the new snapshot (base plus appended rows, graph, id_index
+  when needed), `4 x row_stride` bytes per changed row while they are collected,
+  one bit per position for the tombstones, and up to 2 bytes per position per
+  insert thread for the visited marks. The base is the mapped cache file (page
+  cache, shared).
 - The snapshot and every cache file: 256 bytes plus `4 x row_stride + 8` bytes
   per vector, plus the graph: about 141 bytes per vector with m = 16 (codes
   from M4).
@@ -247,7 +252,78 @@ unique, it can change, and it cannot be part of a projection.
   vload". Newer is fine (a refresh is in flight).
 - Refresh order, never changed: boundary, build, insert chunks, vload on all
   nodes, index defaults on all nodes, update manifest and views, delete older
-  snapshots.
+  snapshots. An incremental refresh (next section) keeps the order; only the
+  build reads less.
+
+## Incremental refresh (milestone M3)
+
+`refresh_index` builds a new snapshot from the active one and the journal
+rows after the previous boundary, the same rows the delta view shows,
+consolidated per id (latest row, a delete wins a tie; deletes are passed to
+vbuild with `del = true`). vbuild gets `base_snapshot` and reads the base from
+the cache of its node, verified like a vload (checksum, ids, graph links): a
+damaged base would otherwise be copied into every later snapshot with a fresh
+checksum.
+
+The engine (`src/engine/delta.cpp`, `IncrementalBuilder`):
+
+- Copies vectors, ids and tombstones of the base into a new buffer. A delete
+  of a live id sets the tombstone bit of its position. An add of an id that is
+  live with a different vector tombstones the old position; every new or
+  changed vector is appended as a new position, in id order. An add whose
+  vector is bit for bit the live one changes nothing: the delta margin brings
+  back rows the base already has, and without this every refresh would
+  tombstone and append them again. A delete of an id that is not live changes
+  nothing. When nothing changes, vbuild returns no rows and the refresh keeps
+  the snapshot and moves only the boundary.
+- An id can then be at several positions. The id_index sorts by id and, for
+  one id, by position from high to low; the live position is always the
+  highest (every change appends), so `VectorSet::find` looks at the first
+  entry only. Without appended ids below the largest base id (ids that only
+  grow, the usual case) the ids stay ascending and no id_index is written.
+- HNSW (`hnsw_extend`): the base graph is copied to the same positions; the
+  base's upper blocks come first, so no block index changes; the new
+  positions are inserted with the insert code of the full build, in parallel,
+  starting from the base's entry point. As in hnswlib, tombstoned nodes are
+  passed through during the insert but never chosen as neighbours; they stay
+  in other nodes' lists as bridges until the next full build. The
+  reachability repair pass of the full build runs again (it skips tombstoned
+  nodes), because a link list that overflows is shrunk by the heuristic and
+  can drop the last link to a node.
+- Tested (`tests/engine/test_delta.cpp`): after every round of random changes
+  the new snapshot passes the full verification, holds exactly the live
+  vectors, and a flat search, and a graph search with ef = count, give bit
+  for bit the result of a full build of the same vectors; every live node is
+  reachable. SIFT1M (`make test DATA_DIR=...`, VM, 8 threads): a 900,000-vector
+  base, then 100 rounds of 1000 adds and 500 deletes, 0.25 s per round (the
+  slowest 0.41 s; no Vertica). Recall@10 of the result against the exact
+  answer of the live set, next to a full build of the same 950,000 vectors
+  (32.3 s):
+
+  | ef_search | after 100 incremental rounds | full build |
+  |---:|---:|---:|
+  | 32 | 0.9072 | 0.9056 |
+  | 64 | 0.9658 | 0.9650 |
+  | 100 | 0.9845 | 0.9837 |
+  | 200 | 0.9965 | 0.9962 |
+
+  Inserting into a finished graph is what the HNSW build does all along, so
+  the graph does not get worse; 50,000 tombstones (5%) did not lower recall
+  either.
+
+When the refresh builds in full instead (`refresh_index` in
+`sql/procedures.sql`, the reason goes to `manifest.refresh_note`): mode
+`full`; the first build; a static index; changed build options
+(`manifest.active_options` records those of the active snapshot) or format;
+tombstones above `tombstone_ratio` of the positions or `rebuild_every`
+incremental refreshes reached (mode `auto` only); a node whose cache does not
+hold the active snapshot (checked with `vinfo` before the build); and a
+journal whose rows up to the previous boundary changed in number. That count
+(`manifest.boundary_rows`) is taken at every refresh for the new boundary: a
+row committed later always has a newer version (that is the boundary rule),
+so the count only changes when rows are removed (physical DELETE, dropped
+partitions) or written with old versions by hand. It is one scan of the
+version column.
 
 ## Where a single query spends its time
 
@@ -438,3 +514,87 @@ At M2 (benchmark.sh, fenced): flat `refresh_index` 11.2 s (vbuild statement
 between runs). HNSW `refresh_index` 45.6 s: the vbuild statement 41.9 s, of
 which the graph build is about 34 s (8 threads, `make bench`), and vload 1.9 s
 (write 631 MB, verify the checksum and every link of the graph).
+
+### Incremental refresh at milestone M3
+
+Vertica 26.2.0-1, the VM, fenced, `scripts/benchmark.sh --parts=incremental`: a flat
+and an HNSW index (m 16, ef_construction 200) on a copy of the first 900,000 SIFT1M
+vectors; after each change `refresh_index` (client time, and the two big statements):
+
+| Change | flat total | vbuild | vload | hnsw total | vbuild | vload |
+|---|---:|---:|---:|---:|---:|---:|
+| first build (full) | 10.1 s | 7.7 s | 1.6 s | 40.7 s | 38.1 s | 1.8 s |
+| none: snapshot kept | 0.53 s | 6 ms | - | 0.51 s | 5 ms | - |
+| 100 adds, 50 deletes | 4.4 s | 2.2 s | 1.5 s | 6.5 s | 3.9 s | 1.9 s |
+| 1,000 adds, 500 deletes | 4.4 s | 2.3 s | 1.5 s | 6.5 s | 3.9 s | 1.9 s |
+| 10,000 adds, 5,000 deletes | 4.7 s | 2.3 s | 1.7 s | 7.2 s | 4.4 s | 2.1 s |
+| 50,000 adds, 25,000 deletes | 5.1 s | 2.7 s | 1.7 s | 9.2 s | 6.4 s | 2.0 s |
+| full build of the 930,550 vectors | 8.5 s | 6.3 s | 1.6 s | 42.4 s | 39.9 s | 1.8 s |
+
+So an incremental refresh is a fixed cost plus about 0.04 ms (HNSW) or 0.01 ms (flat)
+per changed row. The fixed cost is the size of the index, not of the change: the new
+snapshot is written to `vvector.snapshot` in full (the vbuild statement: 2.2 s for
+450 MB flat, 3.9 s for 570 MB HNSW, of which the engine needs 0.25 s and verifying the
+base 0.1 to 0.4 s: 0.39 s for 630 MB when its pages are not mapped yet, 0.10 s after) and loaded on every node in full (vload, 1.5 to 2 s). Before the
+three changes below, the 100-refresh test measured 7.3 to 7.6 s per HNSW refresh:
+
+- `refresh_index` called `status` first; its NOTICEs never reached anyone (nested
+  CALL), 0.5 s: removed.
+- The snapshot size was `SUM(OCTET_LENGTH(chunk))`, which reads every chunk: 1.1 s for
+  574 MB. Now the offset and length of the last chunk.
+- The highest version was `MAX(ver)` over the whole journal (0.17 s at 1M rows, and it
+  grows with the journal); now over the rows after the previous boundary only.
+
+What is left and could be shaped later: moving only the changed parts of the
+snapshot. With appended positions every section after the vectors moves, so a
+chunk-level difference needs a layout with room to grow (a format version 3), and
+the level-0 links of the graph change all over the file (every insert adds back
+links). Not planned; noted here with the numbers it would be judged by.
+
+The 100-refresh acceptance test (`tests/sql/test_incremental.sh --sift=VVBENCH`,
+before the three changes): 900,000 base vectors, 100 refreshes of 1000 adds and 500
+deletes, tombstone_ratio 0.03; one full build fired at round 59 (29,000 tombstones in
+958,000 positions), 99 incremental; median 7.8 s, full 46.5 s; the index holds exactly
+the 950,000 live vectors (manifest, vinfo and the journal agree) and recall@10 at the
+default precision against the exact search of 1000 queries passed (>= 0.95). The
+disk use of the database stayed within 7 GB of its start: the Tuple Mover purged the
+deleted snapshot rows by itself.
+
+### Prewarming (milestone M3)
+
+The cost of the first search of a session (`scripts/latency.sh --first_call`, 20 new
+sessions, client ms, median; 1M x 128, warm page cache):
+
+| | first call | second call |
+|---|---:|---:|
+| HNSW `_snap`, fenced, no advice | 13.0 | 7.6 |
+| the same with `madvise(MADV_WILLNEED)` on the mapping | 12.9 | 7.5 |
+| the same with `MAP_POPULATE` (every page mapped at open) | 22.3 | 7.9 |
+| flat `_snap`, fenced, no advice / WILLNEED / POPULATE | 18.1 / 18.1 / 23.5 | 12.7 / 12.7 / 12.7 |
+| `vversion()`, fenced (no index at all) | 11.3 | 8.6 |
+| tiny index (16 vectors), fenced | 9.8 | 7.1 |
+| HNSW `_snap`, mixed (vsearch in the Vertica process) | 2.4 | 2.1 |
+
+Fenced, the first call pays about 2.7 ms for the new fenced process and its first
+function call (vversion and the tiny index show it without a large file) and about
+2.7 ms for the new mapping of a 1M-vector index (page faults, the visited array);
+flat and HNSW pay the same, so the page faults are the smaller part. `MAP_POPULATE`
+maps all 150,000 pages up front and is slower. `MADV_WILLNEED` costs nothing
+measurable with the file in the page cache and asks the kernel to read the file ahead
+when it is not (after a restart; not measured). vvector keeps WILLNEED on every new
+query mapping. vload needs no advice: it reads the whole new file to verify its
+checksum, which leaves it in the page cache. Unfenced the mapping is kept by the
+Vertica process across sessions, so only the first query after a new snapshot pays.
+
+### Repeated at milestone M3 (Vertica 26.2.0-1, the VM)
+
+`scripts/latency.sh`, 200 runs, client ms, median / p99. The query path did not
+change; the numbers are those of M2 within the noise.
+
+| Shape | fenced | mixed |
+|---|---:|---:|
+| `SELECT 1` | 0.86 / 1.10 | 0.99 / 1.23 |
+| HNSW `sift_hnsw_snap` (balanced) | 7.06 / 8.08 | 1.94 / 2.79 |
+| HNSW `sift_hnsw_delta`, freshness exact, empty delta | 8.14 / 10.21 | 3.04 / 5.08 |
+| HNSW `vknn ... FROM dual` | 7.41 / 8.23 | 1.57 / 1.95 |
+| flat `sift_snap` | 12.66 / 13.80 | 5.08 / 5.53 |

@@ -83,6 +83,17 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p,
 // The graph section for SnapshotBuilder::finish.
 GraphSection hnsw_graph_section(const HnswParams &p, const std::function<bool()> &poll = std::function<bool()>());
 
+// Incremental build (delta.h): bytes of the graph section of base extended by n_new positions with
+// these ids.
+std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new);
+
+// Incremental build: writes the base graph into section (hnsw_extended_bytes bytes, zero-filled) and
+// inserts the positions base.count .. s.count - 1 of s with the insertion code of hnsw_build.
+// s is the new snapshot: the base's positions first, same order. Tombstoned positions of s stay in
+// the graph and are passed through, but new nodes are not linked to them. p.m must be base.m.
+void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *section, const HnswParams &p,
+                 const std::function<bool()> &poll = std::function<bool()>());
+
 // Opens the graph of a snapshot with FLAG_HNSW. Throws std::runtime_error with the cause. verify
 // reads every link (vload); without it only the header is checked (every query).
 HnswGraph hnsw_open(const VectorSet &s, bool verify);
