@@ -43,6 +43,11 @@ row_numbers() {
             LIMIT $1) g"
 }
 
+# wait_cache_check: a warm query trusts the ACTIVE and OPTIONS files of the node cache for 200 ms
+# (src/engine/cache.h, ACTIVE_CHECK_MS). Tests that change those files by hand, or change index
+# defaults, wait that long before the next query, as unfenced queries in the same process would.
+wait_cache_check() { [ "$ECHO_ONLY" = yes ] || sleep 0.3; }
+
 # finish_tests NAME: summary line and exit code.
 finish_tests() {
     [ "$ECHO_ONLY" = yes ] && exit 0

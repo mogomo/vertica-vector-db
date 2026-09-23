@@ -1,49 +1,106 @@
-// Snapshot format: layout, builder, validation, checksum, and the HNSW stub.
+// Snapshot format version 2: layout, padding, builder, validation, checksum, id lookup, HNSW stub.
 #include "check.h"
 
 #include "../../src/engine/hnsw.h"
 
+#include <cmath>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 
 using namespace vvector;
 
-template <class F> static bool throws(F f, const char *containing = "")
+// Rewrites the checksum after a deliberate change of the bytes.
+static void reseal(SnapshotBuffer &b)
 {
-    try { f(); } catch (const std::runtime_error &e) { return std::strstr(e.what(), containing) != nullptr; }
-    return false;
+    const std::uint64_t sum = snapshot_checksum(b.data(), b.size());
+    std::memcpy(b.data() + offsetof(SnapshotHeader, checksum), &sum, 8);
 }
 
 int main()
 {
     // Metric names.
-    CHECK(parse_metric("l2") == Metric::L2 && parse_metric("cosine") == Metric::Cosine && parse_metric("dot") == Metric::Dot);
-    CHECK(throws([] { parse_metric("L2"); }, "metric must be"));
-    CHECK(std::string(metric_name(Metric::Cosine)) == "cosine");
+    CHECK(parse_metric("l2") == Metric::L2 && parse_metric("cosine") == Metric::Cosine &&
+          parse_metric("dot") == Metric::Dot && parse_metric("l1") == Metric::L1);
+    CHECK(throws([] { parse_metric("L2"); }, "metric must be l2, cosine, dot or l1"));
+    CHECK(std::string(metric_name(Metric::Cosine)) == "cosine" && std::string(metric_name(Metric::L1)) == "l1");
 
-    // Layout: header, ids, vectors; every section 8-byte aligned.
-    SnapshotHeader h;
-    std::memset(&h, 0, sizeof(h));
-    h.count = 3;
-    h.dims = 3;
-    snapshot_layout(h);
-    CHECK(h.off_ids == 128 && h.off_vectors == 128 + 24 && h.off_graph == 0);
-    CHECK(h.total_bytes == 128 + 24 + 40);      // 36 bytes of vectors, padded to 40
-    CHECK(h.total_bytes % 8 == 0);
+    // Row stride: dims rounded up to 16.
+    CHECK(row_stride_for(1) == 16 && row_stride_for(15) == 16 && row_stride_for(16) == 16 &&
+          row_stride_for(17) == 32 && row_stride_for(768) == 768);
 
-    // Build in id order and in reverse order: the same bytes.
-    TestSet a, b;
-    build(a, 1000, 7, false, Metric::Cosine, 4711);
-    build(b, 1000, 7, true, Metric::Cosine, 4711);
+    // Layout: header 256 bytes, vectors first, every section on a 64-byte boundary.
+    {
+        SnapshotHeader h;
+        std::memset(&h, 0, sizeof(h));
+        h.count = 3;
+        h.dims = 3;
+        h.row_stride = 16;
+        snapshot_layout(h);
+        CHECK(h.off_vectors == 256 && h.off_ids == 256 + 192 && h.total_bytes == 512);
+        CHECK(h.off_id_index == 0 && h.off_tombstones == 0 && h.off_sq8 == 0 && h.off_graph == 0);
+        h.flags = FLAG_ID_INDEX | FLAG_TOMBSTONES | FLAG_SQ8 | FLAG_HNSW;
+        h.sq8_bytes = 100;
+        h.graph_bytes = 8;
+        snapshot_layout(h);
+        CHECK(h.off_id_index == 512 && h.off_tombstones == 576 && h.off_sq8 == 640 && h.off_graph == 768 &&
+              h.total_bytes == 832);
+    }
+
+    // Built in id order, in reverse and shuffled: the same bytes.
+    TestSet a, b, c;
+    build(a, 1000, 7, Order::Ascending, Metric::L2, 4711);
+    build(b, 1000, 7, Order::Reversed, Metric::L2, 4711);
+    build(c, 1000, 7, Order::Shuffled, Metric::L2, 4711);
     CHECK(a.buffer.size() == b.buffer.size() && std::memcmp(a.buffer.data(), b.buffer.data(), a.buffer.size()) == 0);
-    CHECK(a.set.count == 1000 && a.set.dims == 7 && a.set.metric == Metric::Cosine && a.set.max_ver == 4711);
-    CHECK(!a.set.has_graph);
-    bool sorted = true;
+    CHECK(a.buffer.size() == c.buffer.size() && std::memcmp(a.buffer.data(), c.buffer.data(), a.buffer.size()) == 0);
+    CHECK(a.set.count == 1000 && a.set.dims == 7 && a.set.row_stride == 16 && a.set.metric == Metric::L2);
+    CHECK(a.set.max_ver == 4711 && a.set.flags == 0 && !a.set.has_graph() && !a.set.normalised());
+    CHECK(a.set.id_index == nullptr && a.set.tombstone_bits == nullptr && a.set.base_snapshot == 0);
+    CHECK(reinterpret_cast<std::uintptr_t>(a.set.vectors) % 64 == 0);
+    bool sorted = true, padded = true;
     for (std::uint64_t i = 1; i < a.set.count; ++i) sorted = sorted && a.set.ids[i - 1] < a.set.ids[i];
-    CHECK(sorted);
-    // Row i belongs to ids[i]: vector of id (n + 1) * 10 has elements in [n, n + 1).
+    for (std::uint64_t i = 0; i < a.set.count; ++i)
+        for (std::uint32_t d = 7; d < 16; ++d) padded = padded && a.set.vector(i)[d] == 0.0f;
+    CHECK(sorted && padded);
+    // Row i belongs to ids[i]: the vector of id (n + 1) * 10 has elements in [n, n + 1).
     CHECK(a.set.ids[5] == 60 && a.set.vector(5)[0] >= 5.0f && a.set.vector(5)[6] < 6.0f);
+
+    // A larger shuffled build: the buffer grows many times and the rows are moved in place.
+    {
+        TestSet x, y;
+        build(x, 50000, 33, Order::Ascending, Metric::Dot, 1, 7);
+        build(y, 50000, 33, Order::Shuffled, Metric::Dot, 1, 7);
+        CHECK(x.buffer.size() == y.buffer.size() && std::memcmp(x.buffer.data(), y.buffer.data(), x.buffer.size()) == 0);
+        CHECK(x.set.row_stride == 48 && x.buffer.size() % 64 == 0);
+    }
+
+    // Id lookup, also through an id_index.
+    CHECK(a.set.find(10) == 0 && a.set.find(10000) == 999 && a.set.find(500) == 49 && a.set.find(505) == -1);
+    CHECK(a.set.find(5) == -1 && a.set.find(15) == -1 && a.set.find(10010) == -1);
+    {
+        const std::int64_t ids[4] = {30, 10, 40, 20};
+        const std::uint32_t index[4] = {1, 3, 0, 2};
+        VectorSet s;
+        s.count = 4;
+        s.ids = ids;
+        s.id_index = index;
+        CHECK(s.find(10) == 1 && s.find(20) == 3 && s.find(30) == 0 && s.find(40) == 2);
+        CHECK(s.find(25) == -1 && s.find(5) == -1 && s.find(50) == -1);
+    }
+
+    // Cosine: rows are stored with unit length; a zero vector stays zero.
+    {
+        SnapshotBuilder x(Metric::Cosine);
+        const float v1[3] = {3, 0, 4}, v2[3] = {0, 0, 0};
+        x.add(2, v1, 3);
+        x.add(1, v2, 3);
+        TestSet t;
+        x.finish(0, t.buffer);
+        t.set = snapshot_open(t.buffer.data(), t.buffer.size(), true);
+        CHECK(t.set.normalised() && t.set.flags == FLAG_NORMALISED);
+        CHECK(t.set.ids[0] == 1 && t.set.vector(0)[0] == 0.0f && t.set.vector(0)[2] == 0.0f);
+        CHECK(std::fabs(t.set.vector(1)[0] - 0.6f) < 1e-7f && std::fabs(t.set.vector(1)[2] - 0.8f) < 1e-7f);
+    }
 
     // Builder errors.
     CHECK(throws([] { SnapshotBuilder x(Metric::L2); SnapshotBuffer o; x.finish(0, o); }, "no vectors"));
@@ -52,19 +109,55 @@ int main()
         x.add(1, v, 2); x.add(2, v, 1); }, "has 1 elements"));
     CHECK(throws([] {
         SnapshotBuilder x(Metric::L2); const float v[2] = {1, 2}; SnapshotBuffer o;
-        x.add(2, v, 2); x.add(1, v, 2); x.add(2, v, 2); x.finish(0, o); }, "appears twice"));
+        x.add(2, v, 2); x.add(1, v, 2); x.add(2, v, 2); x.finish(0, o); }, "id 2 appears twice"));
     CHECK(throws([] { SnapshotBuilder x(Metric::L2); const float v[1] = {1}; x.add(1, v, 0); }, "no elements"));
+    CHECK(throws([] { SnapshotBuilder x(Metric::L2); x.begin_row(1, MAX_DIMS + 1); }, "at most 32768"));
 
-    // Damage is found.
-    CHECK(throws([&] { snapshot_open(a.buffer.data(), a.buffer.size() - 8, false); }, "header says"));
+    // Damage and foreign files are found.
+    CHECK(throws([&] { snapshot_open(a.buffer.data(), a.buffer.size() - 64, false); }, "header says"));
     {
-        TestSet c;
-        build(c, 10, 4);
-        c.buffer.data()[200] ^= 1;
-        CHECK(throws([&] { snapshot_open(c.buffer.data(), c.buffer.size(), true); }, "checksum mismatch"));
-        CHECK(!throws([&] { snapshot_open(c.buffer.data(), c.buffer.size(), false); }));
-        c.buffer.data()[0] = 'X';
-        CHECK(throws([&] { snapshot_open(c.buffer.data(), c.buffer.size(), false); }, "wrong magic"));
+        TestSet t;
+        build(t, 10, 4);
+        t.buffer.data()[300] ^= 1;
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), true); }, "checksum mismatch"));
+        CHECK(!throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }));
+        t.buffer.data()[0] = 'X';
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }, "wrong magic"));
+    }
+    {
+        // A version 1 file (milestone M0) is refused with what to do.
+        TestSet t;
+        build(t, 10, 4);
+        const std::uint32_t v1 = 1;
+        std::memcpy(t.buffer.data() + offsetof(SnapshotHeader, format_version), &v1, 4);
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); },
+                     "format version 1, this library reads version 2: refresh the index"));
+    }
+    {
+        // Ids out of order are found by the full check (vload), with a valid checksum.
+        TestSet t;
+        build(t, 10, 4);
+        std::int64_t *ids = reinterpret_cast<std::int64_t *>(t.buffer.data() + 256 + 10 * 64);
+        std::swap(ids[3], ids[4]);
+        reseal(t.buffer);
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), true); }, "not unique and ascending"));
+    }
+    {
+        // Flags and sizes must agree.
+        TestSet t;
+        build(t, 10, 4);
+        SnapshotHeader h;
+        std::memcpy(&h, t.buffer.data(), sizeof(h));
+        h.flags = FLAG_NORMALISED;
+        std::memcpy(t.buffer.data(), &h, sizeof(h));
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }, "must be normalised"));
+        h.flags = 64;
+        std::memcpy(t.buffer.data(), &h, sizeof(h));
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }, "unknown flags"));
+        h.flags = 0;
+        h.row_stride = 4;
+        std::memcpy(t.buffer.data(), &h, sizeof(h));
+        CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }, "row_stride"));
     }
 
     // Checksum of parts, in any order, equals the checksum of the file.
@@ -76,7 +169,7 @@ int main()
         CHECK(parts == snapshot_checksum(d, n));
     }
 
-    // HNSW is a stub.
+    // HNSW is a stub until milestone M2.
     CHECK(throws([&] { hnsw_build(a.set, HnswParams()); }, "not implemented"));
     CHECK(throws([&] { hnsw_search(a.set, a.set.vector(0), 5, 50); }, "not implemented"));
 

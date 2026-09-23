@@ -8,10 +8,10 @@
 namespace vvector {
 
 // Library version. Change it here only.
-constexpr const char *LIBRARY_VERSION = "0.0.1";
+constexpr const char *LIBRARY_VERSION = "0.1.0";
 
 // Snapshot binary format version. See docs/format.md.
-constexpr std::int32_t FORMAT_VERSION = 1;
+constexpr std::int32_t FORMAT_VERSION = 2;
 
 // Build flags are passed by the Makefile. The fallback keeps other builds working.
 #ifndef VVECTOR_BUILD_FLAGS

@@ -126,3 +126,37 @@ Check again on other versions.
 - `FencedUDxMemoryLimitMB` is -1 by default (no limit). UDx heap is outside the
   resource pools; an mmap'ed file is page cache, shared by all queries and
   reclaimable.
+
+## Verified in milestone M1 (26.2.0-1, 2026-09-23)
+- SDK, arrays: for a 1-D FLOAT array cell, `Array::ArrayReader a = in.getArrayRef(col)` gives
+  `a->getNumRows()` (the element count) and `a->getFloatPtr(0)`, a pointer to the first element;
+  `a->getColStride(0)` is 8: the elements are one contiguous run of float8 values in the input
+  block. vvector reads vectors through that pointer, not with a call per element. A NULL element is
+  the float8 value `vfloat_null` (a NaN pattern; test with `vfloatIsNull`).
+- SDK: `TransformFunctionFactory::Properties` has `isExploder` ("expands rows 1:N"), set through
+  `getFunctionProperties`; marked INTERNAL in the header. Tested for vknn at milestone M2.
+- SDK: session parameters arrive as strings (`getUDSessionParamReader("library").getStringRef`),
+  whatever the value looks like; vvector parses numbers and booleans itself.
+- SDK: `vt_report_error` throws through a function pointer set by the server; the exception type is
+  not visible to the library. The adapters throw `std::runtime_error` and report once, in the catch.
+- `ALTER TABLE t ADD COLUMN IF NOT EXISTS c INT DEFAULT NULL` works; a second run gives
+  "NOTICE 8778: Duplicate column name; nothing was done". install.sql upgrades the manifest this way.
+- Procedures can be overloaded by argument count: `p(x INT, y INT)` and `p(x INT)` side by side,
+  and one can `PERFORM CALL` the other. register_index uses it for the optional index_type.
+- PL/vSQL: `x := (SELECT ...)::INT` (a cast outside the subquery) fails with "ERROR 5301:
+  Unsupported use of sub-queries"; put the cast inside. A subquery inside an `IF` condition works.
+- `GET_CONFIG_PARAMETER(...)` cannot be nested in another function or cast ("ERROR 2009: ... can
+  not be used in function int8"). Read `v_monitor.configuration_parameters.current_value` instead.
+- PL/vSQL: an `IF` whose condition is NULL (for example `IF x = 'a'` with x NULL) raises
+  "ERROR 10268: Query returned null where a value was expected"; it is not treated as false.
+- `v_monitor.host_resources` has `processor_core_count`, `total_memory_bytes`,
+  `total_memory_free_bytes`, `total_memory_cache_bytes`. `GET_CONFIG_PARAMETER('FencedUDxMemoryLimitMB')`
+  returns the limit as text ('-1' = none); so does `current_value` in
+  `v_monitor.configuration_parameters`.
+- `TO_JSON(vec)` prints an ARRAY[FLOAT] as `[0.12345678901234568,-1e-20,3.0]`: 17 significant
+  digits, so the text reads back as the same double. `ARRAY_TO_STRING` does not accept FLOAT arrays
+  and an array cannot be cast to VARCHAR (ERROR 2366). Use TO_JSON to build a `query` parameter.
+- A correlated subquery with `<>` in its condition is rejected (ERROR 2788: "Correlated subquery in
+  expression with operator <> is not supported"). Window functions (LAG, LEAD) do the same job.
+- A view without FROM (`CREATE VIEW v AS SELECT NULL::INT AS qid, ..., 21 AS snapshot_id`) is
+  allowed and is a valid input of a transform function: the `_snap` view.

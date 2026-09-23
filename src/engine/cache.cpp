@@ -1,9 +1,10 @@
 #include "cache.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <stdexcept>
 
@@ -45,6 +46,16 @@ bool file_has_magic(const std::string &path)
     return got == static_cast<ssize_t>(sizeof(head)) && snapshot_has_magic(head, sizeof(head));
 }
 
+// Makes the renames in a directory durable.
+void sync_dir(const std::string &dir)
+{
+    int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) fail("cannot open directory", dir);
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok) fail("cannot sync directory", dir);
+}
+
 // Writes a small text file atomically: temp file, then rename.
 void write_atomically(const std::string &path, const std::string &content)
 {
@@ -58,6 +69,24 @@ void write_atomically(const std::string &path, const std::string &content)
         ::unlink(tmp.c_str());
         fail("cannot write", path);
     }
+}
+
+// The whole content of a small file, or false.
+bool read_small_file(const std::string &path, std::string &out)
+{
+    std::FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char buf[4096];
+    const std::size_t n = std::fread(buf, 1, sizeof(buf), f);
+    std::fclose(f);
+    out.assign(buf, n);
+    return true;
+}
+
+bool is_file(const std::string &path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 } // namespace
@@ -86,14 +115,12 @@ std::string snapshot_path(const std::string &cache_dir, const std::string &index
 
 bool read_active(const std::string &cache_dir, const std::string &index, std::int64_t &snapshot_id)
 {
-    const std::string path = index_dir(cache_dir, index) + "/ACTIVE";
-    std::FILE *f = std::fopen(path.c_str(), "r");
-    if (!f) return false;
+    std::string text;
+    if (!read_small_file(index_dir(cache_dir, index) + "/ACTIVE", text)) return false;
     long long id = 0;
-    const bool ok = std::fscanf(f, "%lld", &id) == 1;
-    std::fclose(f);
+    if (std::sscanf(text.c_str(), "%lld", &id) != 1) return false;
     snapshot_id = id;
-    return ok;
+    return true;
 }
 
 std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
@@ -102,17 +129,66 @@ std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
     DIR *d = opendir(cache_dir.c_str());
     if (!d) return indexes;
     while (dirent *e = readdir(d))
-        if (valid_index_name(e->d_name)) indexes.push_back(e->d_name);
+        if (valid_index_name(e->d_name) && is_file(cache_dir + "/" + e->d_name + "/ACTIVE")) indexes.push_back(e->d_name);
     closedir(d);
+    std::sort(indexes.begin(), indexes.end());
     return indexes;
+}
+
+// ---- index options
+
+static const char *const OPTION_NAMES[] = {"precision", "freshness", "ef_search", "threads"};
+
+IndexOptions parse_index_options(const std::string &text)
+{
+    IndexOptions out;
+    std::size_t at = 0;
+    while (at <= text.size()) {
+        std::size_t end = text.find_first_of(",\n", at);
+        if (end == std::string::npos) end = text.size();
+        std::string item = text.substr(at, end - at);
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\r')) item.pop_back();
+        while (!item.empty() && item.front() == ' ') item.erase(0, 1);
+        at = end + 1;
+        if (item.empty()) continue;
+        const std::size_t eq = item.find('=');
+        if (eq == std::string::npos) throw std::runtime_error("index option '" + item + "' is not name=value");
+        const std::string name = item.substr(0, eq), value = item.substr(eq + 1);
+        bool known = false;
+        for (const char *n : OPTION_NAMES) known = known || name == n;
+        if (!known) throw std::runtime_error("unknown index option '" + name + "'");
+        for (char c : value)
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+                throw std::runtime_error("index option " + name + ": value '" + value + "' is not valid");
+        if (!value.empty()) out[name] = value;
+    }
+    return out;
+}
+
+void write_index_options(const std::string &cache_dir, const std::string &index, const IndexOptions &options)
+{
+    const std::string dir = index_dir(cache_dir, index);
+    make_dir(cache_dir);
+    make_dir(dir);
+    std::string text;
+    for (const auto &o : options) text += o.first + "=" + o.second + "\n";
+    write_atomically(dir + "/OPTIONS", text);
+}
+
+IndexOptions read_index_options(const std::string &cache_dir, const std::string &index)
+{
+    std::string text;
+    if (!read_small_file(index_dir(cache_dir, index) + "/OPTIONS", text)) return IndexOptions();
+    return parse_index_options(text);
 }
 
 // ---- MappedSnapshot
 
 namespace {
 
-// The mappings kept by open_active, by file path. An entry is used only while the file at that
-// path is still the file that was mapped.
+using Clock = std::chrono::steady_clock;
+
+// A mapping kept by open_active.
 struct KeptMapping {
     void *map = nullptr;
     std::uint64_t size = 0;
@@ -126,8 +202,18 @@ struct KeptMapping {
                static_cast<std::uint64_t>(st.st_size) == size;
     }
 };
-std::mutex kept_lock;
-std::map<std::string, std::shared_ptr<KeptMapping>> kept_mappings;
+
+// What the process knows about one index of one cache directory.
+struct IndexState {
+    std::int64_t snapshot_id = 0;
+    std::string path;
+    std::shared_ptr<KeptMapping> mapping;
+    IndexOptions options;
+    Clock::time_point checked;
+};
+
+std::mutex state_lock;
+std::map<std::string, IndexState> states;      // by <cache_dir>/<index>
 
 } // namespace
 
@@ -136,7 +222,7 @@ MappedSnapshot::~MappedSnapshot()
     if (map_ && !kept_) munmap(map_, size_);
 }
 
-void MappedSnapshot::open(const std::string &path, bool verify_checksum)
+void MappedSnapshot::open(const std::string &path, bool verify)
 {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open", path);
@@ -154,46 +240,61 @@ void MappedSnapshot::open(const std::string &path, bool verify_checksum)
     ino_ = st.st_ino;
     path_ = path;
     try {
-        set_ = snapshot_open(static_cast<const std::uint8_t *>(map_), size_, verify_checksum);
+        set_ = snapshot_open(static_cast<const std::uint8_t *>(map_), size_, verify);
     } catch (const std::runtime_error &e) {
         throw std::runtime_error(std::string(e.what()) + " in " + path);
     }
 }
 
-void MappedSnapshot::open_active(const std::string &cache_dir, const std::string &index)
+void MappedSnapshot::open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least)
 {
-    std::int64_t id = 0;
-    if (!read_active(cache_dir, index, id))
-        throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir + ": run vload");
-    const std::string path = snapshot_path(cache_dir, index, id);
-    const std::string dir = path.substr(0, path.rfind('/') + 1);
-    std::lock_guard<std::mutex> hold(kept_lock);
-    for (auto it = kept_mappings.begin(); it != kept_mappings.end(); ) {
-        const bool older = it->first != path && it->first.compare(0, dir.size(), dir) == 0;
-        if (older || !it->second->is_file(it->first)) it = kept_mappings.erase(it);      // unmapped when its last query ends
-        else ++it;
-    }
-    auto it = kept_mappings.find(path);
-    if (it == kept_mappings.end()) {
-        try {
-            open(path, false);
-        } catch (const std::runtime_error &e) {
-            throw std::runtime_error(std::string("snapshot cache of index '") + index + "' is missing or damaged (" +
-                                     e.what() + "): run vload");
+    const std::string key = index_dir(cache_dir, index);
+    const Clock::time_point now = Clock::now();
+    std::lock_guard<std::mutex> hold(state_lock);
+    IndexState &st = states[key];
+    const bool fresh = st.mapping && now - st.checked < std::chrono::milliseconds(ACTIVE_CHECK_MS) &&
+                       st.snapshot_id >= at_least;
+    if (!fresh) {
+        std::int64_t id = 0;
+        if (!read_active(cache_dir, index, id)) {
+            states.erase(key);
+            throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir + ": run vload");
         }
-        std::shared_ptr<KeptMapping> keep(new KeptMapping);
-        keep->map = map_; keep->size = size_; keep->dev = dev_; keep->ino = ino_; keep->set = set_;
-        kept_ = keep;
-        kept_mappings[path] = keep;
-    } else {
-        if (map_ && !kept_) munmap(map_, size_);
-        kept_ = it->second;
-        map_ = it->second->map;
-        size_ = it->second->size;
-        set_ = it->second->set;
-        path_ = path;
+        const std::string path = snapshot_path(cache_dir, index, id);
+        if (!st.mapping || st.path != path || !st.mapping->is_file(path)) {
+            try {
+                open(path, false);
+            } catch (const std::runtime_error &e) {
+                states.erase(key);
+                throw std::runtime_error(std::string("snapshot cache of index '") + index + "' is missing or damaged (" +
+                                         e.what() + "): run vload");
+            }
+            std::shared_ptr<KeptMapping> keep(new KeptMapping);
+            keep->map = map_; keep->size = size_; keep->dev = dev_; keep->ino = ino_; keep->set = set_;
+            kept_ = keep;
+            st.mapping = keep;          // the mapping it replaces is unmapped when its last query ends
+            st.path = path;
+        }
+        try {
+            st.options = read_index_options(cache_dir, index);
+        } catch (const std::runtime_error &e) {
+            throw std::runtime_error("index '" + index + "': OPTIONS file in the cache: " + e.what() + ": run vvector.load_all");
+        }
+        st.snapshot_id = id;
+        st.checked = now;
     }
-    snapshot_id_ = id;
+    if (kept_ != st.mapping) {
+        if (map_ && !kept_) munmap(map_, size_);
+        kept_ = st.mapping;
+        map_ = st.mapping->map;
+        size_ = st.mapping->size;
+        dev_ = st.mapping->dev;
+        ino_ = st.mapping->ino;
+        set_ = st.mapping->set;
+    }
+    path_ = st.path;
+    options_ = st.options;
+    snapshot_id_ = st.snapshot_id;
 }
 
 // ---- CacheWriter
@@ -259,6 +360,7 @@ std::uint64_t CacheWriter::commit()
     ::close(fd_);
     fd_ = -1;
     write_atomically(dir_ + "/ACTIVE", std::to_string(snapshot_id_) + "\n");
+    sync_dir(dir_);
 
     // Keep the new and the previous snapshot. Remove other vvector files only.
     const std::string keep_new = std::to_string(snapshot_id_) + ".vv";
@@ -266,7 +368,8 @@ std::uint64_t CacheWriter::commit()
     if (DIR *d = opendir(dir_.c_str())) {
         while (dirent *e = readdir(d)) {
             const std::string name = e->d_name;
-            if (name == keep_new || name == keep_old || name == "ACTIVE" || name == "." || name == "..") continue;
+            if (name == keep_new || name == keep_old || name == "ACTIVE" || name == "OPTIONS" || name == "." || name == "..")
+                continue;
             const std::string path = dir_ + "/" + name;
             struct stat st;
             if (lstat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && file_has_magic(path)) ::unlink(path.c_str());

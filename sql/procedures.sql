@@ -1,81 +1,123 @@
 -- vvector stored procedures (PL/vSQL). Installed by sql/install.sql.
 --
---   vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin)
+--   vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin [, index_type])
+--   vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
+--                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
+--                             freshness_default, ef_search_default, threads_default)
 --   vvector.refresh_index(index_name)
 --   vvector.load_all(index_name)
 --   vvector.status(index_name)
+--   vvector.sizing(vectors, dims, index_type, quantization)
 --   vvector.schedule_refresh(index_name, cron_expr)
 --   vvector.unregister_index(index_name)
 --
 -- Identifiers given by the caller are checked against a strict pattern before
--- they are put into dynamic SQL. Local variables never have the name of a
--- manifest column (PL/vSQL reports an ambiguous column otherwise).
+-- they are put into dynamic SQL. Local variables and arguments never have the
+-- name of a manifest column (PL/vSQL reports an ambiguous column otherwise).
+-- Names are compared with LOWER(a) = LOWER(b), never with ILIKE, where '_' is a wildcard.
+-- An IF whose condition is NULL is an error in PL/vSQL (not false): conditions on arguments that may
+-- be NULL use COALESCE or IS NOT NULL.
 
 -- The vector column reaches the functions as ARRAY[FLOAT]. A FLOAT array is used as it is: a cast
 -- to ARRAY[FLOAT] would give it the default bound of 65000 bytes. INT and NUMERIC arrays are cast.
 
--- Builds <source schema>.<index_name>_delta from the manifest row.
--- The view returns the journal rows that may be newer than the active snapshot,
--- plus one sentinel row, so its result is never empty. The boundary is a
--- literal, so Vertica can prune partitions and storage containers.
-CREATE OR REPLACE PROCEDURE vvector.make_delta_view(nm VARCHAR) LANGUAGE PLvSQL AS $$
+-- The views of an index, in the schema of its source table:
+--   <index>_snap   one sentinel row that carries the active snapshot id: the input of a search that
+--                  reads the snapshot only (the fastest statement that keeps the stale-cache check)
+--   <index>_delta  (only with a version column) the journal rows that may be newer than the active
+--                  snapshot, plus the sentinel row, so its result is never empty. The boundary is a
+--                  literal, so Vertica can prune partitions and storage containers.
+CREATE OR REPLACE PROCEDURE vvector.make_views(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128);
     op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
-    sid INT; v_from VARCHAR(64);
-    del_expr VARCHAR(400); ver_expr VARCHAR(400);
-    view_name VARCHAR(400); stmt VARCHAR(8000); sid_text VARCHAR(32);
+    sid INT; v_from VARCHAR(64); sch VARCHAR(128); tbl VARCHAR(128);
+    del_expr VARCHAR(400); ver_expr VARCHAR(400); sentinel VARCHAR(1000);
+    stmt VARCHAR(8000); sid_text VARCHAR(32);
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
-        RAISE EXCEPTION 'vvector.make_delta_view: index % is not registered', nm;
+        RAISE EXCEPTION 'vvector.make_views: index % is not registered', nm;
     END IF;
+    sch := SPLIT_PART(tab, '.', 1);
+    tbl := SPLIT_PART(tab, '.', 2);
     idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
     vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
     op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
     ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
     sid := (SELECT active_snapshot FROM vvector.manifest WHERE index_name = nm);
     v_from := (SELECT m.delta_from FROM vvector.manifest m WHERE m.index_name = nm);
-    view_name := SPLIT_PART(tab, '.', 1) || '.' || nm || '_delta';
     sid_text := COALESCE(sid::VARCHAR, 'NULL::INT');
+    sentinel := 'SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, '
+             || 'NULL::BOOLEAN AS del, NULL::INT AS ver, ' || sid_text || ' AS snapshot_id';
 
-    stmt := 'CREATE OR REPLACE VIEW ' || view_name || ' AS ';
-    IF ver IS NOT NULL AND v_from IS NOT NULL THEN
-        op_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                    AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE op);
-        ver_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                     AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE ver);
-        vc_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                    AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE vc);
+    EXECUTE 'CREATE OR REPLACE VIEW ' || sch || '.' || nm || '_snap AS ' || sentinel;
+    IF ver IS NULL THEN
+        RETURN;
+    END IF;
+
+    stmt := 'CREATE OR REPLACE VIEW ' || sch || '.' || nm || '_delta AS ';
+    IF v_from IS NOT NULL THEN
+        op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
+        ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                     AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
+        vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vc));
         del_expr := CASE WHEN op IS NULL THEN 'FALSE'
                          WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)'
                          ELSE '(COALESCE(' || op || ', 1) < 0)' END;
         ver_expr := CASE WHEN ver_type ILIKE 'int%' THEN ver || '::INT'
                          ELSE '(EXTRACT(EPOCH FROM ' || ver || ') * 1000000)::INT' END;
         stmt := stmt || 'SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, ' || idc || '::INT AS id, '
-             || CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END || ' AS vec, ' || del_expr || ' AS del, ' || ver_expr || ' AS ver, '
-             || sid_text || ' AS snapshot_id FROM ' || tab || ' WHERE ' || ver || ' > ' || v_from || ' UNION ALL ';
+             || CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END || ' AS vec, ' || del_expr || ' AS del, '
+             || ver_expr || ' AS ver, ' || sid_text || ' AS snapshot_id FROM ' || tab || ' WHERE ' || ver || ' > ' || v_from
+             || ' UNION ALL ';
     END IF;
-    stmt := stmt || 'SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, '
-         || 'NULL::BOOLEAN AS del, NULL::INT AS ver, ' || sid_text || ' AS snapshot_id';
-    EXECUTE stmt;
+    EXECUTE stmt || sentinel;
 END;
 $$;
 
--- vec_col: ARRAY[FLOAT] (recommended), ARRAY[INT] or ARRAY[NUMERIC]; every vector of the index has the same length.
--- op_col:  BOOLEAN (true = vector deleted) or INT (+1 added, -1 deleted), or NULL when rows are only added.
--- ver_col: TIMESTAMP, TIMESTAMPTZ or INT column that orders the journal (last row per id wins).
---          NULL = static index: queries see the snapshot only, changes show up at the next refresh.
--- metric:  l2, cosine or dot: the measure the index is built and searched for.
--- margin:  overlap of the delta. Timestamp ver_col: seconds (NULL = 60). Open transactions are found
---          through their locks, so it only covers clock differences and statement-start versions.
---          INT ver_col: units of that column; there it must also cover the longest write transaction.
-CREATE OR REPLACE PROCEDURE vvector.register_index(nm VARCHAR, src_table VARCHAR, id_column VARCHAR, vec_column VARCHAR,
-                                                   op_column VARCHAR, ver_column VARCHAR, measure VARCHAR, margin INT)
+-- Writes the query defaults of the manifest (precision, freshness, ef_search, threads) into the
+-- cache of every node, where vsearch reads them, and checks that every node wrote them.
+CREATE OR REPLACE PROCEDURE vvector.push_options(nm VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    opts VARCHAR(400); want INT; got INT;
+BEGIN
+    opts := (SELECT MAX('precision=' || COALESCE(precision_default, '') || ',freshness=' || COALESCE(freshness_default, '')
+                        || ',ef_search=' || COALESCE(ef_search_default::VARCHAR, '') || ',threads=' || COALESCE(threads_default::VARCHAR, ''))
+             FROM vvector.manifest WHERE index_name = nm);
+    IF opts IS NULL THEN
+        RAISE EXCEPTION 'vvector.push_options: index % is not registered', nm;
+    END IF;
+    want := (SELECT COUNT(*) FROM (SELECT vvector.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vconfig(k USING PARAMETERS index_name='
+        || QUOTE_LITERAL(nm) || ', options=' || QUOTE_LITERAL(opts) || ') OVER(PARTITION NODES) FROM vvector.probe) c WHERE status = ''written''';
+    IF got IS NULL OR got < want THEN
+        RAISE EXCEPTION 'vvector.push_options: index %: options written on % of % nodes', nm, COALESCE(got, 0), want;
+    END IF;
+END;
+$$;
+
+-- vec_col:    ARRAY[FLOAT] (recommended), ARRAY[INT] or ARRAY[NUMERIC]; every vector of the index has the same length.
+-- op_col:     BOOLEAN (true = vector deleted) or INT (+1 added, -1 deleted), or NULL when rows are only added.
+-- ver_col:    TIMESTAMPTZ (recommended), TIMESTAMP or INT column that orders the journal (last row per id wins).
+--             NULL = static index: queries see the snapshot only, changes show up at the next refresh.
+-- metric:     l2, cosine, dot or l1: the measure the index is built and searched for.
+-- margin:     overlap of the delta. Timestamp ver_col: seconds (NULL = 60). Open transactions are found
+--             through their locks, so it only covers clock differences and statement-start versions.
+--             INT ver_col: units of that column; there it must also cover the longest write transaction.
+-- index_type: flat (the default until milestone M2) or hnsw (milestone M2).
+-- register_index_core does the work; the two forms of register_index call it and print the result
+-- themselves, because NOTICEs of a nested CALL do not reach the caller.
+CREATE OR REPLACE PROCEDURE vvector.register_index_core(nm VARCHAR, src_table VARCHAR, id_column VARCHAR, vec_column VARCHAR,
+                                                        op_column VARCHAR, ver_column VARCHAR, measure VARCHAR, margin INT,
+                                                        kind VARCHAR)
 LANGUAGE PLvSQL AS $$
 DECLARE
     ident VARCHAR(64) := '^[A-Za-z_][A-Za-z0-9_]*$';
-    n INT; ver_type VARCHAR(128); op_type VARCHAR(128); vc_type VARCHAR(128); m INT;
+    sch VARCHAR(128); tbl VARCHAR(128);
+    ver_type VARCHAR(128); op_type VARCHAR(128); vc_type VARCHAR(128); id_type VARCHAR(128); m INT;
 BEGIN
     IF nm IS NULL OR NOT REGEXP_LIKE(nm, '^[A-Za-z0-9_]{1,64}$') THEN
         RAISE EXCEPTION 'vvector.register_index: index name must be 1 to 64 letters, digits or underscores';
@@ -87,21 +129,46 @@ BEGIN
        OR NOT REGEXP_LIKE(COALESCE(op_column, 'x'), ident) OR NOT REGEXP_LIKE(COALESCE(ver_column, 'x'), ident) THEN
         RAISE EXCEPTION 'vvector.register_index: column names must be plain identifiers';
     END IF;
-    IF measure IS NULL OR measure NOT IN ('l2', 'cosine', 'dot') THEN
-        RAISE EXCEPTION 'vvector.register_index: metric must be l2, cosine or dot';
+    IF measure IS NULL OR measure NOT IN ('l2', 'cosine', 'dot', 'l1') THEN
+        RAISE EXCEPTION 'vvector.register_index: metric must be l2, cosine, dot or l1';
     END IF;
-    n := (SELECT COUNT(*) FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(src_table, '.', 1)
-          AND table_name ILIKE SPLIT_PART(src_table, '.', 2)
-          AND (column_name ILIKE id_column OR column_name ILIKE vec_column OR column_name ILIKE op_column
-               OR column_name ILIKE ver_column));
-    IF n <> 2 + (op_column IS NOT NULL)::INT + (ver_column IS NOT NULL)::INT THEN
-        RAISE EXCEPTION 'vvector.register_index: table % or one of the given columns does not exist', src_table;
+    IF kind IS NULL OR kind NOT IN ('flat', 'hnsw') THEN
+        RAISE EXCEPTION 'vvector.register_index: index_type must be flat or hnsw';
+    END IF;
+    IF kind = 'hnsw' THEN
+        RAISE EXCEPTION 'vvector.register_index: index_type hnsw is not implemented yet (milestone M2): use flat';
+    END IF;
+    sch := SPLIT_PART(src_table, '.', 1);
+    tbl := SPLIT_PART(src_table, '.', 2);
+    IF (SELECT COUNT(*) FROM v_catalog.tables WHERE LOWER(table_schema) = LOWER(sch) AND LOWER(table_name) = LOWER(tbl)) = 0 THEN
+        RAISE EXCEPTION 'vvector.register_index: table % does not exist', src_table;
+    END IF;
+    id_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(id_column));
+    vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vec_column));
+    op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op_column));
+    ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                 AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver_column));
+    IF id_type IS NULL THEN
+        RAISE EXCEPTION 'vvector.register_index: column % does not exist in %', id_column, src_table;
+    END IF;
+    IF vc_type IS NULL THEN
+        RAISE EXCEPTION 'vvector.register_index: column % does not exist in %', vec_column, src_table;
+    END IF;
+    IF op_column IS NOT NULL AND op_type IS NULL THEN
+        RAISE EXCEPTION 'vvector.register_index: column % does not exist in %', op_column, src_table;
+    END IF;
+    IF ver_column IS NOT NULL AND ver_type IS NULL THEN
+        RAISE EXCEPTION 'vvector.register_index: column % does not exist in %', ver_column, src_table;
+    END IF;
+    IF NOT id_type ILIKE 'int%' THEN
+        RAISE EXCEPTION 'vvector.register_index: id_col % must be INT, not %', id_column, id_type;
     END IF;
     IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
         RAISE EXCEPTION 'vvector.register_index: index % is already registered', nm;
     END IF;
-    vc_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(src_table, '.', 1)
-                AND table_name ILIKE SPLIT_PART(src_table, '.', 2) AND column_name ILIKE vec_column);
     IF NOT (vc_type ILIKE 'array[float8%' OR vc_type ILIKE 'array[int8%' OR vc_type ILIKE 'array[numeric%') THEN
         RAISE EXCEPTION 'vvector.register_index: vec_col % must be ARRAY[FLOAT], ARRAY[INT] or ARRAY[NUMERIC], not %', vec_column, vc_type;
     END IF;
@@ -110,8 +177,6 @@ BEGIN
     END IF;
     m := NULL;
     IF ver_column IS NOT NULL THEN
-        ver_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(src_table, '.', 1)
-                     AND table_name ILIKE SPLIT_PART(src_table, '.', 2) AND column_name ILIKE ver_column);
         IF ver_type ILIKE 'timestamp%' THEN
             m := COALESCE(margin, 60) * 1000000;
         ELSIF ver_type ILIKE 'int%' THEN
@@ -120,26 +185,131 @@ BEGIN
             END IF;
             m := margin;
         ELSE
-            RAISE EXCEPTION 'vvector.register_index: ver_col % must be TIMESTAMP, TIMESTAMPTZ or INT, not %', ver_column, ver_type;
+            RAISE EXCEPTION 'vvector.register_index: ver_col % must be TIMESTAMPTZ, TIMESTAMP or INT, not %', ver_column, ver_type;
         END IF;
         IF m < 0 THEN
             RAISE EXCEPTION 'vvector.register_index: margin must not be negative';
         END IF;
     END IF;
-    IF op_column IS NOT NULL THEN
-        op_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(src_table, '.', 1)
-                    AND table_name ILIKE SPLIT_PART(src_table, '.', 2) AND column_name ILIKE op_column);
-        IF NOT (op_type ILIKE 'bool%' OR op_type ILIKE 'int%') THEN
-            RAISE EXCEPTION 'vvector.register_index: op_col % must be BOOLEAN or INT, not %', op_column, op_type;
-        END IF;
+    IF op_column IS NOT NULL AND NOT (op_type ILIKE 'bool%' OR op_type ILIKE 'int%') THEN
+        RAISE EXCEPTION 'vvector.register_index: op_col % must be BOOLEAN or INT, not %', op_column, op_type;
     END IF;
 
     PERFORM INSERT INTO vvector.manifest (index_name, source_table, id_col, vec_col, op_col, ver_col, ver_margin, metric, index_type)
-            VALUES (nm, src_table, id_column, vec_column, op_column, ver_column, m, measure, 'flat');
+            VALUES (nm, src_table, id_column, vec_column, op_column, ver_column, m, measure, kind);
     PERFORM COMMIT;
-    PERFORM CALL vvector.make_delta_view(nm);
-    RAISE NOTICE 'vvector: index % registered. Next: CALL vvector.refresh_index(''%''). Queries read %.%_delta; grant SELECT on it to the users who may search the index.',
-                 nm, nm, SPLIT_PART(src_table, '.', 1), nm;
+    PERFORM CALL vvector.make_views(nm);
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.register_index(nm VARCHAR, src_table VARCHAR, id_column VARCHAR, vec_column VARCHAR,
+                                                   op_column VARCHAR, ver_column VARCHAR, measure VARCHAR, margin INT,
+                                                   kind VARCHAR)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.register_index_core(nm, src_table, id_column, vec_column, op_column, ver_column, measure, margin, kind);
+    IF ver_column IS NULL THEN
+        RAISE NOTICE 'vvector: index % registered (static: no version column). Next: CALL vvector.refresh_index(''%''). Queries read %_snap in schema %; grant SELECT on it to the users who may search the index.',
+                     nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+    ELSE
+        RAISE NOTICE 'vvector: index % registered. Next: CALL vvector.refresh_index(''%''). Queries read %_snap (snapshot only) or %_delta (with the changes since the refresh) in schema %; grant SELECT on them to the users who may search the index.',
+                     nm, nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.register_index(nm VARCHAR, src_table VARCHAR, id_column VARCHAR, vec_column VARCHAR,
+                                                   op_column VARCHAR, ver_column VARCHAR, measure VARCHAR, margin INT)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.register_index_core(nm, src_table, id_column, vec_column, op_column, ver_column, measure, margin, 'flat');
+    IF ver_column IS NULL THEN
+        RAISE NOTICE 'vvector: index % registered (static: no version column). Next: CALL vvector.refresh_index(''%''). Queries read %_snap in schema %; grant SELECT on it to the users who may search the index.',
+                     nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+    ELSE
+        RAISE NOTICE 'vvector: index % registered. Next: CALL vvector.refresh_index(''%''). Queries read %_snap (snapshot only) or %_delta (with the changes since the refresh) in schema %; grant SELECT on them to the users who may search the index.',
+                     nm, nm, nm, nm, SPLIT_PART(src_table, '.', 1);
+    END IF;
+END;
+$$;
+
+-- Changes the options of an index. NULL keeps a value. Build options (x_type, x_m, x_efc, x_quant) take
+-- effect at the next refresh; query defaults (x_prec, x_fresh, x_ef, x_thr) at once, on every node.
+-- 'default' (text) or 0 (numbers) sets a query default back to the built-in default.
+CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) = 0 THEN
+        RAISE EXCEPTION 'vvector.set_index_options: index % is not registered', nm;
+    END IF;
+    IF x_type IS NOT NULL AND x_type NOT IN ('flat', 'hnsw') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: index_type must be flat or hnsw';
+    END IF;
+    IF COALESCE(x_type, '') = 'hnsw' THEN
+        RAISE EXCEPTION 'vvector.set_index_options: index_type hnsw is not implemented yet (milestone M2)';
+    END IF;
+    IF x_m IS NOT NULL AND (x_m < 2 OR x_m > 256) THEN
+        RAISE EXCEPTION 'vvector.set_index_options: m must be 2 to 256';
+    END IF;
+    IF x_efc IS NOT NULL AND (x_efc < 1 OR x_efc > 100000) THEN
+        RAISE EXCEPTION 'vvector.set_index_options: ef_construction must be 1 to 100000';
+    END IF;
+    IF x_quant IS NOT NULL AND x_quant NOT IN ('none', 'sq8') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: quantization must be none or sq8';
+    END IF;
+    IF COALESCE(x_quant, '') = 'sq8' THEN
+        RAISE EXCEPTION 'vvector.set_index_options: quantization sq8 is not implemented yet (milestone M4)';
+    END IF;
+    IF x_refresh IS NOT NULL AND x_refresh NOT IN ('auto', 'incremental', 'full') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: refresh_mode must be auto, incremental or full';
+    END IF;
+    IF COALESCE(x_refresh, '') = 'incremental' THEN
+        RAISE EXCEPTION 'vvector.set_index_options: refresh_mode incremental is not implemented yet (milestone M3); auto and full rebuild the snapshot';
+    END IF;
+    IF x_ratio IS NOT NULL AND NOT (x_ratio > 0 AND x_ratio <= 1) THEN
+        RAISE EXCEPTION 'vvector.set_index_options: tombstone_ratio must be above 0 and at most 1';
+    END IF;
+    IF x_rebuild IS NOT NULL AND x_rebuild < 0 THEN
+        RAISE EXCEPTION 'vvector.set_index_options: rebuild_every must be 0 (never) or more';
+    END IF;
+    IF x_memory IS NOT NULL AND x_memory NOT IN ('ram', 'compact') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: memory_mode must be ram or compact';
+    END IF;
+    IF COALESCE(x_memory, '') = 'compact' THEN
+        RAISE EXCEPTION 'vvector.set_index_options: memory_mode compact needs quantization sq8 (milestone M4)';
+    END IF;
+    IF x_prec IS NOT NULL AND x_prec NOT IN ('fast', 'balanced', 'best', 'exact', 'default') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: precision_default must be fast, balanced, best, exact or default';
+    END IF;
+    IF x_fresh IS NOT NULL AND x_fresh NOT IN ('snapshot', 'exact', 'default') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: freshness_default must be snapshot, exact or default';
+    END IF;
+    IF x_ef IS NOT NULL AND (x_ef < 0 OR x_ef > 100000) THEN
+        RAISE EXCEPTION 'vvector.set_index_options: ef_search_default must be 0 (built-in) to 100000';
+    END IF;
+    IF x_thr IS NOT NULL AND (x_thr < 0 OR x_thr > 64) THEN
+        RAISE EXCEPTION 'vvector.set_index_options: threads_default must be 0 (one per core) to 64';
+    END IF;
+
+    PERFORM UPDATE vvector.manifest SET
+        index_type = COALESCE(x_type, index_type),
+        hnsw_m = COALESCE(x_m, hnsw_m),
+        hnsw_ef_construction = COALESCE(x_efc, hnsw_ef_construction),
+        quantization = COALESCE(x_quant, quantization),
+        refresh_mode = COALESCE(x_refresh, refresh_mode),
+        tombstone_ratio = COALESCE(x_ratio, tombstone_ratio),
+        rebuild_every = CASE WHEN x_rebuild IS NULL THEN rebuild_every WHEN x_rebuild = 0 THEN NULL ELSE x_rebuild END,
+        memory_mode = COALESCE(x_memory, memory_mode),
+        precision_default = CASE WHEN x_prec IS NULL THEN precision_default WHEN x_prec = 'default' THEN NULL ELSE x_prec END,
+        freshness_default = CASE WHEN x_fresh IS NULL THEN freshness_default WHEN x_fresh = 'default' THEN NULL ELSE x_fresh END,
+        ef_search_default = CASE WHEN x_ef IS NULL THEN ef_search_default WHEN x_ef = 0 THEN NULL ELSE x_ef END,
+        threads_default = CASE WHEN x_thr IS NULL THEN threads_default WHEN x_thr = 0 THEN NULL ELSE x_thr END
+        WHERE index_name = nm;
+    PERFORM COMMIT;
+    PERFORM CALL vvector.push_options(nm);
+    RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
@@ -156,11 +326,10 @@ BEGIN
     IF got IS NULL OR got < want THEN
         RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes', nm, sid, COALESCE(got, 0), want;
     END IF;
-    RAISE NOTICE 'vvector: index %, snapshot % loaded on % nodes', nm, sid, got;
 END;
 $$;
 
--- Cache repair: loads the active snapshot again on every node. Safe at any time.
+-- Cache repair: loads the active snapshot and the index defaults again on every node. Safe at any time.
 CREATE OR REPLACE PROCEDURE vvector.load_all(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     sid INT;
@@ -170,23 +339,81 @@ BEGIN
         RAISE EXCEPTION 'vvector.load_all: index % is not registered or has no snapshot yet: run vvector.refresh_index', nm;
     END IF;
     PERFORM CALL vvector.load_on_nodes(nm, sid);
+    PERFORM CALL vvector.push_options(nm);
     RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes', nm, sid;
 END;
 $$;
 
--- How many journal rows a query has to apply now, and how long it takes to read them.
+-- Memory estimate for an index before its table is loaded. Prints one line per figure; changes nothing.
+-- index_type flat or hnsw, quantization none or sq8 (hnsw and sq8 are estimates for milestones M2 and M4).
+CREATE OR REPLACE PROCEDURE vvector.sizing(n_vectors INT, n_dims INT, kind VARCHAR, quant VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    stride INT; vec_mb FLOAT; ids_mb FLOAT; graph_mb FLOAT; sq8_mb FLOAT; total_mb FLOAT; build_mb FLOAT; mem_gb FLOAT;
+BEGIN
+    IF n_vectors IS NULL OR n_vectors < 1 OR n_vectors > 4294967295 THEN
+        RAISE EXCEPTION 'vvector.sizing: vectors must be 1 to 4294967295';
+    END IF;
+    IF n_dims IS NULL OR n_dims < 1 OR n_dims > 32768 THEN
+        RAISE EXCEPTION 'vvector.sizing: dims must be 1 to 32768';
+    END IF;
+    IF COALESCE(kind, 'flat') NOT IN ('flat', 'hnsw') OR COALESCE(quant, 'none') NOT IN ('none', 'sq8') THEN
+        RAISE EXCEPTION 'vvector.sizing: index_type must be flat or hnsw, quantization none or sq8';
+    END IF;
+    stride := (n_dims + 15) // 16 * 16;
+    vec_mb := n_vectors * stride * 4 / 1048576.0;
+    ids_mb := n_vectors * 8 / 1048576.0;
+    -- HNSW with m = 16: layer 0 holds 2m + 1 uint32 per vector, the upper layers about 1/(m - 1) of that.
+    graph_mb := CASE WHEN kind = 'hnsw' THEN n_vectors * (33 * 4 + 5 + 17 * 4 / 15.0) / 1048576.0 ELSE 0 END;
+    sq8_mb := CASE WHEN quant = 'sq8' THEN n_vectors * (stride + 8) / 1048576.0 ELSE 0 END;
+    total_mb := vec_mb + ids_mb + graph_mb + sq8_mb;
+    build_mb := total_mb + n_vectors * 4 / 1048576.0;
+    mem_gb := (SELECT MIN(total_memory_bytes) FROM v_monitor.host_resources) / 1073741824.0;
+    RAISE NOTICE 'vvector.sizing: % vectors of % dimensions (% floats per row): vectors % MB, ids % MB, graph % MB, sq8 codes % MB',
+                 n_vectors, n_dims, stride, vec_mb::NUMERIC(18,1), ids_mb::NUMERIC(18,1), graph_mb::NUMERIC(18,1), sq8_mb::NUMERIC(18,1);
+    RAISE NOTICE 'vvector.sizing: snapshot and cache file % MB per node; build memory about % MB on the refreshing node (fenced: counts against FencedUDxMemoryLimitMB)',
+                 total_mb::NUMERIC(18,1), build_mb::NUMERIC(18,1);
+    RAISE NOTICE 'vvector.sizing: queries read the cache file through the page cache: keep it in memory. Smallest node here: % GB of memory',
+                 mem_gb::NUMERIC(18,1);
+    IF total_mb / 1024.0 > 0.5 * mem_gb THEN
+        RAISE WARNING 'vvector.sizing: the index needs more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact (milestone M4) or larger nodes.';
+    END IF;
+END;
+$$;
+
+-- How many journal rows a query has to apply now and how long it takes to read them, open writers,
+-- versions in the future, and the sizing check (index bytes against node memory, build memory against
+-- FencedUDxMemoryLimitMB and free memory, threads against cores, all indexes against the page cache).
+-- It recommends; it never changes anything.
 CREATE OR REPLACE PROCEDURE vvector.status(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    tab VARCHAR(256); ver VARCHAR(128); n INT; t0 TIMESTAMPTZ; ms INT;
+    tab VARCHAR(256); ver VARCHAR(128); n INT; t0 TIMESTAMPTZ; ms INT; sch VARCHAR(128); tbl VARCHAR(128);
+    bytes INT; all_bytes INT; vectors INT; mem INT; free_mem INT; cores INT; fenced_mb INT; thr INT; build INT;
+    rmode VARCHAR(16); tomb INT; kind VARCHAR(16); ver_type VARCHAR(128);
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.status: index % is not registered', nm;
     END IF;
-    t0 := (SELECT CLOCK_TIMESTAMP());
-    n := EXECUTE 'SELECT COUNT(id) FROM (SELECT id, vec, del, ver FROM ' || SPLIT_PART(tab, '.', 1) || '.' || nm || '_delta) d';
-    ms := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()));
-    RAISE NOTICE 'vvector: index %: % journal rows in the delta, read in % ms', nm, n, ms;
+    sch := SPLIT_PART(tab, '.', 1);
+    tbl := SPLIT_PART(tab, '.', 2);
+    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
+    kind := (SELECT MAX(index_type) FROM vvector.manifest WHERE index_name = nm);
+    rmode := (SELECT MAX(refresh_mode) FROM vvector.manifest WHERE index_name = nm);
+    tomb := (SELECT MAX(tombstones) FROM vvector.manifest WHERE index_name = nm);
+    RAISE NOTICE 'vvector: index %: % index, refresh_mode %, % tombstones', nm, kind, COALESCE(rmode, 'auto'), COALESCE(tomb, 0);
+    n := 0;
+    IF ver IS NOT NULL THEN
+        t0 := (SELECT CLOCK_TIMESTAMP());
+        n := EXECUTE 'SELECT COUNT(id) FROM (SELECT id, vec, del, ver FROM ' || sch || '.' || nm || '_delta) d';
+        ms := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()));
+        RAISE NOTICE 'vvector: index %: % journal rows in the delta, read in % ms', nm, n, ms;
+        IF ms > 500 THEN
+            RAISE WARNING 'vvector: index %: reading the delta is slow (% ms) and every exact query pays for it. Usual cause: the journal is not partitioned by the date of its version column, so new rows were merged into old storage. Fix: partition the journal by the version date, or refresh more often.', nm, ms;
+        END IF;
+        IF n > 100000 THEN
+            RAISE WARNING 'vvector: index %: the delta holds % rows. Every exact query searches them: refresh more often.', nm, n;
+        END IF;
+    END IF;
     n := (SELECT COUNT(DISTINCT transaction_id) FROM v_monitor.locks WHERE LOWER(object_name) = LOWER('Table:' || tab)
           AND (lock_mode ILIKE '%I%' OR lock_mode = 'X'));
     IF n > 0 THEN
@@ -194,48 +421,79 @@ BEGIN
                WHERE LOWER(object_name) = LOWER('Table:' || tab) AND (lock_mode ILIKE '%I%' OR lock_mode = 'X'));
         RAISE NOTICE 'vvector: index %: % open transactions are writing to %, the oldest for % seconds. A refresh now keeps their rows in the delta.', nm, n, tab, ms;
     END IF;
-    IF ms > 500 THEN
-        RAISE WARNING 'vvector: index %: reading the delta is slow (% ms) and every query pays for it. Usual cause: the journal is not partitioned by the date of its version column, so new rows were merged into old storage. Fix: partition the journal by the version date, or refresh more often.', nm, ms;
-    END IF;
-    IF n > 100000 THEN
-        RAISE WARNING 'vvector: index %: the delta holds % rows. Refresh more often.', nm, n;
-    END IF;
     -- A version that lies in the future was not set by the database clock: some writer fills the
     -- version column itself. (A version set too far in the past cannot be recognised afterwards.)
-    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
-    IF ver IS NOT NULL AND (SELECT data_type ILIKE 'timestamp%' FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                            AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE ver) THEN
+    ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                 AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
+    IF ver IS NOT NULL AND ver_type ILIKE 'timestamp%' THEN
         n := EXECUTE 'SELECT COUNT(*) FROM ' || tab || ' WHERE ' || ver || ' > CLOCK_TIMESTAMP() + INTERVAL ''5 minutes''';
         IF n > 0 THEN
             RAISE WARNING 'vvector: index %: % rows of % have a version in the future. The version column must be filled by its default (CLOCK_TIMESTAMP), never by the application; results can be wrong.', nm, n, tab;
         END IF;
     END IF;
+
+    -- Sizing check.
+    bytes := (SELECT MAX(index_bytes) FROM vvector.manifest WHERE index_name = nm);
+    vectors := (SELECT MAX(vector_count) FROM vvector.manifest WHERE index_name = nm);
+    IF bytes IS NULL THEN
+        RAISE NOTICE 'vvector: index %: no snapshot yet, no sizing check. For an estimate: CALL vvector.sizing(vectors, dims, index_type, quantization)', nm;
+        RETURN;
+    END IF;
+    all_bytes := (SELECT SUM(index_bytes) FROM vvector.manifest);
+    mem := (SELECT MIN(total_memory_bytes) FROM v_monitor.host_resources);
+    free_mem := (SELECT MIN(total_memory_free_bytes + total_memory_cache_bytes) FROM v_monitor.host_resources);
+    cores := (SELECT MIN(processor_core_count) FROM v_monitor.host_resources);
+    fenced_mb := (SELECT MAX(current_value::INT) FROM v_monitor.configuration_parameters WHERE parameter_name = 'FencedUDxMemoryLimitMB');
+    thr := (SELECT MAX(threads_default) FROM vvector.manifest WHERE index_name = nm);
+    build := bytes + 4 * vectors;
+    RAISE NOTICE 'vvector: index %: sizing: index % MB, all indexes % MB, build about % MB, smallest node % MB of memory (% MB free or cache), % cores',
+                 nm, bytes // 1048576, all_bytes // 1048576, build // 1048576, mem // 1048576, free_mem // 1048576, cores;
+    IF bytes > mem // 2 THEN
+        RAISE WARNING 'vvector: index %: the index takes more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact (milestone M4) or larger nodes.', nm;
+    ELSIF all_bytes > mem * 7 // 10 THEN
+        RAISE WARNING 'vvector: index %: all indexes together take % MB, more than 70%% of the memory of the smallest node: they will not stay in the page cache. Use quantization sq8 (milestone M4), fewer indexes, or larger nodes.', nm, all_bytes // 1048576;
+    END IF;
+    IF fenced_mb > 0 AND build > fenced_mb * 1048576 THEN
+        RAISE WARNING 'vvector: index %: a refresh needs about % MB in the fenced process, FencedUDxMemoryLimitMB is %: raise FencedUDxMemoryLimitMB (vbuild runs fenced with FENCED=yes and FENCED=mixed).', nm, build // 1048576, fenced_mb;
+    END IF;
+    IF build > free_mem THEN
+        RAISE WARNING 'vvector: index %: a refresh needs about % MB, the node has % MB free or in the page cache. Refresh when the node is quiet, or use larger nodes.', nm, build // 1048576, free_mem // 1048576;
+    END IF;
+    IF thr IS NOT NULL AND thr > cores THEN
+        RAISE WARNING 'vvector: index %: threads_default % is more than the % cores of the smallest node: set it to 0 (one per core) or lower.', nm, thr, cores;
+    END IF;
 END;
 $$;
 
--- boundary -> build -> insert chunks -> vload on all nodes -> update manifest and delta view -> delete older snapshots.
+-- boundary -> build -> insert chunks -> vload on all nodes -> update manifest and views -> delete older snapshots.
 CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128);
-    measure VARCHAR(16); kind VARCHAR(16); margin INT; op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
+    tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128); sch VARCHAR(128); tbl VARCHAR(128);
+    measure VARCHAR(16); kind VARCHAR(16); quant VARCHAR(16); hm INT; hefc INT; margin INT;
+    op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
     prev INT; sid INT; chunks INT; max_ver INT; v_from VARCHAR(64);
     source VARCHAR(4000); del_expr VARCHAR(400); v_expr VARCHAR(400);
-    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT;
+    t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT;
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
     END IF;
+    sch := SPLIT_PART(tab, '.', 1);
+    tbl := SPLIT_PART(tab, '.', 2);
     idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
     vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
     op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
     ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
     measure := (SELECT m.metric FROM vvector.manifest m WHERE m.index_name = nm);
     kind := (SELECT m.index_type FROM vvector.manifest m WHERE m.index_name = nm);
+    quant := (SELECT COALESCE(m.quantization, 'none') FROM vvector.manifest m WHERE m.index_name = nm);
+    hm := (SELECT COALESCE(m.hnsw_m, 16) FROM vvector.manifest m WHERE m.index_name = nm);
+    hefc := (SELECT COALESCE(m.hnsw_ef_construction, 200) FROM vvector.manifest m WHERE m.index_name = nm);
     margin := (SELECT ver_margin FROM vvector.manifest WHERE index_name = nm);
     prev := (SELECT active_snapshot FROM vvector.manifest WHERE index_name = nm);
-    vc_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE vc);
+    vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vc));
     v_expr := CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END;
 
     IF prev IS NOT NULL THEN
@@ -256,8 +514,8 @@ BEGIN
     max_ver := 0;
     v_from := NULL;
     IF ver IS NOT NULL THEN
-        ver_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                     AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE ver);
+        ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                     AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
         IF ver_type ILIKE 'int%' THEN
             max_ver := EXECUTE 'SELECT MAX(' || ver || ')::INT FROM ' || tab;
             v_from := (max_ver - margin)::VARCHAR;
@@ -280,6 +538,7 @@ BEGIN
     END IF;
 
     -- 2. Consolidated vectors: the latest row of every id by version, kept if it is not a delete.
+    --    Two rows of one id with the same version: the delete wins.
     --    Without a version column every id must appear once (vbuild refuses a repeated id).
     IF ver IS NULL THEN
         source := 'SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL';
@@ -287,47 +546,53 @@ BEGIN
         IF op IS NULL THEN
             del_expr := 'FALSE';
         ELSE
-            op_type := (SELECT data_type FROM v_catalog.columns WHERE table_schema ILIKE SPLIT_PART(tab, '.', 1)
-                        AND table_name ILIKE SPLIT_PART(tab, '.', 2) AND column_name ILIKE op);
+            op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                        AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
             del_expr := CASE WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)' ELSE '(COALESCE(' || op || ', 1) < 0)' END;
         END IF;
         source := 'SELECT id, vec FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
-               || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC) AS rn FROM ' || tab
+               || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC, ' || del_expr || ' DESC) AS rn FROM ' || tab
                || ' WHERE ' || idc || ' IS NOT NULL) j WHERE rn = 1 AND NOT del';
     END IF;
 
-    -- 3. Build and store the chunks.
+    -- 3. Build and store the chunks. vbuild sorts by id itself: no ORDER BY, no sort of the table.
     --    Snapshot ids come from a sequence: they never repeat, also not after unregister and register,
     --    so a cache file left behind by an older index of the same name is always recognised as stale.
     sid := (SELECT NEXTVAL('vvector.snapshot_seq'));
     EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
-         || ', byte_offset, chunk FROM (SELECT vvector.vbuild(id, vec USING PARAMETERS index_name=' || QUOTE_LITERAL(nm)
-         || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind) || ', max_ver=' || COALESCE(max_ver, 0)
-         || ') OVER(ORDER BY id) FROM (' || source || ') e) b';
+         || ', byte_offset, chunk FROM (SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name=' || QUOTE_LITERAL(nm)
+         || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind) || ', quantization=' || QUOTE_LITERAL(quant)
+         || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || COALESCE(max_ver, 0)
+         || ') OVER() FROM (' || source || ') e) b';
     PERFORM COMMIT;
     chunks := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
     IF chunks = 0 THEN
         RAISE EXCEPTION 'vvector.refresh_index: index %: table % has no vectors, nothing to build', nm, tab;
     END IF;
 
-    -- 4. Load on every node. Until the manifest changes, queries keep using the previous snapshot's view.
+    -- 4. Load on every node, with the index defaults. Until the manifest and the views change, queries
+    --    keep using the previous snapshot's views.
     PERFORM CALL vvector.load_on_nodes(nm, sid);
+    PERFORM CALL vvector.push_options(nm);
 
-    -- 5. Manifest and delta view.
+    -- 5. Manifest and views.
     n_vec := EXECUTE 'SELECT MAX(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
     n_dims := EXECUTE 'SELECT MAX(dims) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+    n_bytes := (SELECT SUM(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
     fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
     secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
     PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
-                   vector_count = n_vec, dims = n_dims, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt
+                   base_snapshot = 0, vector_count = n_vec, dims = n_dims, tombstones = 0, graph_bytes = 0, index_bytes = n_bytes,
+                   built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt
             WHERE index_name = nm;
     PERFORM COMMIT;
-    PERFORM CALL vvector.make_delta_view(nm);
+    PERFORM CALL vvector.make_views(nm);
 
     -- 6. Keep the active and the previous snapshot.
     PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id < COALESCE(prev, sid);
     PERFORM COMMIT;
-    RAISE NOTICE 'vvector: index % refreshed: snapshot %, % vectors of % dimensions, % seconds', nm, sid, n_vec, n_dims, secs;
+    RAISE NOTICE 'vvector: index % refreshed: snapshot %, % vectors of % dimensions, % MB, % seconds',
+                 nm, sid, n_vec, n_dims, n_bytes // 1048576, secs;
 END;
 $$;
 
@@ -349,7 +614,7 @@ BEGIN
 END;
 $$;
 
--- Removes the schedule, the delta view, the snapshots and the manifest row.
+-- Removes the schedule, the views, the snapshots and the manifest row.
 -- Cache files stay on the nodes: no vvector function deletes paths on request. Remove <cache_dir>/<index_name> by hand.
 CREATE OR REPLACE PROCEDURE vvector.unregister_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
@@ -362,6 +627,7 @@ BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS vvector.' || nm || '_refresh_trigger';
     EXECUTE 'DROP SCHEDULE IF EXISTS vvector.' || nm || '_refresh_schedule';
     EXECUTE 'DROP VIEW IF EXISTS ' || SPLIT_PART(tab, '.', 1) || '.' || nm || '_delta';
+    EXECUTE 'DROP VIEW IF EXISTS ' || SPLIT_PART(tab, '.', 1) || '.' || nm || '_snap';
     PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm;
     PERFORM DELETE FROM vvector.manifest WHERE index_name = nm;
     PERFORM COMMIT;
@@ -369,9 +635,17 @@ BEGIN
 END;
 $$;
 
--- install.sql grants all functions of the schema to PUBLIC; on a second install that reached the procedures too.
-REVOKE EXECUTE ON PROCEDURE vvector.make_delta_view(VARCHAR) FROM PUBLIC;
+-- The procedure of milestone M0 that only made the delta view. make_views replaces it.
+DROP PROCEDURE IF EXISTS vvector.make_delta_view(VARCHAR);
+
+-- install.sql grants all functions of the schema to PUBLIC; that reaches the procedures too.
+-- Only sizing (an estimate from its arguments and the node memory) stays open to everyone.
+REVOKE EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM PUBLIC;
@@ -379,9 +653,12 @@ REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) FROM PUBLIC;
 
+GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.status(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.sizing(INT, INT, VARCHAR, VARCHAR) TO PUBLIC;

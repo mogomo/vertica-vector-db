@@ -1,6 +1,8 @@
-// vvector.vversion() OVER(): library version, snapshot format version, build flags.
+// vvector.vversion() OVER(): library version, snapshot format version, build flags and the
+// kernel code the CPU dispatcher picked on this node (x86_64: default, avx2 or avx512f).
 // Thin adapter. The values come from src/engine/version.h.
 #include "Vertica.h"
+#include "../engine/kernels.h"
 #include "../engine/version.h"
 
 #include <cstring>
@@ -16,7 +18,7 @@ class VVersion : public TransformFunction
         try {
             outputWriter.getStringRef(0).copy(vvector::LIBRARY_VERSION);
             outputWriter.setInt(1, vvector::FORMAT_VERSION);
-            outputWriter.getStringRef(2).copy(vvector::BUILD_FLAGS);
+            outputWriter.getStringRef(2).copy(std::string(vvector::BUILD_FLAGS) + " kernels=" + vvector::kernel_target());
             outputWriter.next();
         } catch (std::exception &e) {
             vt_report_error(0, "vversion: %s", e.what());

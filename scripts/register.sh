@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Register a table of vectors as a vector index.
 #
-#   scripts/register.sh --index=NAME --table=SCHEMA.TABLE --id=COL --vec=COL --metric=l2|cosine|dot
+#   scripts/register.sh --index=NAME --table=SCHEMA.TABLE --id=COL --vec=COL --metric=l2|cosine|dot|l1
 #                       [--op=COL] [--ver=COL] [--margin=N] [--echo_only]
 #
 #   --vec     vector column: ARRAY[FLOAT] (recommended), ARRAY[INT] or ARRAY[NUMERIC]

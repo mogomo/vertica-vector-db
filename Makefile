@@ -6,13 +6,13 @@
 #
 #   make                      build build/libvvector.so
 #   make test                 engine unit tests, no Vertica needed
-#   make deploy [FENCED=yes|no]   install the library and functions (default: fenced)
+#   make deploy [FENCED=yes|no|mixed]   install the library and functions (default: fenced)
 #   make undeploy             remove functions and library
 #   make clean
 
 SDK_HOME ?= /opt/vertica/sdk
 CXX      ?= g++
-OPT      ?= -O2
+OPT      ?= -O3
 FENCED   ?= yes
 
 # Same C++ ABI as the Vertica server. Always 1 since Vertica 24.1.
@@ -28,10 +28,13 @@ TEST_SRC   := $(wildcard tests/engine/test_*.cpp)
 TEST_BIN   := $(patsubst tests/engine/%.cpp,$(BUILD_DIR)/tests/%,$(TEST_SRC))
 
 # Reported by vversion().
-BUILD_FLAGS := $(OPT) -std=c++17 $(shell uname -m) $(notdir $(CXX))-$(shell $(CXX) -dumpfullversion 2>/dev/null || $(CXX) -dumpversion)
+BUILD_FLAGS := $(OPT) -ffp-contract=off -std=c++17 $(shell uname -m) $(notdir $(CXX))-$(shell $(CXX) -dumpfullversion 2>/dev/null || $(CXX) -dumpversion)
 
-COMMON_FLAGS := -std=c++17 -g $(OPT) -Wall -pthread -DVVECTOR_BUILD_FLAGS='"$(BUILD_FLAGS)"'
-UDX_FLAGS    := $(COMMON_FLAGS) -I $(SDK_HOME)/include -Wno-unused-value -shared -fPIC \
+# -ffp-contract=off: no fused multiply-add, so every node and every thread count computes
+# bit-identical scores (see src/engine/kernels.h). Never -ffast-math, never -march=native:
+# one .so must run on every node of a cluster.
+COMMON_FLAGS := -std=c++17 -g $(OPT) -ffp-contract=off -Wall -pthread -DVVECTOR_BUILD_FLAGS='"$(BUILD_FLAGS)"'
+UDX_FLAGS    := $(COMMON_FLAGS) -DNDEBUG -fno-plt -I $(SDK_HOME)/include -Wno-unused-value -shared -fPIC \
                 -D_GLIBCXX_USE_CXX11_ABI=$(VERTICA_CXX11_ABI)
 
 .PHONY: all test deploy undeploy clean

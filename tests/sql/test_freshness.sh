@@ -2,9 +2,10 @@
 # Integration test of the freshness model: journal, delta view, register_index,
 # refresh_index, load_all, status, schedule_refresh, unregister_index, and the
 # delta boundary with an open writer (two sessions).
-# vsearch is a stub, so exactness of search results is not tested yet (milestone M1).
-# What is tested: the delta view holds exactly the rows a query must apply, and every
-# refresh builds exactly the live vectors (latest row per id, not deleted).
+# What is tested: the delta view holds exactly the rows a query must apply, every
+# refresh builds exactly the live vectors (latest row per id, not deleted), and
+# vsearch applies the journal with freshness='exact' and ignores it by default.
+# Exactness of the scores against the built-in functions: tests/sql/test_search.sh.
 #
 #   tests/sql/test_freshness.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--echo_only]
 #
@@ -46,6 +47,13 @@ VEC=$(random_vector "$DIMS")
 Q="1, ${VEC}::ARRAY[FLOAT], NULL::INT, NULL::ARRAY[FLOAT], NULL::BOOLEAN, NULL::INT, NULL::INT"
 SEARCH="SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='$IX', k=5) OVER()
 FROM (SELECT * FROM $SCHEMA.${IX}_delta UNION ALL SELECT $Q) q;"
+COUNT5="SELECT 'rows: ' || COUNT(*) FROM (${SEARCH%;}) r;"
+# How many of the ids 6 to 1000 (deleted in the journal below) are among the 2000 nearest.
+deleted_found() {   # FRESHNESS
+    echo "SELECT 'deleted in results: ' || COUNT(*) FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+          USING PARAMETERS index_name='$IX', k=2000, freshness='$1') OVER()
+          FROM (SELECT * FROM $SCHEMA.${IX}_delta UNION ALL SELECT $Q) q) r WHERE id BETWEEN 6 AND 1000;"
+}
 # The live vectors of the journal: the latest row per id, not deleted. Every refresh must build exactly these.
 LIVE="SELECT COUNT(*) AS n FROM (SELECT id, del, ROW_NUMBER() OVER(PARTITION BY id ORDER BY ts DESC) AS rn FROM $SCHEMA.journal) j WHERE rn = 1 AND NOT del"
 built_equals_live() {   # NAME
@@ -75,13 +83,18 @@ expect "register_index" "index $IX registered" "CALL vvector.register_index('$IX
 expect "register_index refuses a second registration" "already registered" "CALL vvector.register_index('$IX', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', NULL);"
 expect "register_index refuses a bad identifier" "plain identifiers" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id; DROP TABLE x', 'vec', NULL, NULL, 'l2', NULL);"
 expect "register_index refuses a column that is not an array" "must be ARRAY\[FLOAT\], ARRAY\[INT\] or ARRAY\[NUMERIC\]" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'ts', NULL, NULL, 'l2', NULL);"
-expect "register_index refuses an unknown metric" "metric must be l2, cosine or dot" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', NULL, NULL, 'manhattan', NULL);"
+expect "register_index refuses an unknown metric" "metric must be l2, cosine, dot or l1" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', NULL, NULL, 'manhattan', NULL);"
+expect "register_index refuses a column that does not exist" "column nope does not exist in $SCHEMA.journal" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'nope', NULL, NULL, 'l2', NULL);"
+expect "register_index says when hnsw comes" "index_type hnsw is not implemented yet (milestone M2)" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw');"
 expect "a query before the first refresh says what to do" "run vload" "$SEARCH"
 expect "refresh_index" "index $IX refreshed: snapshot [0-9]" "CALL vvector.refresh_index('$IX');"
 built_equals_live "the snapshot holds every vector of the journal"
 expect "delta view holds only the sentinel after the refresh" "^rows 1, journal rows 0$" "
 SELECT 'rows ' || COUNT(*) || ', journal rows ' || COUNT(id) FROM $SCHEMA.${IX}_delta;"
-expect "vsearch through the delta view: cache found, not stale" "(1 query rows, 0 journal rows read)" "$SEARCH"
+expect "vsearch through the delta view: k rows" "^rows: 5$" "$COUNT5"
+expect "the _snap view is one row with the active snapshot id" "^snap rows 1, active: t$" "
+SELECT 'snap rows ' || COUNT(*) || ', active: ' || (MAX(s.snapshot_id) = MAX(m.active_snapshot))::VARCHAR
+FROM $SCHEMA.${IX}_snap s CROSS JOIN (SELECT active_snapshot FROM vvector.manifest WHERE index_name = '$IX') m;"
 
 echo "== 1000 journaled adds and 1000 journaled deletes, no refresh"
 expect "journal the changes" "^delta rows: 2000$" "
@@ -90,7 +103,8 @@ INSERT INTO journal (id, vec) SELECT 900000000 + id, $VEC FROM ($(row_numbers 10
 INSERT INTO journal (id, del) SELECT id, TRUE FROM ($(row_numbers 1000)) g;
 COMMIT;
 SELECT 'delta rows: ' || COUNT(id) FROM ${IX}_delta;"
-expect "vsearch reads all of them" "(1 query rows, 2000 journal rows read)" "$SEARCH"
+expect "freshness exact: no deleted id comes back" "^deleted in results: 0$" "$(deleted_found exact)"
+expect "freshness snapshot (the default): the snapshot still has them" "^deleted in results: [1-9]" "$(deleted_found snapshot)"
 expect "a delete and a re-add of one id are both in the delta, the add last" "^delta rows for id 5: 3, last is an add: t$" "
 SET SEARCH_PATH TO $SCHEMA, public;
 INSERT INTO journal (id, del) VALUES (5, TRUE); COMMIT;
@@ -117,6 +131,7 @@ if [ "$ECHO_ONLY" = yes ]; then
 else
     rm -f "$CACHE_DIR/$IX/$SID.vv"
 fi
+wait_cache_check
 expect "a deleted cache file gives a clear error" "run vload" "$SEARCH"
 expect "load_all repairs it" "loaded on all nodes" "CALL vvector.load_all('$IX');"
 expect "vinfo after load_all: every node has the active snapshot" "^nodes with the active snapshot: all$" "
@@ -130,9 +145,10 @@ else
     # An older snapshot file that is still marked active: what a node looks like that missed a vload.
     cp "$CACHE_DIR/$IX/$SID.vv" "$CACHE_DIR/$IX/1.vv"; echo 1 > "$CACHE_DIR/$IX/ACTIVE"
 fi
+wait_cache_check
 expect "a cache that points to an older snapshot is refused as stale" "snapshot cache stale on .*: run vload" "$SEARCH"
 expect "load_all repairs that too" "loaded on all nodes" "CALL vvector.load_all('$IX');"
-expect "vsearch works again after the repairs" "search is not implemented yet" "$SEARCH"
+expect "vsearch works again after the repairs" "^rows: 5$" "$COUNT5"
 
 echo "== schedule and unregister"
 expect "schedule_refresh creates schedule and trigger" "^triggers: 1$" "
@@ -141,7 +157,7 @@ SELECT 'triggers: ' || COUNT(*) FROM v_catalog.stored_proc_triggers WHERE schema
 expect "unregister_index removes trigger, view, snapshots and manifest row" "^left: 0 0 0 0$" "
 CALL vvector.unregister_index('$IX');
 SELECT 'left: ' || (SELECT COUNT(*) FROM v_catalog.stored_proc_triggers WHERE trigger_name ILIKE '${IX}_refresh_trigger') || ' ' ||
-       (SELECT COUNT(*) FROM v_catalog.views WHERE table_name ILIKE '${IX}_delta') || ' ' ||
+       (SELECT COUNT(*) FROM v_catalog.views WHERE LOWER(table_name) IN ('${IX}_delta', '${IX}_snap')) || ' ' ||
        (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = '$IX') || ' ' || (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = '$IX');"
 
 echo "== margin 0: the strictest case"

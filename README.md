@@ -4,11 +4,13 @@ Nearest-neighbour vector search inside Vertica: a C++ UDx library that keeps
 an index of the vectors stored in a Vertica table and answers "the k vectors
 closest to this one" from SQL, like a built-in function.
 
-**Status: early work (milestone M0).** The plumbing works: build a snapshot
-of a vector table, store it in Vertica, load it on every node, keep it fresh.
-The search itself is not written yet: `vsearch` checks its input and the node
-cache and then stops with "not implemented yet". The HNSW index is a stub.
-Do not use this for anything but testing.
+**Status: work in progress (milestone M1, exact search).** Exact k-nearest-
+neighbour search works: build a snapshot of a vector table, store it in
+Vertica, load it on every node, and search it with `vsearch`, optionally with
+the rows written since the last refresh. Results equal the full scan with
+Vertica's built-in functions (tested). The HNSW index is milestone M2; the
+complete manual comes at the end of M1. Do not use this for anything but
+testing.
 
 ## Why
 
@@ -29,15 +31,15 @@ index that lives inside Vertica and is never stale.
 | Piece | State |
 |---|---|
 | `vvector.vversion()` | library version, format version, build flags |
-| `vvector.vbuild(id, vec)` | builds a snapshot (ids and float32 vectors) from the rows of a table |
+| `vvector.vbuild(id, vec, del)` | builds a snapshot (ids and float32 vectors) from the rows of a table |
 | `vvector.vload(...)` | writes the snapshot to a cache file on every node |
 | `vvector.vinfo()` | what every node has cached |
-| `vvector.vsearch(...)` | reads its input and the cache, checks that the cache is current; **no search yet** |
-| `register_index`, `refresh_index`, `load_all`, `status`, `schedule_refresh`, `unregister_index` | stored procedures: register a table, rebuild and load the snapshot, keep a view of the rows written since the last refresh |
-| HNSW | stub: `index_type='hnsw'` says "not implemented yet" |
+| `vvector.vsearch(...)` | exact k nearest neighbours, metrics l2, cosine, dot and l1, one or many queries, optionally applying the rows written since the last refresh |
+| `register_index`, `set_index_options`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` | stored procedures: register a table, set its options, rebuild and load the snapshot, check memory, keep the views `<index>_snap` and `<index>_delta` |
+| HNSW | milestone M2: `index_type='hnsw'` says "not implemented yet" |
 
-Tested on one Vertica 26.2 node (aarch64, Rocky Linux 9, g++ 11.5), fenced
-and unfenced. Multi-node tests follow on a 3-node Eon cluster (milestone M2).
+Tested on one Vertica 26.2 node (aarch64, Rocky Linux 9, g++ 11.5), fenced,
+unfenced and mixed. Multi-node tests follow on a 3-node Eon cluster (milestone M2).
 
 ## Install
 
@@ -48,6 +50,7 @@ with C++17, GNU make):
     make test                 # engine unit tests, no Vertica needed
     make deploy               # fenced mode, the default
     make deploy FENCED=no     # unfenced: faster, but inside the Vertica process
+    make deploy FENCED=mixed  # build and load fenced, search unfenced
     make undeploy             # removes library and functions; schema vvector stays
 
 Everything is created in schema `vvector`. Building, loading and the
@@ -81,28 +84,35 @@ row with `del = TRUE`, and for every id the latest row wins.
     SELECT * FROM vvector.manifest;
     SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe;
 
-Planned query (M1), reading the snapshot plus the rows written since the last
-refresh from the view `app.docs_delta`:
+One query, snapshot only (the fastest form):
 
     SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
-                           USING PARAMETERS index_name='docs', k=10) OVER()
-    FROM (SELECT * FROM app.docs_delta
-          UNION ALL SELECT 1, ARRAY[0.1, 0.2, 0.3], NULL, NULL, NULL, NULL, NULL) q;
+                           USING PARAMETERS index_name='docs', query='[0.1, 0.2, 0.3]', k=10) OVER()
+    FROM app.docs_snap;
 
-`metric` is `l2`, `cosine` or `dot`, with the meaning of `VECTOR_L2`,
-`COSINE_SIMILARITY` and `DOT_PRODUCT`.
+Many queries from a table, with the rows written since the last refresh applied:
+
+    SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                           USING PARAMETERS index_name='docs', k=10, freshness='exact') OVER()
+    FROM (SELECT * FROM app.docs_delta
+          UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM app.queries) q;
+
+The output is (qid, id, score, rank). `metric` is `l2`, `cosine`, `dot` or `l1`:
+the score is what `VECTOR_L2`, `COSINE_SIMILARITY` and `DOT_PRODUCT` return,
+and the Manhattan distance for l1.
 
 ## Files
 
 | File | What it does |
 |---|---|
 | `Makefile` | builds `build/libvvector.so`, runs the unit tests, installs or removes the library |
-| `src/engine/` | pure C++17, no Vertica includes: snapshot format, node cache, HNSW (stub) |
+| `src/engine/` | pure C++17, no Vertica includes: snapshot format, node cache, distance kernels, flat search, threads, HNSW (stub) |
 | `src/udx/` | the Vertica adapters: one small file per SQL function |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh` |
+| `tests/sql/run_all.sh` | every integration test, fenced, unfenced and mixed |
 | `tests/engine/` | unit tests of the engine (`make test`) |
-| `tests/sql/` | integration tests against a database: `test_snapshot.sh`, `test_freshness.sh` |
+| `tests/sql/` | integration tests against a database: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh` |
 | `docs/` | `design.md` (freshness, cache rules), `format.md` (snapshot format), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## Not supported

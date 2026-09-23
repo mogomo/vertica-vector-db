@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration test of the snapshot path: vbuild -> vvector.snapshot -> vload ->
-# vinfo -> vsearch reading the node cache (vsearch is a stub: it checks the cache
-# and its input, then stops with "not implemented yet").
+# vinfo -> vsearch reading the node cache; the input rules of vbuild and vsearch, and
+# the cache rules (session parameter, stale cache, unknown index).
 #
 #   tests/sql/test_snapshot.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--keep] [--echo_only]
 #
@@ -55,7 +55,7 @@ expect "vbuild into vvector.snapshot" "^chunks: [1-9]" "
 DELETE FROM vvector.snapshot WHERE index_name = 'vvtest';
 INSERT INTO vvector.snapshot
 SELECT 'vvtest', 1, byte_offset, chunk FROM (
-  SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest', metric='cosine', max_ver=4711) OVER(ORDER BY id)
+  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest', metric='cosine', max_ver=4711) OVER()
   FROM $SCHEMA.vectors) b;
 COMMIT;
 SELECT 'chunks: ' || COUNT(*) FROM vvector.snapshot WHERE index_name = 'vvtest';"
@@ -89,38 +89,56 @@ CROSS JOIN (SELECT COUNT(*) AS n FROM $SCHEMA.vectors) t;"
 echo "== vbuild input rules"
 expect "ARRAY[INT] vectors are accepted (Vertica converts them to ARRAY[FLOAT])" "^built: 2 vectors of 3$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
   FROM (SELECT 1 AS id, ARRAY[1, 2, 3] AS vec UNION ALL SELECT 2, ARRAY[4, 5, 6]) v) b;"
 # Not in one query with the INT arrays: a UNION of ARRAY[INT] and ARRAY[NUMERIC] fails inside Vertica 26.2.
 expect "ARRAY[NUMERIC] vectors are accepted" "^built: 2 vectors of 3$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
-  SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+  SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
   FROM (SELECT 1 AS id, ARRAY[1.5, 2.5, 3.5]::ARRAY[NUMERIC(6,2)] AS vec UNION ALL SELECT 2, ARRAY[1, 2, 3]::ARRAY[NUMERIC(6,2)]) v) b;"
 expect "a repeated id is refused" "id 7 appears twice" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 7 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 7, ARRAY[3.0, 4.0]) v;"
 expect "vectors of different lengths are refused" "has 3 elements, the ones before have 2" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 2, ARRAY[3.0, 4.0, 5.0]) v;"
-expect "a NULL vector is refused" "id and vec must not be NULL" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+expect "a NULL vector is refused" "the vector of id 2 is NULL (a delete needs del = true)" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec UNION ALL SELECT 2, NULL::ARRAY[FLOAT]) v;"
-expect "a NULL element is refused" "NULL element" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x') OVER(ORDER BY id)
+expect "a NULL element is refused" "the vector of id 1 has a NULL element" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, NULL]::ARRAY[FLOAT] AS vec) v;"
-expect "an unknown metric is refused" "metric must be l2, cosine or dot" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x', metric='hamming') OVER(ORDER BY id)
+expect "an unknown metric is refused" "metric must be l2, cosine, dot or l1" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', metric='hamming') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
-expect "index_type hnsw says it is not implemented yet" "HNSW is not implemented yet" "
-SELECT vvector.vbuild(id, vec USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER(ORDER BY id)
+expect "index_type hnsw says when it comes" "HNSW is not implemented yet (milestone M2)" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
+expect "quantization sq8 says when it comes" "quantization sq8 is not implemented yet (milestone M4)" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()
+FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
+expect "base_snapshot says when it comes" "incremental builds are not implemented yet (milestone M3)" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5) OVER()
+FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
+expect "rows with del = true are left out of a full build; l1 is a metric" "^built: 2 vectors of 2$" "
+SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
+  SELECT vvector.vbuild(id, vec, del USING PARAMETERS index_name='vvtest_x', metric='l1') OVER()
+  FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec, FALSE AS del UNION ALL SELECT 2, ARRAY[3.0, 4.0], TRUE
+        UNION ALL SELECT 3, ARRAY[5.0, 6.0], NULL) v) b;"
+expect "a NaN element is refused" "element 2 is not a finite float32 value" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+FROM (SELECT 1 AS id, ARRAY[1.0, 'NaN'::FLOAT] AS vec) v;"
+expect "a value beyond the float32 range is refused" "element 1 is not a finite float32 value" "
+SELECT vvector.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
+FROM (SELECT 1 AS id, ARRAY[1e300, 1.0] AS vec) v;"
 
-echo "== vsearch (stub) and cache rules"
-expect "vsearch reads the cache and its input, then says the search is not implemented yet" \
-       "search is not implemented yet (1 query rows, 0 journal rows read)" "
-SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest'$CD, k=5) OVER() FROM dual;"
+echo "== vsearch and cache rules"
+expect "vsearch returns k rows ranked 1 to k, the closest first" "^rows 5, ranks 1 to 5, ordered$" "
+SELECT 'rows ' || COUNT(*) || ', ranks ' || MIN(rank) || ' to ' || MAX(rank) || CASE WHEN MIN(ok) = 1 THEN ', ordered' ELSE ', NOT ordered' END
+FROM (SELECT rank, CASE WHEN LAG(score) OVER(ORDER BY rank) IS NULL OR LAG(score) OVER(ORDER BY rank) >= score THEN 1 ELSE 0 END AS ok
+      FROM (SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest'$CD, k=5) OVER() FROM dual) r) x;"
 
-expect "a query vector of another length is refused" "has $DIMS dimensions, the query vectors have 2" "
+expect "a query vector of another length is refused" "index 'vvtest' has $DIMS dimensions, query 1 has 2" "
 SELECT vvector.vsearch(1, ARRAY[1.0, 2.0], NULL::INT, NULL::ARRAY[FLOAT], NULL::BOOLEAN, NULL::INT, NULL::INT
                        USING PARAMETERS index_name='vvtest'$CD) OVER() FROM dual;"
 
@@ -128,9 +146,9 @@ expect "session parameter cache_dir is used" "no snapshot cache for index 'vvtes
 ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/tmp/vvector_not_there';
 SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest') OVER() FROM dual;"
 
-expect "function parameter cache_dir wins over the session parameter" "search is not implemented yet" "
+expect "function parameter cache_dir wins over the session parameter" "^rows: 3$" "
 ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/tmp/vvector_not_there';
-SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest', cache_dir='$CACHE_DIR') OVER() FROM dual;"
+SELECT 'rows: ' || COUNT(*) FROM (SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest', cache_dir='$CACHE_DIR', k=3) OVER() FROM dual) r;"
 
 expect "stale cache is refused" "snapshot cache stale on .*: run vload" "
 SELECT vvector.vsearch($Q, 999 USING PARAMETERS index_name='vvtest'$CD) OVER() FROM dual;"

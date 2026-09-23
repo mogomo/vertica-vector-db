@@ -7,6 +7,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 using namespace vvector;
@@ -39,7 +40,7 @@ int main()
     // Big enough for three chunks: 200,000 vectors of 32 floats.
     TestSet big;
     const std::uint64_t n = 200000;
-    build(big, n, 32, false, Metric::Dot, 77);
+    build(big, n, 32, Order::Ascending, Metric::Dot, 77);
     CHECK(big.buffer.size() > 2 * CHUNK_BYTES);
 
     std::int64_t active = 0;
@@ -79,7 +80,47 @@ int main()
     CHECK(exists(snapshot_path(dir, "g", 2)) && exists(snapshot_path(dir, "g", 3)));
     CHECK(exists(foreign));
 
+    // Only directories with an ACTIVE file are listed.
+    std::system(("mkdir -p " + dir + "/not_an_index").c_str());
     CHECK(list_cached_indexes(dir) == std::vector<std::string>({"g"}));
+
+    // What ACTIVE says is trusted for ACTIVE_CHECK_MS, unless the caller needs a newer snapshot.
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ACTIVE_CHECK_MS + 50));
+        MappedSnapshot m;
+        m.open_active(dir, "g");
+        CHECK(m.snapshot_id() == 3);
+        load(dir, "g", 4, big.buffer);
+        m.open_active(dir, "g");
+        CHECK(m.snapshot_id() == 3);                 // within the check interval: no file system work
+        m.open_active(dir, "g", 4);
+        CHECK(m.snapshot_id() == 4 && m.vectors().count == n);      // needs 4: reads ACTIVE at once
+        load(dir, "g", 5, small.buffer);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ACTIVE_CHECK_MS + 50));
+        MappedSnapshot other;
+        other.open_active(dir, "g");
+        CHECK(other.snapshot_id() == 5 && other.vectors().count == 3);
+        CHECK(m.vectors().count == n);               // the older mapping stays valid while it is used
+    }
+
+    // Index options: written by vconfig, read with the snapshot.
+    {
+        CHECK(parse_index_options("precision=best, freshness=exact,ef_search=,threads=4").size() == 3);
+        CHECK(parse_index_options("").empty());
+        CHECK(throws([] { parse_index_options("colour=red"); }, "unknown index option 'colour'"));
+        CHECK(throws([] { parse_index_options("threads"); }, "is not name=value"));
+        CHECK(throws([] { parse_index_options("precision=../x"); }, "is not valid"));
+        write_index_options(dir, "g", parse_index_options("precision=balanced,threads=2"));
+        CHECK(read_index_options(dir, "g").at("precision") == "balanced");
+        std::this_thread::sleep_for(std::chrono::milliseconds(ACTIVE_CHECK_MS + 50));
+        MappedSnapshot m;
+        m.open_active(dir, "g");
+        CHECK(m.options().size() == 2 && m.options().at("threads") == "2");
+        load(dir, "g", 6, small.buffer);            // a load keeps OPTIONS
+        CHECK(read_index_options(dir, "g").size() == 2);
+        write_index_options(dir, "fresh_index", IndexOptions());        // creates the directory
+        CHECK(read_index_options(dir, "fresh_index").empty());
+    }
 
     std::system(("rm -rf " + dir).c_str());
     return finish("test_cache");

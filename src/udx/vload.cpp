@@ -18,16 +18,15 @@ class VLoad : public TransformFunction
         const std::string node = srvInterface.getCurrentNodeName();
         try {
             ParamReader params = srvInterface.getParamReader();
-            const std::string name = read_index_name(FN, srvInterface);
-            if (!params.containsParameter("snapshot_id"))
-                vt_report_error(0, "%s: parameter snapshot_id is required", FN);
+            const std::string name = read_index_name(srvInterface);
+            if (!params.containsParameter("snapshot_id")) fail("parameter snapshot_id is required");
             const vint snapshot_id = params.getIntRef("snapshot_id");
 
             vvector::CacheWriter writer;
             writer.begin(resolve_cache_dir(srvInterface), name, snapshot_id);
             do {
                 if (inputReader.isNull(0) || inputReader.getStringRef(1).isNull())
-                    vt_report_error(0, "%s: index '%s' on %s: NULL byte_offset or chunk", FN, name.c_str(), node.c_str());
+                    fail("index '" + name + "': NULL byte_offset or chunk");
                 const VString &chunk = inputReader.getStringRef(1);
                 writer.write_at(inputReader.getIntRef(0), chunk.data(), chunk.length());
                 if (isCanceled()) return;
