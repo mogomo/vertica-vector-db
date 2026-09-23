@@ -24,9 +24,9 @@ Vertica 26.2 has no vector type and no vector index. Vectors are stored as
 two arrays. A nearest-neighbour query is therefore a full scan with a top-k
 sort (verified with EXPLAIN: STORAGE ACCESS, then SORT [TOPK]); on SIFT1M
 (1,000,000 vectors of 128 dimensions) one query takes 7.3 seconds on the test
-VM. vvector keeps a copy of the vectors (and from milestone M2 an HNSW graph
-over them) as a snapshot, loads it on every node and answers the same query
-from it in 5 to 12 milliseconds (below).
+VM. vvector keeps a copy of the vectors and an HNSW graph over them as a
+snapshot, loads it on every node and answers the same query from it in a few
+milliseconds (below).
 
 ## Search engine
 
@@ -58,6 +58,84 @@ from it in 5 to 12 milliseconds (below).
   never call the SDK. Only the calling thread checks `isCanceled()` between
   work units. Below about 2 million multiply-adds the search runs on the
   calling thread only (thread start costs more than it saves).
+
+## HNSW
+
+`src/engine/hnsw.h`, after Malkov and Yashunin (TPAMI 2018); the mechanics
+follow hnswlib, the code is our own.
+
+- Built in place: the snapshot builder sorts the rows, lays out the graph
+  section (its size follows from the ids alone, because the level of a node
+  is a hash of its id) and the graph is written straight into the final
+  buffer. There is no second copy of vectors or links. The graph refers to
+  positions; the search reads the rows of the vectors section, so flat
+  search, graph search and the journal overlay share one copy of the vectors.
+- Insert (hnswlib's addPoint): greedy descent on the upper levels, a beam
+  search with ef_construction on each level of the new node, the neighbour
+  heuristic (Algorithm 4: a candidate is kept only when it is nearer to the
+  new node than to every neighbour kept before it; pruned candidates are not
+  kept, as in hnswlib), back links, and the heuristic again when a list is
+  full. The new node gets m links on every level; lists hold m (upper levels)
+  or 2 x m (level 0).
+- Parallel build: a thread takes the next 64 positions at a time. Link lists
+  are protected by 65536 striped mutexes (never two held at once); the global
+  mutex is held only by an insert whose node becomes the new entry point.
+  Another thread can reach a node through its upper levels before that
+  node's insert gets down to a lower level and link itself to it there;
+  those links are merged when the insert writes the node's list, not
+  overwritten (a first version lost them: 0.5% of the nodes of a 4-thread
+  build had no incoming link).
+- Reachability repair: the heuristic can prune the last link to a node; such
+  a node can never be found (hnswlib has the same effect, mostly with small m
+  or many equal vectors). After the inserts, one thread walks level 0 from
+  the entry point and links every node it misses from its nearest reachable
+  node (a search for it), preferring a list with room. With it, a search with
+  ef = count finds exactly what the flat search finds; `test_hnsw` checks
+  that for every metric, for clustered data and for 1500 equal vectors.
+- Search: greedy descent from the entry point, then a beam search on level 0
+  with ef = max(ef_search, k). The neighbours of a node are scored in one
+  kernel call (`keys_gather`) that prefetches the next rows while it scores
+  one; the visited marks are prefetched too. Visited marks are 16-bit stamps
+  per position (a new search takes the next stamp; the array is cleared only
+  when the stamp wraps), kept by the process between calls, 2 bytes per
+  vector per search thread. Masked and tombstoned positions (the journal
+  overlay) are traversed but never returned; the journal's live vectors are
+  searched exactly and merged.
+- Determinism: candidates are ordered by (key, position), a total order, so a
+  search on a given snapshot gives the same result on every thread count and
+  CPU. The graph of a parallel build depends on the interleaving of the
+  threads; with one build thread it depends on the data only.
+- Precision levels are presets of ef_search: fast max(2 x k, 32), balanced
+  100, best 400; exact (or `exact=true`) is the flat search.
+- Graph memory: (2m + 1) x 4 bytes per vector on level 0, 5 bytes for the
+  level and the upper index, and on average 1/(m - 1) upper blocks of
+  (m + 1) x 4 bytes: 141 bytes per vector with m = 16 (135 MB for SIFT1M).
+
+Engine against hnswlib, SIFT1M (1M x 128, l2), m 16, ef_construction 200,
+10,000 queries, k 10, same VM, same threads (`make bench DATA_DIR=...
+HNSWLIB_DIR=...`; hnswlib v0.10.0-rc.2 built with its own flags `-Ofast
+-march=native`, vvector with `-O3 -ffp-contract=off`):
+
+| | vvector | hnswlib |
+|---|---:|---:|
+| build, 1 thread | 197.5 s | 229.0 s |
+| build, 8 threads | 34.0 s | 39.5 s |
+
+| ef_search | recall@10 vvector | recall@10 hnswlib | q/s 1 thread vvector | q/s 1 thread hnswlib | q/s 8 threads vvector | q/s 8 threads hnswlib |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 0.7084 | 0.7079 | 42,752 | 38,830 | 284,203 | 224,250 |
+| 16 | 0.8001 | 0.8016 | 30,902 | 28,162 | 209,882 | 172,439 |
+| 32 | 0.9031 | 0.9034 | 20,444 | 18,106 | 127,755 | 106,988 |
+| 64 | 0.9632 | 0.9634 | 11,867 | 10,396 | 73,476 | 62,513 |
+| 100 | 0.9828 | 0.9826 | 8,042 | 7,198 | 50,294 | 43,092 |
+| 200 | 0.9956 | 0.9956 | 4,473 | 3,967 | 27,169 | 23,927 |
+| 400 | 0.9987 | 0.9987 | 2,364 | 2,179 | 14,767 | 13,049 |
+
+Equal recall, 8 to 27% more queries per second, 14% faster build. One search
+call (the unit vsearch makes) takes 0.13 ms at ef 100. hnswlib has no NEON
+code: on aarch64 its distances come from the compiler's vectorisation of a
+plain loop; on x86_64 it uses AVX intrinsics, so the comparison is repeated
+on the x86 cluster when it has the memory for SIFT1M.
 
 ## vload on every node
 
@@ -117,11 +195,17 @@ project this code comes from):
   128 dimensions: 500 MB; of 768 dimensions: 2.9 GB. Fenced, this memory
   belongs to the fenced process; its limit is `FencedUDxMemoryLimitMB`
   (-1 = no limit). `vvector.sizing()` and `vvector.status()` compute it.
+- HNSW build: in addition, the graph section (below) and, per build thread,
+  2 bytes per vector of visited marks; 5 bytes per vector for a moment while
+  the levels are laid out.
 - The snapshot and every cache file: 256 bytes plus `4 x row_stride + 8` bytes
-  per vector (plus graph and codes from M2 and M4).
+  per vector, plus the graph: about 141 bytes per vector with m = 16 (codes
+  from M4).
 - vsearch maps the snapshot and copies nothing from it. It holds the queries
   and the live journal vectors: `4 x row_stride` bytes each, and a bitset of
-  one bit per snapshot vector when the journal has rows.
+  one bit per snapshot vector when the journal has rows. A graph search keeps
+  2 bytes per vector per search thread of visited marks in the process
+  between calls (2 MB per thread for 1M vectors).
 
 ## Freshness: exact results between refreshes
 

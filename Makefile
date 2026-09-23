@@ -7,7 +7,10 @@
 #   make                      build build/libvvector.so
 #   make test [DATA_DIR=DIR]  engine unit tests, no Vertica needed; with DATA_DIR also the SIFT1M recall test
 #   make tools                build/tools/fvecs (vector files to COPY text)
-#   make bench [DATA_DIR=DIR] engine benchmark; with DATA_DIR on SIFT1M (DIR/sift_*.fvecs), else random data
+#   make bench [DATA_DIR=DIR] [HNSWLIB_DIR=DIR]
+#                             engine benchmarks; with DATA_DIR on SIFT1M (DIR/sift_*.fvecs), else random
+#                             data (flat only); with HNSWLIB_DIR (a clone of github.com/nmslib/hnswlib)
+#                             also the same HNSW measurements made with hnswlib, for comparison
 #   make deploy [FENCED=yes|no|mixed]   install the library and functions (default: fenced)
 #   make undeploy             remove functions and library
 #   make clean
@@ -28,9 +31,13 @@ ENGINE_HDR := $(wildcard src/engine/*.h)
 UDX_SRC    := $(wildcard src/udx/*.cpp)
 TEST_SRC   := $(wildcard tests/engine/test_*.cpp)
 TEST_BIN   := $(patsubst tests/engine/%.cpp,$(BUILD_DIR)/tests/%,$(TEST_SRC))
-BENCH_SRC  := $(wildcard tests/engine/bench_*.cpp)
+BENCH_SRC  := $(filter-out tests/engine/bench_hnswlib.cpp,$(wildcard tests/engine/bench_*.cpp))
 BENCH_BIN  := $(patsubst tests/engine/%.cpp,$(BUILD_DIR)/tests/%,$(BENCH_SRC))
 DATA_DIR   ?=
+HNSWLIB_DIR ?=
+ifneq ($(HNSWLIB_DIR),)
+BENCH_BIN  += $(BUILD_DIR)/tests/bench_hnswlib
+endif
 
 # Reported by vversion().
 BUILD_FLAGS := $(OPT) -ffp-contract=off -std=c++17 $(shell uname -m) $(notdir $(CXX))-$(shell $(CXX) -dumpfullversion 2>/dev/null || $(CXX) -dumpversion)
@@ -54,6 +61,11 @@ $(LIB): $(UDX_SRC) $(wildcard src/udx/*.h) $(ENGINE_SRC) $(ENGINE_HDR) $(SDK_HOM
 $(BUILD_DIR)/tests/%: tests/engine/%.cpp $(wildcard tests/engine/*.h) $(ENGINE_SRC) $(ENGINE_HDR) Makefile
 	@mkdir -p $(BUILD_DIR)/tests
 	$(CXX) $(COMMON_FLAGS) -o $@ $< $(ENGINE_SRC)
+
+# hnswlib with the flags of its own build (CMakeLists.txt): the reference as its authors ship it.
+$(BUILD_DIR)/tests/bench_hnswlib: tests/engine/bench_hnswlib.cpp tests/engine/bench_util.h Makefile
+	@mkdir -p $(BUILD_DIR)/tests
+	$(CXX) -std=c++17 -Ofast -march=native -pthread -w -I $(HNSWLIB_DIR) -o $@ $<
 
 test: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "== $$t"; $$t $(if $(DATA_DIR),--dir=$(DATA_DIR)) || exit 1; done

@@ -64,11 +64,50 @@ In this order, each starting on the next 64-byte boundary after the one before:
 4. `tombstones` (FLAG_TOMBSTONES): uint64[(count + 63) / 64], one bit per
    position (bit i % 64 of word i / 64); 1 = the position is deleted.
 5. `sq8` (FLAG_SQ8): int8 codes and their scale. Defined with milestone M4.
-6. `graph` (FLAG_HNSW): the HNSW links. Defined with milestone M2.
+6. `graph` (FLAG_HNSW): the HNSW links, see below.
 
 Vectors come first so the builder can write every row straight into the
 final buffer as it arrives. Rows are sorted by id at the end by moving them
 in place, so a build never holds two copies of the vectors.
+
+## Graph section (FLAG_HNSW)
+
+The links of the HNSW graph (Malkov and Yashunin, 2018). The vectors are not
+repeated: the graph refers to positions, and a search reads the rows of the
+`vectors` section. Offsets below are from the start of the graph section;
+every part starts on a 64-byte boundary, padding bytes are 0.
+
+Graph header (64 bytes):
+
+| Offset | Type | Field | Meaning |
+|---:|---|---|---|
+| 0 | uint32 | m | links per node on the levels above 0, 2 to 256 |
+| 4 | uint32 | m0 | links per node on level 0: 2 x m |
+| 8 | uint32 | ef_construction | candidate list size of the build (information only) |
+| 12 | uint32 | max_level | level of the entry point, at most 32 |
+| 16 | uint32 | entry_point | position where every search starts |
+| 20 | uint32 | reserved0 | 0 |
+| 24 | uint64 | count | positions, equal to the snapshot's count |
+| 32 | uint64 | level_seed | seed of the level function |
+| 40 | uint64 | upper_blocks | number of blocks in `upper`: the sum of all levels |
+| 48 | uint64[2] | reserved | 0 |
+
+Parts, in this order:
+
+1. `levels`: uint8[count], the top level of every position.
+2. `level0`: count blocks of (m0 + 1) uint32, one per position: the number
+   of links n, then n neighbour positions (the rest of the block is 0).
+3. `upper_index`: uint32[count], the index of the first `upper` block of a
+   position, 0xFFFFFFFF when its level is 0.
+4. `upper`: for every position of level L >= 1, in position order, L blocks
+   of (m + 1) uint32 for the levels 1 to L: n, then n neighbour positions.
+
+The level of a vector is floor(-ln(u) / ln(m)) with u in (0, 1] taken from
+a hash of (level_seed, id), capped at 32: the same id always gets the same
+level. The section size follows from count, m and upper_blocks; readers
+refuse a section whose size differs. vload also checks every link (in
+range, not to itself, not to a node below that level, lists not longer than
+m or m0) and that the levels, upper_index and upper_blocks agree.
 
 ## Checksum
 
@@ -77,5 +116,5 @@ checksum field itself counted as 0, of splitmix64(w + (p + 1) x
 0x9E3779B97F4A7C15). Zero words contribute nothing. Because of the XOR, parts
 of the file can be summed separately and combined in any order.
 vload verifies it, and that the ids are unique and ascending (through the
-id_index when present) and that the tombstone count matches; queries check
-the header only.
+id_index when present), that the tombstone count matches, and the graph links;
+queries check the headers only.

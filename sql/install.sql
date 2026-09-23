@@ -1,7 +1,7 @@
 -- vvector install. Run by scripts/deploy.sh, which sets three vsql variables:
 --   libfile         quoted absolute path of libvvector.so on the initiator node
 --   fenced_build    FENCED or NOT FENCED: vbuild, vload, vconfig, vnode (memory-heavy or writing)
---   fenced_search   FENCED or NOT FENCED: vsearch, vinfo, vversion (the query path)
+--   fenced_search   FENCED or NOT FENCED: vsearch, vknn, vinfo, vversion (the query path)
 -- Safe to run again: tables and their data are kept; missing manifest columns are added.
 \set ON_ERROR_STOP on
 
@@ -86,6 +86,7 @@ CREATE OR REPLACE TRANSFORM FUNCTION vvector.vload    AS LANGUAGE 'C++' NAME 'VL
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vconfig  AS LANGUAGE 'C++' NAME 'VConfigFactory'  LIBRARY vvector :fenced_build;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vnode    AS LANGUAGE 'C++' NAME 'VNodeFactory'    LIBRARY vvector :fenced_build;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vsearch  AS LANGUAGE 'C++' NAME 'VSearchFactory'  LIBRARY vvector :fenced_search;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector.vknn     AS LANGUAGE 'C++' NAME 'VKnnFactory'     LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vinfo    AS LANGUAGE 'C++' NAME 'VInfoFactory'    LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vversion AS LANGUAGE 'C++' NAME 'VVersionFactory' LIBRARY vvector :fenced_search;
 

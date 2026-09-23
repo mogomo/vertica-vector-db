@@ -20,6 +20,8 @@
 #   delta0     query parameter FROM <index>_delta with freshness exact, the delta holds the sentinel
 #   delta1000  the same with 1000 journal rows (inserted before, deleted after)
 #   threads1, threads2, threads4   the snap shape with threads=1, 2, 4: the engine's share
+#   vknn       vknn with the query parameter FROM dual: no OVER(), no view, no stale check
+#   vknnrow    vknn on the query row of the query table (qid = 0), beside its qid
 # Creates index vvlat_tiny in SCHEMA (kept for later runs).
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -euo pipefail
@@ -35,7 +37,7 @@ for arg in "$@"; do
         --shapes=*)  SHAPES="${arg#*=}" ;;
         --queries=*) QUERIES="${arg#*=}" ;;
         --echo_only) ECHO_ONLY=yes ;;
-        -h|--help)   sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,27p' "$0"; exit 0 ;;
         *) echo "latency.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -52,7 +54,7 @@ DROP TABLE IF EXISTS $SCHEMA.vvlat_tiny CASCADE;
 CREATE TABLE $SCHEMA.vvlat_tiny AS SELECT qid AS id, qvec AS vec FROM $QUERIES WHERE qid < 16;
 SQL
     vsql -X -q -c "CALL vvector.unregister_index('vvlat_tiny');" > /dev/null 2>&1 || true
-    vsql -X -q -v ON_ERROR_STOP=1 -c "CALL vvector.register_index('vvlat_tiny', '$SCHEMA.vvlat_tiny', 'id', 'vec', NULL, NULL, 'l2', NULL);" > /dev/null
+    vsql -X -q -v ON_ERROR_STOP=1 -c "CALL vvector.register_index('vvlat_tiny', '$SCHEMA.vvlat_tiny', 'id', 'vec', NULL, NULL, 'l2', NULL, 'flat');" > /dev/null
     vsql -X -q -v ON_ERROR_STOP=1 -c "CALL vvector.refresh_index('vvlat_tiny');" > /dev/null
 }
 
@@ -69,6 +71,8 @@ statement() {   # SHAPE -> one SQL statement
         literal)   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', k=10) OVER() FROM ($QROW) q;" ;;
         delta0|delta1000)
                    echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, freshness='exact') OVER() FROM $SCHEMA.${INDEX}_delta;" ;;
+        vknn)      echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='$INDEX', query='$Q', k=10) FROM dual;" ;;
+        vknnrow)   echo "SELECT /*+LABEL(${TAG}_$1)*/ q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='$INDEX', k=10) FROM $QUERIES q WHERE q.qid = 0;" ;;
         threads*)  echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, threads=${1#threads}) OVER() FROM $SCHEMA.${INDEX}_snap;" ;;
     esac
 }

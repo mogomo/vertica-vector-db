@@ -12,6 +12,7 @@
 #   reaches every vector);
 # - recall@10 of the precision levels fast, balanced and best against the full scan;
 # - freshness='exact' never returns a deleted id; 1 and 8 threads give the same results;
+# - vknn (no OVER(), one row in, k rows out) gives what vsearch gives with freshness snapshot;
 # - set_index_options m and ef_construction take effect at the next refresh;
 # - error messages of the HNSW parameters.
 # --sift=SCHEMA: also registers the SIFT1M journal SCHEMA.sift_base (scripts/load_dataset.sh) as
@@ -39,7 +40,7 @@ for arg in "$@"; do
         --cache_dir=*) CACHE_DIR="${arg#--cache_dir=}" ;;
         --sift=*)      SIFT="${arg#--sift=}" ;;
         --echo_only)   ECHO_ONLY=yes ;;
-        -h|--help)     sed -n '2,23p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "test_hnsw.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -116,6 +117,26 @@ SELECT 'differences: ' || (SELECT COUNT(*) FROM (
   || ', rows: ' || (SELECT COUNT(*) FROM ($(search_sql vh_dot ", k=10, threads=8" "(SELECT * FROM $SCHEMA.vh_dot_delta UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries) x")) c);"
 expect "radius on HNSW: only rows within it" "^outside: 0$" "
 SELECT 'outside: ' || COUNT(*) FROM ($(search_sql vh_l2 ", k=50, radius=1.0, freshness='exact'" "$Q1")) r WHERE score > 1.0;"
+
+echo "== vknn: one vector in, k rows out, no OVER()"
+SNAPQ="(SELECT * FROM $SCHEMA.vh_cos_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries) x"
+expect "vknn gives what vsearch gives with freshness snapshot (100 queries, beside the qid column)" "^differences: 0, rows: 1000$" "
+SELECT 'differences: ' || (SELECT COUNT(*) FROM (
+    SELECT qid, id, rank, score::NUMERIC(20,6) FROM (SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='vh_cos', k=10) FROM $SCHEMA.queries q) a
+    EXCEPT SELECT qid, id, rank, score::NUMERIC(20,6) FROM ($(search_sql vh_cos ", k=10" "$SNAPQ")) b) d)
+  || ', rows: ' || (SELECT COUNT(*) FROM (SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='vh_cos', k=10) FROM $SCHEMA.queries q) c);"
+expect "vknn with precision exact equals vsearch exact" "^differences: 0$" "
+SELECT 'differences: ' || COUNT(*) FROM (
+    SELECT qid, id, rank FROM (SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='vh_cos', k=10, precision='exact') FROM $SCHEMA.queries20 q) a
+    EXCEPT SELECT qid, id, rank FROM ($(search_sql vh_cos ", k=10, precision='exact'" "(SELECT * FROM $SCHEMA.vh_cos_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries20) x")) b) d;"
+QTEXT=$(printf "SELECT TO_JSON(qvec) FROM %s.queries WHERE qid = 1;" "$SCHEMA" | { [ "$ECHO_ONLY" = yes ] && echo "[0.1]" || { printf '%s\n' "$PRE"; cat; } | vsql -X -A -t -q; })
+expect "vknn with the query parameter FROM dual" "^rows 5, ranks 1 to 5$" "
+SELECT 'rows ' || COUNT(*) || ', ranks ' || MIN(rank) || ' to ' || MAX(rank)
+FROM (SELECT vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='vh_cos', k=5, query='$QTEXT') FROM dual) r;"
+expect "vknn: a NULL vector gives no rows" "^rows: 0$" "
+SELECT 'rows: ' || COUNT(*) FROM (SELECT vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='vh_cos') FROM dual) r;"
+expect "vknn: a vector of another length is refused" "vknn: index 'vh_cos' has 16 dimensions, the query vector has 2" "
+SELECT vvector.vknn(ARRAY[1.0, 2.0] USING PARAMETERS index_name='vh_cos') FROM dual;"
 
 echo "== options and refresh"
 expect "set_index_options m 8, ef_construction 40, then refresh: smaller graph, same exactness" "^m 8, efc 40, smaller: t$" "

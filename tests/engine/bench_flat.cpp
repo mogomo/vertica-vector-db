@@ -12,6 +12,7 @@
 #include "../../src/engine/snapshot.h"
 #include "../../src/engine/version.h"
 #include "check.h"
+#include "bench_util.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,45 +23,9 @@
 #include <vector>
 
 using namespace vvector;
-using Clock = std::chrono::steady_clock;
+using namespace bench;
 
 namespace {
-
-double seconds_since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
-
-// Reads a .fvecs or .ivecs file: count vectors of dims values (as float or int).
-template <class T>
-bool read_vecs(const std::string &path, std::vector<T> &out, std::uint32_t &dims, std::uint64_t &count)
-{
-    std::FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    out.clear();
-    count = 0;
-    std::int32_t d;
-    while (std::fread(&d, 4, 1, f) == 1) {
-        dims = static_cast<std::uint32_t>(d);
-        const std::size_t at = out.size();
-        out.resize(at + d);
-        if (std::fread(out.data() + at, 4, d, f) != static_cast<std::size_t>(d)) { std::fclose(f); return false; }
-        ++count;
-    }
-    std::fclose(f);
-    return true;
-}
-
-template <class F> double median_seconds(int runs, F f)
-{
-    std::vector<double> t;
-    for (int i = 0; i < runs; ++i) {
-        const Clock::time_point s = Clock::now();
-        f();
-        t.push_back(seconds_since(s));
-    }
-    std::sort(t.begin(), t.end());
-    return t[t.size() / 2];
-}
-
-void line(const char *what, double value, const char *unit) { std::printf("%-58s %12.3f %s\n", what, value, unit); }
 
 // Memory bandwidth: every thread sums its part of a large buffer (reads only, as a flat scan),
 // with 16 independent add chains, so the loop waits for memory, not for the adder.

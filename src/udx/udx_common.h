@@ -7,12 +7,17 @@
 #include "Vertica.h"
 #include "Arrays/Accessors.h"
 #include "../engine/cache.h"
+#include "../engine/flat.h"
+#include "../engine/hnsw.h"
+#include "../engine/parallel.h"
 #include "../engine/snapshot.h"
 
 #include <cerrno>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -20,6 +25,7 @@
 namespace vvector_udx {
 
 using Vertica::BaseDataOID;     // Float8OID is a macro that names this type without its namespace
+using Vertica::vint;
 
 [[noreturn]] inline void fail(const std::string &why) { throw std::runtime_error(why); }
 
@@ -170,6 +176,105 @@ private:
     Vertica::ParamReader params_, session_;
     const vvector::IndexOptions &index_;
 };
+
+inline bool one_of(const std::string &v, std::initializer_list<const char *> allowed)
+{
+    for (const char *a : allowed) if (v == a) return true;
+    return false;
+}
+
+// The tuning values of a search (vsearch, vknn), read with the precedence of Settings and checked.
+// On a flat index every precision is exact and ef_search has no effect; rescore and oversampling
+// have no effect before int8 quantisation (milestone M4). All are checked, so that the same SQL
+// works on every index.
+struct SearchSettings {
+    static const vint MAX_K = 16384;
+    vint k = 10;
+    std::string precision;
+    vint ef_search = 0;
+    bool exact = false;
+    double oversampling = 1.0;
+    int threads = 1;
+    bool has_radius = false;
+    double radius = 0;
+
+    SearchSettings(Settings &cfg, Vertica::ParamReader &params)
+    {
+        k = cfg.integer("k", 10);
+        if (k < 1 || k > MAX_K) fail("k must be 1 to 16384, not " + std::to_string(k));
+        precision = cfg.text("precision", "fast");
+        if (!one_of(precision, {"fast", "balanced", "best", "exact"}))
+            fail("precision must be fast, balanced, best or exact, not '" + precision + "'");
+        ef_search = cfg.integer("ef_search", 0);
+        if (ef_search < 0 || ef_search > 100000) fail("ef_search must be 0 (preset) to 100000");
+        exact = cfg.boolean("exact", false);
+        cfg.boolean("rescore", true);
+        oversampling = cfg.real("oversampling", 1.0);
+        if (!(oversampling >= 1.0 && oversampling <= 100.0)) fail("oversampling must be 1 to 100");
+        threads = vvector::resolve_threads(cfg.integer("threads", 0));
+        has_radius = params.containsParameter("radius");
+        radius = has_radius ? params.getFloatRef("radius") : 0.0;
+        if (has_radius && !std::isfinite(radius)) fail("radius must be a finite number");
+    }
+
+    // The search walks the graph on an HNSW index, unless precision is exact or exact is true.
+    bool use_graph(const vvector::VectorSet &s) const { return s.has_graph() && !exact && precision != "exact"; }
+
+    // Candidate list size of the graph search: ef_search, else the preset of the precision level
+    // (fast: max(2 x k, 32), balanced: 100, best: 400); at least k.
+    std::uint32_t ef() const
+    {
+        vint ef = ef_search;
+        if (ef == 0) ef = precision == "best" ? 400 : precision == "balanced" ? 100 : std::max<vint>(2 * k, 32);
+        return static_cast<std::uint32_t>(std::max(ef, k));
+    }
+
+    // The FlatSearch description of queries (n rows of the index's stride) with these values.
+    vvector::FlatSearch describe(const vvector::VectorSet &s, const float *queries, std::uint64_t n) const
+    {
+        vvector::FlatSearch fs;
+        fs.metric = s.metric;
+        fs.stride = s.row_stride;
+        fs.queries = queries;
+        fs.n_queries = n;
+        fs.k = static_cast<std::uint32_t>(k);
+        fs.has_radius = has_radius;
+        fs.radius = radius;
+        fs.threads = threads;
+        return fs;
+    }
+
+    // Searches the snapshot s (positions in skip, may be null, are never returned) and the extra
+    // rows beside it (the journal's live vectors, may be null): graph or flat, as the settings say.
+    void search(const vvector::FlatSearch &fs, const vvector::VectorSet &s, const std::uint64_t *skip,
+                const vvector::RowBlock *extra, std::vector<vvector::Neighbor> &out, std::vector<std::uint32_t> &count,
+                const std::function<bool()> &poll) const
+    {
+        if (use_graph(s)) {
+            const vvector::HnswGraph graph = vvector::hnsw_open(s, false);
+            vvector::hnsw_search(fs, s, graph, ef(), skip, extra, out, count, poll);
+            return;
+        }
+        vvector::RowBlock blocks[2];
+        blocks[0] = vvector::RowBlock{s.vectors, s.ids, s.count, skip};
+        std::size_t n = 1;
+        if (extra && extra->n) blocks[n++] = *extra;
+        vvector::flat_search(fs, blocks, n, out, count, poll);
+    }
+};
+
+inline void add_search_parameters(Vertica::SizedColumnTypes &parameterTypes)
+{
+    parameterTypes.addInt("k");
+    parameterTypes.addVarchar(16, "precision");
+    parameterTypes.addInt("ef_search");
+    parameterTypes.addBool("exact");
+    parameterTypes.addFloat("radius");
+    parameterTypes.addInt("threads");
+    parameterTypes.addVarchar(65000, "query");
+    parameterTypes.addBool("rescore");
+    parameterTypes.addFloat("oversampling");
+}
 
 } // namespace vvector_udx
 

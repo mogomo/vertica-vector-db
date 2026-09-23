@@ -25,7 +25,6 @@ using namespace Vertica;
 using namespace vvector_udx;
 
 static const char *const FN = "vsearch";
-static const vint MAX_K = 16384;
 
 namespace {
 
@@ -89,12 +88,6 @@ private:
     std::vector<std::uint32_t> free_;
 };
 
-bool one_of(const std::string &v, std::initializer_list<const char *> allowed)
-{
-    for (const char *a : allowed) if (v == a) return true;
-    return false;
-}
-
 } // namespace
 
 class VSearch : public TransformFunction
@@ -110,27 +103,11 @@ class VSearch : public TransformFunction
             vvector::MappedSnapshot snap;
             snap.open_active(cache_dir, name);
 
-            // Tuning values. On a flat index every precision is exact and ef_search has no effect;
-            // rescore and oversampling have no effect before int8 quantisation (milestone M4). All are
-            // checked, so that the same SQL works on every index.
+            // Tuning values (udx_common.h), and freshness.
             Settings cfg(srvInterface, snap.options());
-            const vint k = cfg.integer("k", 10);
-            if (k < 1 || k > MAX_K) fail("k must be 1 to 16384, not " + std::to_string(k));
-            const std::string precision = cfg.text("precision", "fast");
-            if (!one_of(precision, {"fast", "balanced", "best", "exact"}))
-                fail("precision must be fast, balanced, best or exact, not '" + precision + "'");
+            const SearchSettings ss(cfg, params);
             const std::string freshness = cfg.text("freshness", "snapshot");
             if (!one_of(freshness, {"snapshot", "exact"})) fail("freshness must be snapshot or exact, not '" + freshness + "'");
-            const vint ef_search = cfg.integer("ef_search", 0);
-            if (ef_search < 0 || ef_search > 100000) fail("ef_search must be 0 (preset) to 100000");
-            const bool exact = cfg.boolean("exact", false);
-            cfg.boolean("rescore", true);
-            const double oversampling = cfg.real("oversampling", 1.0);
-            if (!(oversampling >= 1.0 && oversampling <= 100.0)) fail("oversampling must be 1 to 100");
-            const int threads = vvector::resolve_threads(cfg.integer("threads", 0));
-            const bool has_radius = params.containsParameter("radius");
-            const double radius = has_radius ? params.getFloatRef("radius") : 0.0;
-            if (has_radius && !std::isfinite(radius)) fail("radius must be a finite number");
             const bool apply_journal = freshness == "exact";
 
             const vvector::VectorSet set = snap.vectors();
@@ -211,33 +188,12 @@ class VSearch : public TransformFunction
                 if (now.tombstone_bits) std::memcpy(skip.data(), now.tombstone_bits, skip.size() * 8);
                 journal.apply(now, skip, extra_ids, extra_rows);
             }
-            vvector::RowBlock blocks[2];
-            blocks[0] = vvector::RowBlock{now.vectors, now.ids, now.count, skip.empty() ? nullptr : skip.data()};
-            blocks[1] = vvector::RowBlock{extra_rows.data(), extra_ids.data(), extra_ids.size(), nullptr};
-
-            vvector::FlatSearch fs;
-            fs.metric = now.metric;
-            fs.stride = stride;
-            fs.queries = queries.data();
-            fs.n_queries = qids.size();
-            fs.k = static_cast<std::uint32_t>(k);
-            fs.has_radius = has_radius;
-            fs.radius = radius;
-            fs.threads = threads;
+            const vvector::RowBlock extra{extra_rows.data(), extra_ids.data(), extra_ids.size(), nullptr};
+            const vvector::FlatSearch fs = ss.describe(now, queries.data(), qids.size());
             std::vector<vvector::Neighbor> found;
             std::vector<std::uint32_t> count;
             try {
-                if (now.has_graph() && !exact && precision != "exact") {
-                    // ef: the ef_search value, else the preset of the precision level; at least k.
-                    vint ef = ef_search;
-                    if (ef == 0) ef = precision == "best" ? 400 : precision == "balanced" ? 100 : std::max<vint>(2 * k, 32);
-                    const vvector::HnswGraph graph = vvector::hnsw_open(now, false);
-                    vvector::hnsw_search(fs, now, graph, static_cast<std::uint32_t>(std::max(ef, k)),
-                                         skip.empty() ? nullptr : skip.data(), extra_ids.empty() ? nullptr : &blocks[1],
-                                         found, count, [this] { return isCanceled(); });
-                } else {
-                    vvector::flat_search(fs, blocks, extra_ids.empty() ? 1 : 2, found, count, [this] { return isCanceled(); });
-                }
+                ss.search(fs, now, skip.empty() ? nullptr : skip.data(), &extra, found, count, [this] { return isCanceled(); });
             } catch (const vvector::Cancelled &) {
                 return;
             }
@@ -280,16 +236,8 @@ class VSearchFactory : public TransformFunctionFactory
     virtual void getParameterType(ServerInterface &srvInterface, SizedColumnTypes &parameterTypes)
     {
         add_common_parameters(parameterTypes);
-        parameterTypes.addInt("k");
-        parameterTypes.addVarchar(16, "precision");
+        add_search_parameters(parameterTypes);
         parameterTypes.addVarchar(16, "freshness");
-        parameterTypes.addInt("ef_search");
-        parameterTypes.addBool("exact");
-        parameterTypes.addFloat("radius");
-        parameterTypes.addInt("threads");
-        parameterTypes.addVarchar(65000, "query");
-        parameterTypes.addBool("rescore");
-        parameterTypes.addFloat("oversampling");
     }
 
     virtual TransformFunction *createTransformFunction(ServerInterface &srvInterface)
