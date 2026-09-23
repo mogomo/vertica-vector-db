@@ -279,11 +279,11 @@ The levers of the plan, applied and measured:
 |---|---|
 | 1. No journal scan for snapshot-only queries | `FROM <index>_snap` with the `query` parameter: the fastest shape; the view costs nothing against `FROM dual` and keeps the stale check |
 | 2. Cheap delta scan | journal partitioned by version date: the empty delta costs 1.1 ms. Journal rows cost about 1.7 ms per 1000 |
-| 3. No gather across nodes | single node: does not apply; measured on the Eon cluster at M2 |
+| 3. No gather across nodes | single node: does not apply; on the Eon cluster see M2 below |
 | 4. No file system work per call | ACTIVE and OPTIONS trusted for 200 ms, the mapping kept: a warm call makes no system call for the cache |
 | 5. Function setup | 0.5 ms more than an empty transform function (unfenced); parameters are read once, the query parsed once |
 | 6. Output | k rows written in one pass; no string work |
-| 7. Lightest function shape | verified: with `isExploder` a transform function can be called without OVER() and beside other columns (VERTICA_NOTES); `vknn` is prototyped at M2 |
+| 7. Lightest function shape | verified: with `isExploder` a transform function can be called without OVER() and beside other columns (VERTICA_NOTES); `vknn` measured at M2 below |
 | 8. Prepared statements | not measured yet: the VM has the Vertica ODBC driver and JDBC jar but no driver manager and no Java; needs an install (asked) |
 | 9. Resource pool | not measured: it needs a new pool (a database change); a statement this short shows no thread setup in the numbers above |
 | 10. Fenced against unfenced | fenced adds about 6 ms per statement; see the recommendation below |
@@ -291,10 +291,74 @@ The levers of the plan, applied and measured:
 
 Recommendation from the numbers: fenced mode costs about 6 ms per statement,
 more than the search itself. For a service that runs single searches, deploy
-with `FENCED=mixed` (vbuild, vload and vconfig stay fenced; vsearch, vinfo
-and vversion run in the Vertica process). For batch searches (1000 queries in
+with `FENCED=mixed` (vbuild, vload and vconfig stay fenced; vsearch, vknn,
+vinfo and vversion run in the Vertica process). For batch searches (1000 queries in
 one statement) the difference is below 2% (957 against 944 queries per
 second), and fenced is the safer choice.
+
+### Repeated at milestone M2: HNSW, vknn, and the Eon cluster
+
+VM as above (Vertica 26.2.0-1), `scripts/benchmark.sh` of 2026-09-23: the
+same shapes on the HNSW index `sift_hnsw` (SIFT1M, m 16, ef_construction 200,
+precision fast = ef_search 32), next to the flat index `sift`. Medians in ms,
+client / server.
+
+| Statement shape | Fenced | Unfenced | Mixed |
+|---|---:|---:|---:|
+| `SELECT 1` | 0.83 / 0.68 | 0.81 / 0.67 | 0.81 / 0.66 |
+| flat, `FROM sift_snap` | 12.38 / 7.99 | 5.08 / 4.36 | 5.13 / 4.39 |
+| flat, `FROM sift_delta`, empty delta | 13.55 / 8.87 | 6.26 / 5.24 | 6.24 / 5.21 |
+| HNSW, `FROM sift_hnsw_snap` | 7.80 / 4.42 | 1.93 / 1.47 | 1.88 / 1.45 |
+| HNSW, `FROM dual` | 7.71 / 4.39 | 1.66 / 1.29 | 1.74 / 1.35 |
+| HNSW, `FROM sift_hnsw_delta`, empty delta | 8.86 / 5.24 | 2.69 / 2.08 | 2.68 / 2.06 |
+| `vknn`, `query` parameter, `FROM dual` | 7.76 / 3.73 | 1.45 / 1.06 | 1.43 / 1.04 |
+| `vknn` on the query row of a table | 7.94 / 3.91 | 1.61 / 1.16 | 1.58 / 1.13 |
+
+The HNSW search itself takes 0.05 ms (engine, one call at ef 32); the rest of
+the 1.9 ms statement is Vertica: 0.8 ms for any statement, about 0.3 ms for a
+transform function, about 0.5 ms for vsearch's setup, cache check and output,
+and 0.1 to 0.3 ms for the `_snap` view against `FROM dual`. Fenced adds about
+6 ms, as for the flat index.
+
+Batches (one statement, 1000 queries of the SIFT1M query set, median of 3):
+
+| Statement | Fenced | Unfenced | Mixed |
+|---|---:|---:|---:|
+| vsearch flat | 1076 ms | 1076 ms | 1098 ms |
+| vsearch HNSW, precision fast | 22 ms | 13 ms | 12 ms |
+| vsearch HNSW, precision balanced | 35 ms | 25 ms | 25 ms |
+| vknn HNSW, precision fast (1000 rows) | 71 ms | 55 ms | 55 ms |
+
+Recall@10 against the ground truth (1000 queries): flat 0.9994; HNSW fast
+0.8926, balanced 0.9804, best 0.9987, exact 0.9994. `tests/sql/test_hnsw.sh
+--sift=VVBENCH` asserts balanced >= 0.95 (it measured 0.9793 on its own build:
+every parallel build gives a slightly different graph).
+
+Eon cluster: 3 nodes, x86_64 with AVX-512, 2 cores and 15 GB per node,
+Vertica 26.2.0-2; HNSW index of 100,000 random vectors of 128 dimensions
+(l2), journal partitioned by version date and segmented by id. Medians in ms,
+client / server, 200 runs.
+
+| Statement shape | Fenced | Mixed | Fenced, replicated journal | Mixed, replicated journal |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 2.96 / 1.99 | 2.69 / 1.72 | 2.71 / 1.73 | 2.74 / 1.78 |
+| `vversion() OVER()` | 10.02 / 6.42 | 3.63 / 2.35 | | |
+| `FROM lat_snap` | 12.75 / 8.13 | 7.55 / 5.34 | 12.72 / 8.13 | 7.76 / 5.42 |
+| `FROM dual` | 12.45 / 8.00 | 7.36 / 5.27 | | |
+| `FROM lat_delta`, empty delta | 27.87 / 21.86 | 24.18 / 20.60 | 16.11 / 10.56 | 11.93 / 8.08 |
+| same with 1000 journal rows | 38.84 / 32.62 | 33.05 / 29.43 | 22.04 / 16.12 | 15.01 / 11.63 |
+| `vknn`, `FROM dual` | 12.05 / 6.81 | 5.87 / 3.74 | | |
+| `vknn` on a query row | 14.41 / 9.05 | 8.66 / 6.24 | | |
+
+The p99 on the cluster is noisy (up to 5 to 10 times the median on some
+shapes): the nodes are small and shared.
+
+Levers repeated at M2:
+
+| Lever | Result |
+|---|---|
+| 3. No gather across nodes | On the cluster the empty delta cost 15 to 17 ms more than `_snap`: EXPLAIN shows the journal scanned on every node and sent to the initiator (Send/Recv) even when no row qualifies. A replicated (UNSEGMENTED ALL NODES) projection of the journal, ordered by the version column, refreshed with `REFRESH('table')`, and `ANALYZE_STATISTICS('table')` afterwards: the planner then reads that projection on the initiator only ("Execute on: Query Initiator") and the empty delta costs 4 ms (mixed) instead of 17 ms; 1000 journal rows 7 ms instead of 25 ms. Without fresh statistics the planner kept the segmented projection. Cost: every node stores the whole journal (81 MB per node for 100k x 128, against 27 MB segmented) and every load writes to all nodes. Documented in the README as an option; the deploy does not create it |
+| 7. Lightest function shape | `vknn` (exploder, no OVER(), no view) is the fastest single search: 1.43 ms against 1.88 ms for vsearch `_snap` on the VM (mixed), 5.9 against 7.6 ms on the cluster. Fenced there is little gain (the fenced call dominates). It has no stale check and no journal, and in batches it is 3 to 4 times slower than vsearch (row by row against one batch on all cores). Kept as the lightest single-search shape; vsearch stays the exact and the batch path |
 
 ## Refresh cost
 
@@ -317,3 +381,9 @@ back (4.5 s). The consolidation of the whole journal on every refresh is what
 the incremental refresh of milestone M3 removes: it reads only the changed rows.
 The row transfer into the fenced process is 2.3 times slower than unfenced;
 vbuild stays fenced in `FENCED=mixed` because a crash there would take the node.
+
+At M2 (benchmark.sh, fenced): flat `refresh_index` 11.2 s (vbuild statement
+8.1 s, vload 1.7 s; the M1 run measured 9.4 s: the VM varies by this much
+between runs). HNSW `refresh_index` 45.6 s: the vbuild statement 41.9 s, of
+which the graph build is about 34 s (8 threads, `make bench`), and vload 1.9 s
+(write 631 MB, verify the checksum and every link of the graph).

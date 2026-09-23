@@ -170,3 +170,28 @@ Check again on other versions.
   expression with operator <> is not supported"). Window functions (LAG, LEAD) do the same job.
 - A view without FROM (`CREATE VIEW v AS SELECT NULL::INT AS qid, ..., 21 AS snapshot_id`) is
   allowed and is a valid input of a transform function: the `_snap` view.
+
+## Verified in milestone M2 (26.2.0-1 single node and 26.2.0-2 3-node Eon, 2026-09-23)
+- SDK, exploder (`isExploder = true`, used by vknn): the rows a transform function writes before it
+  calls `in.next()` are paired with the columns of the current input row that are selected beside
+  the function (`SELECT q.qid, vvector.vknn(q.qvec ...) FROM q`: every output row carries the qid
+  of its input row). An input row for which the function writes nothing does not appear in the
+  result. Vertica runs several instances in parallel, on every node that holds input rows. Works
+  fenced and unfenced, on one node and on 3 nodes.
+- `target_clones` works in a library loaded by Vertica: on an x86 node with AVX-512 the kernels
+  resolve to the `avx512f` clone inside the Vertica process (vversion reports `kernels=avx512f`),
+  fenced and unfenced.
+- Eon, 3 nodes: a transform function with `OVER()` over the delta view (journal rows `WHERE ver >
+  literal` UNION ALL one sentinel row) scans the journal on every node and sends the rows to the
+  initiator (EXPLAIN: `Send`/`Recv` below the function), also when no journal row qualifies. That
+  exchange costs about 15 ms per statement on the test cluster (1.1 ms on one node for the
+  whole delta read). Over the `_snap` view (no FROM) or `FROM dual` there is no exchange.
+- Eon: a projection added to a table that already has data is not used until it is refreshed:
+  `CREATE PROJECTION` prints "WARNING 4468: Projection ... is not available for query processing.
+  Execute the select start_refresh() function to copy data into this projection."
+- Eon, 3 nodes: an UNSEGMENTED ALL NODES projection of the journal, ordered by the version column,
+  removes that exchange, but only after two steps: `SELECT REFRESH('schema.table');` (synchronous;
+  3 s for 100k rows of 128 FLOAT) fills it, and `SELECT ANALYZE_STATISTICS('schema.table');` makes
+  the planner choose it. Before the statistics the planner kept the segmented projection. Then
+  EXPLAIN shows the scan with "Execute on: Query Initiator" and no Send/Recv; the empty delta costs
+  about 4 ms instead of 17 ms. `v_monitor.projection_storage` lists the full copy on every node.
