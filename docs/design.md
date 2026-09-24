@@ -65,7 +65,10 @@ milliseconds (below).
   per-thread top-k lists are merged; with many queries (or a large k) the
   queries are split. A tile of about 256 KB of rows stays in the L2 cache
   while every group of 4 queries is scored against it, so each row is read
-  from memory once per tile, not once per query.
+  from memory once per tile, not once per query. A row whose key cannot enter
+  the full top-k list is dropped before its id is read (milestone M6: 4 to 5%
+  more queries per second in batches on the 4-node cluster's x86 nodes, 3%
+  less time for one query on 10 threads; SIFT1M, the same results).
 - Journal overlay: vsearch keeps the latest journal row per id (a delete wins
   a version tie), masks those ids in the snapshot with a bitset, and searches
   the live journal vectors with the same kernels beside the snapshot.
@@ -1042,6 +1045,48 @@ SIFT1M: HNSW ef 100 3,853 against 3,953 q/s on one thread (+2.6%), 34,912 agains
 the HNSW search waits for memory, so the wider registers help little there. On this node
 vvector and hnswlib (built with -march=native, AVX-512) are equal: the build took 52 s and 51 s.
 
+### Repeated at milestone M6 (Vertica 26.2.0-3, the 4-node cluster; the VM)
+
+The whole breakdown of "Where a single query spends its time", on the 4-node Enterprise cluster
+(x86_64, AVX-512, 10 cores and 78 GB per node), SIFT1M indexes `sift` (flat) and `sift_hnsw`
+(balanced), journal replica present (the default there), `scripts/latency.sh`, 200 runs. Client
+median in ms (server median in brackets):
+
+| Statement shape | Fenced | Unfenced | Mixed | What it adds (mixed) |
+|---|---:|---:|---:|---|
+| `SELECT 1` | 3.53 (1.69) | 3.19 (1.63) | 3.25 (1.60) | round trip, parse, plan on a 4-node cluster |
+| `vversion() OVER()` | 12.93 (7.04) | 4.47 (2.39) | 4.27 (2.31) | a transform function: 1 ms; fenced 9 ms |
+| vsearch, 16-vector index | 14.06 (7.29) | 5.96 (3.30) | 6.15 (3.42) | vsearch setup, parameters, cache check: 1.9 ms |
+| HNSW `FROM sift_hnsw_snap` | 13.80 (7.73) | 6.67 (3.98) | 6.60 (3.90) | the HNSW search: 0.5 ms |
+| HNSW `FROM dual` | 14.12 (8.06) | 6.68 (4.20) | 6.29 (3.50) | the view: within the noise |
+| HNSW `_delta`, empty delta | 18.73 (11.54) | 9.63 (6.09) | 9.61 (6.12) | reading the journal replica: 3 ms |
+| HNSW `_delta`, 1000 journal rows | 35.12 (25.84) | 16.55 (12.81) | 16.57 (12.72) | 1000 rows of 128 numbers: 7 ms |
+| `vknn ... FROM dual` | 14.20 (7.40) | 5.69 (3.14) | 5.99 (3.47) | the lightest shape |
+| `vknn` on a query row | 13.59 (7.12) | 6.10 (3.42) | 6.06 (3.24) | |
+| flat `FROM sift_snap` | 20.93 (15.29) | 15.76 (12.64) | 15.24 (12.08) | a scan of 1M vectors on 10 threads: 9 ms |
+| flat, query as an ARRAY literal | 45.10 (30.46) | 37.61 (25.44) | 37.86 (24.92) | Vertica parsing a 128-number literal: 23 ms |
+| flat `_delta`, empty delta | 24.18 (17.73) | 18.82 (14.88) | 18.46 (14.57) | |
+| flat `_delta`, 1000 journal rows | 30.55 (23.60) | 22.70 (18.56) | 22.32 (18.26) | |
+| flat, `threads=1` | 107.81 (95.83) | 92.17 (86.13) | 92.29 (86.49) | one thread instead of ten |
+
+First search of a new session (HNSW `_snap`, client ms, 20 sessions, first / second statement):
+fenced 41.8 / 18.3, unfenced 13.4 / 7.7, mixed 12.7 / 7.7; `vknn` fenced 41.0 / 14.9, mixed 7.2 /
+5.8. Fenced, the new session starts its own fenced process and maps the index.
+
+Against milestone M4 on the same cluster (HNSW `_snap` 13.3 fenced / 6.4 mixed, empty delta 17.3 /
+9.2, `SELECT 1` 3.8 / 3.4) nothing changed beyond the noise: milestone M6 did not touch the query
+path except the owner check when a cache file is first mapped. What the cluster adds against the VM:
+2.4 ms for any statement, 1 ms instead of 0.3 ms for a transform function, and 23 ms instead of 7 ms
+for an ARRAY literal (use the `query` parameter or a query row from a table). Filtered and range
+search on this cluster (mixed, 20 runs, `scripts/benchmark.sh`): allow-list of 100 / 10,000 /
+100,000 ids from an unsegmented table 9.9 / 14.8 / 43.1 ms, from a segmented table 33.3 / 46.6 /
+68.0 ms; range search (k 16384, the radius of the 10th neighbour) 8.1 ms.
+
+The VM at M6 (Vertica 26.2.0-1, the definition-of-done run of `scripts/benchmark.sh` on 1M
+generated vectors of 128 dimensions, server medians): HNSW `_snap` 4.40 ms fenced, 1.64 ms
+unfenced and mixed, `vknn` 1.20 ms mixed; 1000 queries at balanced 32 ms fenced / 21 ms mixed; the engine
+tests on SIFT1M gave 49,400 queries/s (float) and 72,600 (sq8) at ef 100, as at M4.
+
 ### 10 million vectors (milestone M4, the 4-node cluster)
 
 The first 10M vectors of BIGANN (SIFT1B, 128 dimensions, uint8 values converted to float) with its
@@ -1110,3 +1155,57 @@ second for the consolidation and 67 million per second for the digest on this cl
 journal the verification is most of a refresh that changes little; `verify_every` N does it at every
 Nth refresh. For a journal that keeps growing, the consolidated journal (one row per id) is the
 compaction candidate of milestone M7.
+
+### 768 and 1536 dimensions (milestone M6, the 4-node cluster)
+
+Embedding models give 768 or 1536 numbers per vector. No public set of that size with ground truth
+was used (decision of 2026-09-24); the data is generated: 1,000,000 vectors of Gaussian clusters
+(`scripts/scale.sh --generate=768` and `--generate=1536`, seeded), 1000 queries from the same
+distribution, metric cosine, recall@10 against the exact search of the flat index. HNSW m 16,
+ef_construction 200, fenced build, caches on the second data disk through the index option
+`cache_dir`, one journal (all rows the same day). Vertica 26.2.0-3, 4 nodes, 10 cores each.
+
+| 768 dimensions | flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot, cache file per node | 2,937 MB | 3,072 MB | 3,808 MB |
+| full refresh (vbuild / vload) | 100 s (49 / 42) | 197 s (163 / 28) | 218 s (171 / 43) |
+| incremental, 1000 adds + 500 deletes (vbuild / vload) | 77 s (38 / 36) | 82 s (42 / 36) | 89 s (47 / 38) |
+| refresh with nothing changed (journal verified) | 2.9 s | 2.7 s | 2.9 s |
+| recall@10 fast / balanced / best | 1.0000 | 0.8075 / 0.9714 / 0.9977 | 0.6943 / 0.9330 / 0.9920 |
+| one search, client ms median, fenced / mixed | 82.0 / 75.9 | 21.7 / 13.2 | 22.8 / 12.8 |
+| vknn, client ms median, fenced / mixed | | 19.5 / 9.7 | 18.6 / 9.5 |
+| 1000 queries, balanced, fenced / mixed | 7.1 s / 7.1 s | 159 / 110 ms | 111 / 61 ms |
+
+| 1536 dimensions | flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot, cache file per node | 5,867 MB | 6,001 MB | 7,470 MB |
+| full refresh (vbuild / vload) | 172 s (111 / 57) | 360 s (303 / 53) | 384 s (321 / 59) |
+| incremental, 1000 adds + 500 deletes (vbuild / vload) | 130 s (67 / 58) | 130 s (68 / 57) | 156 s (84 / 67) |
+| refresh with nothing changed (journal verified) | 3.6 s | 3.5 s | 3.7 s |
+| recall@10 fast / balanced / best | 1.0000 | 0.8021 / 0.9602 / 0.9988 | 0.7056 / 0.9310 / 0.9962 |
+| one search, client ms median, fenced / mixed | 117.0 / 111.6 | 30.4 / 19.9 | 30.3 / 19.7 |
+| vknn, client ms median, fenced / mixed | | 25.4 / 14.2 | 23.7 / 13.3 |
+| 1000 queries, balanced, fenced / mixed | 15.1 s / 15.0 s | 254 / 167 ms | 173 / 103 ms |
+
+What the numbers say:
+- The float rows are most of every file (the graph is 135 MB at any dimension); sq8 adds a quarter.
+  Build memory and the page cache were no problem: 71 GB per node stayed available.
+- A flat search reads the whole file once per query: 76 ms for 2.9 GB, 112 ms for 5.7 GB, which is
+  the memory bandwidth of the node. HNSW reads a few thousand rows: 13 and 20 ms mixed, against
+  6.4 ms for 1M vectors of 128 dimensions on this cluster (most of that is the statement).
+- sq8 halves the time of a batch but loses more recall on these vectors than on SIFT (balanced 0.93
+  against 0.97 for the float index; SIFT: 0.979 against 0.980). The likely reason: sq8 uses one
+  value range for all elements, and the elements of these unit-length vectors differ little, so a
+  code step is large against the differences between near neighbours. `precision='best'`
+  (4 x k rescored) gives 0.992 and 0.996 and is no slower than the float index at balanced;
+  measure recall on your own vectors before choosing sq8 at these sizes (README, int8 quantisation).
+- The HNSW build takes 163 s at 768 and 303 s at 1536 dimensions: the distance computations grow
+  with the dimension, the number of them does not.
+- An incremental refresh stores and loads the whole file: at 1536 dimensions about 60 s of vbuild
+  statement and 57 s of vload (the disk writes about 100 MB/s), for 1000 changed vectors. This is
+  the fixed cost that the incremental transfer of milestone M7 (only the changed chunks move) removes.
+- The empty delta costs 35 to 44 ms more than `_snap`: the journals (3 GB and 6 GB) are above the
+  journal replica limit and all rows are in one day's partition, as in the 10M test.
+- A cache file that no query has touched since its load is the first thing the kernel drops when
+  Vertica writes: after the three 1536 builds, vinfo showed 1.5 to 2.4 GB of the 5.7 GB flat file
+  resident; the first flat search then read the rest from disk.

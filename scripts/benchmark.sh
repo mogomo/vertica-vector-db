@@ -13,7 +13,7 @@
 #   --modes      deploy modes to measure (FENCED=yes|no|mixed); deploys fenced again at the end
 #   --runs       repetitions of each single-query statement (scripts/latency.sh)
 #   --skip_load  keep the tables loaded by an earlier run
-#   --parts      what to run, default all: engine,refresh,incremental,search,recall
+#   --parts      what to run, default all: engine,refresh,incremental,search,recall,memory
 #
 #   --hnswlib    a clone of github.com/nmslib/hnswlib: the engine benchmark also runs hnswlib
 #
@@ -24,9 +24,12 @@
 # of the change (a flat and an HNSW index on a copy of the first 900,000 vectors, changes of 0 to
 # 50,000 adds plus half as many deletes, then a full build for comparison); per mode: the SQL full scan of one
 # query (ORDER BY VECTOR_L2 LIMIT 10), the single-query shapes of scripts/latency.sh on the three
-# indexes (vsearch and vknn), batches of queries in one statement, and recall@10 against the
-# ground truth (flat, and HNSW with and without sq8 at every precision level). Prints the results;
-# also saved to build/benchmark-<date>.txt.
+# indexes (vsearch and vknn), filtered search (allow-lists of 100, 10,000 and 100,000 ids from an
+# unsegmented and a segmented table) and range search on the HNSW index, batches of queries in one
+# statement, and recall@10 against the ground truth (flat, and HNSW with and without sq8 at every
+# precision level); memory: the size of each cache file and how much of it is resident in memory on
+# every node (vinfo resident_mb), and the cache directory. Prints the results; also saved to
+# build/benchmark-<date>.txt.
 # Needs make and a deployed library (it runs make tools itself for generated data). Creates schema
 # VVBENCH (tables sift_* or gen_*) and the three indexes (the incremental part makes and drops
 # <data>_inc, <data>_inc_f and <data>_inc_h). The indexes are registered with margin 0: the data is
@@ -36,7 +39,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DATA_DIR= SCHEMA=VVBENCH MODES=yes,no,mixed RUNS=200 BATCH=1000 SKIP_LOAD=no HNSWLIB= ECHO_ONLY=no PARTS=engine,refresh,incremental,search,recall
+DATA_DIR= SCHEMA=VVBENCH MODES=yes,no,mixed RUNS=200 BATCH=1000 SKIP_LOAD=no HNSWLIB= ECHO_ONLY=no PARTS=engine,refresh,incremental,search,recall,memory
 for arg in "$@"; do
     case "$arg" in
         --data_dir=*) DATA_DIR="${arg#*=}" ;;
@@ -48,7 +51,7 @@ for arg in "$@"; do
         --hnswlib=*)  HNSWLIB="${arg#*=}" ;;
         --parts=*)    PARTS="${arg#*=}" ;;
         --echo_only)  ECHO_ONLY=yes ;;
-        -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,37p' "$0"; exit 0 ;;
         *) echo "benchmark.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -68,7 +71,8 @@ if [ "$ECHO_ONLY" = yes ]; then
     echo "CALL vvector.register_index('$QX', '$SCHEMA.${DS}_base', 'id', 'vec', 'del', 'ts', 'l2', 0, 'hnsw'); CALL vvector.set_index_options('$QX', NULL, NULL, NULL, 'sq8', ...); CALL vvector.refresh_index('$QX');"
     echo "make bench${DATA_DIR:+ DATA_DIR=$DATA_DIR}${HNSWLIB:+ HNSWLIB_DIR=$HNSWLIB}"
     echo "incremental: $SCHEMA.${DS}_inc = first 900000 rows of ${DS}_base; indexes ${DS}_inc_f (flat), ${DS}_inc_h (hnsw); changes of 0, 100, 1000, 10000, 50000 adds and half as many deletes; refresh_index after each; refresh_index(..., 'full')"
-    for m in ${MODES//,/ }; do echo "scripts/deploy.sh --fenced=$m; full scan; scripts/latency.sh --index=$IX, --index=$HX and --index=$QX --schema=$SCHEMA --runs=$RUNS; batches of $BATCH; recall@10"; done
+    for m in ${MODES//,/ }; do echo "scripts/deploy.sh --fenced=$m; full scan; scripts/latency.sh --index=$IX, --index=$HX (also filter and range shapes) and --index=$QX --schema=$SCHEMA --runs=$RUNS; batches of $BATCH; recall@10"; done
+    echo "memory: SELECT node_name, index_name, resident_mb, cache_file FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) i"
     exit 0
 fi
 mkdir -p build
@@ -200,6 +204,9 @@ part search && for m in ${MODES//,/ }; do
     scripts/latency.sh --index="$IX" --schema="$SCHEMA" --runs="$RUNS" --shapes=select1,vversion,snap,delta0,threads1 2>&1 | grep -v NOTICE
     echo "HNSW index $HX (precision balanced, the default):"
     scripts/latency.sh --index="$HX" --schema="$SCHEMA" --runs="$RUNS" --shapes=snap,dual,delta0,vknn,vknnrow 2>&1 | grep -v NOTICE
+    echo "HNSW index $HX, filtered search (allow-list of 100, 10,000, 100,000 ids; seg = from a segmented table) and range search (radius of the 10th neighbour):"
+    scripts/latency.sh --index="$HX" --schema="$SCHEMA" --runs="$RUNS" \
+        --shapes=filter100,filter10k,filter100k,filter100seg,filter10kseg,filter100kseg,range10 2>&1 | grep -v NOTICE
     echo "HNSW index with sq8 codes $QX (precision balanced: 2 x k rescored):"
     scripts/latency.sh --index="$QX" --schema="$SCHEMA" --runs="$RUNS" --shapes=snap,vknn 2>&1 | grep -v NOTICE
     batch() {   # LABEL WHAT SQL
@@ -242,6 +249,15 @@ recall() {   # WHAT INDEX PARAMS
 recall "flat index (exact)" "$IX" ""
 for p in fast balanced best exact; do recall "HNSW index, precision $p" "$HX" ", precision='$p'"; done
 for p in fast balanced best; do recall "HNSW index with sq8, precision $p" "$QX" ", precision='$p'"; done
+fi
+
+if part memory; then
+echo; echo "== memory: cache file size and resident part per node (vinfo resident_mb, after the searches)"
+sql "SELECT RPAD(i.index_name, 12) || ' ' || RPAD(i.node_name, 20) || LPAD((m.index_bytes // 1048576)::VARCHAR, 8) || ' MB file'
+            || LPAD(i.resident_mb::VARCHAR, 8) || ' MB resident   ' || REGEXP_REPLACE(i.cache_file, '/[^/]+/[^/]+$', '')
+     FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) i
+     JOIN vvector.manifest m ON m.index_name = i.index_name AND m.active_snapshot = i.snapshot_id
+     WHERE i.index_name IN ('$IX', '$HX', '$QX') ORDER BY 1"
 fi
 scripts/deploy.sh --fenced=yes > /dev/null 2>&1
 echo; echo "saved to $OUT"

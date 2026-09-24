@@ -40,9 +40,11 @@ inline void offer_all(Heap &h, const FlatSearch &s, const RowBlock &b, std::uint
 {
     for (std::uint64_t i = 0; i < n; ++i) {
         const float key = keys[i];
+        const bool full = h.size == h.cap;
+        if (full && !(key <= h.d[0].key)) continue;           // most rows stop here, before the id is read
         const std::uint64_t row = first + i;
         const std::int64_t id = b.ids ? b.ids[row] : static_cast<std::int64_t>(row);
-        if (h.size == h.cap && !(key < h.d[0].key || (key == h.d[0].key && id < h.d[0].id))) continue;
+        if (full && key == h.d[0].key && !(id < h.d[0].id)) continue;
         if (b.skip && (b.skip[row >> 6] >> (row & 63) & 1u)) continue;
         offer(h, s, key, id);
     }

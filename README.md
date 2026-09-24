@@ -1161,6 +1161,13 @@ threads, 10,000 queries; `make test DATA_DIR=...`.) Through SQL, recall@10 of
 1000 queries: fast 0.884, balanced 0.979, best 0.999, against 0.892, 0.980
 and 0.999 without sq8.
 
+On generated vectors of 768 and 1536 dimensions (metric cosine, 1M vectors)
+sq8 lost more: balanced 0.933 and 0.931 against 0.971 and 0.960 without
+codes; `precision='best'` gave 0.992 and 0.996 and was no slower than the
+float index at balanced. Measure the recall on your own vectors (the query in
+[Precision, ef_search and exact search](#precision-ef_search-and-exact-search-on-an-hnsw-index))
+before you choose sq8 for high dimensions.
+
 Use it when the index is large and searches read much memory (flat indexes,
 large batches, high dimensions). The codes do not replace the float vectors,
 they come in addition: 1M x 128 grows from 631 MB to 757 MB as an HNSW
@@ -1379,7 +1386,13 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   scans go through the same cache, so a large scan can push index pages out;
   the next search then reads them from disk (on the test VM: one search of
   0.3 s for a 632 MB index, then normal speed; at 100M vectors a minute or
-  more). Two ways to keep an index in memory, both with `cache_dir` on a RAM
+  more). A search reads the file on one node only, in the tests the node the
+  client was connected to: on the 4-node test cluster, after a benchmark
+  whose sessions all used node 1, the indexes were fully resident there and
+  100 to 200 MB of 630 MB on the other nodes. Spread
+  the clients over the nodes you want warm, or expect the first searches on
+  a cold node to read from disk.
+  Two ways to keep an index in memory, both with `cache_dir` on a RAM
   file system: `/dev/shm` (no setup; the memory is taken for good, and
   after a reboot the cache is empty until `load_all`), or a tmpfs mounted
   with huge pages, which is also faster (a root step on every node, for
@@ -1547,7 +1560,8 @@ Measured on the test VM: Vertica 26.2.0-1, one node, aarch64, 8 cores, 34 GB,
 g++ 11.5 (milestone M4, 2026-09-24). Data: SIFT1M (1,000,000 vectors of 128
 dimensions, 10,000 queries with ground truth, TEXMEX corpus), metric l2,
 k = 10. HNSW with m = 16, ef_construction = 200. Three numbers, reported
-separately.
+separately. Repeated at milestone M6 (the engine tests on SIFT1M and the
+definition-of-done benchmark): the same within the noise.
 
 **Engine alone** (`make bench DATA_DIR=...`, no Vertica, all 10,000 queries):
 
@@ -1608,8 +1622,11 @@ statement, so sq8 changes little for single searches and much for batches.
 On the 4-node Enterprise test cluster (x86_64 with AVX-512, 10 cores and 78 GB
 per node, Vertica 26.2.0-3, g++ 8.5; SIFT1M as above, loaded on all 4 nodes) a
 statement costs more, the engine is slower per core and hnswlib and vvector
-are equal there: `SELECT 1` 3.4 to 3.8 ms; HNSW `_snap` 13.3 ms fenced and 6.4
-ms mixed, with sq8 14.4 and 6.1 ms; `vknn` 13.5 and 6.0 ms. One statement with
+are equal there: `SELECT 1` 3.3 to 3.5 ms; HNSW `_snap` 13.8 ms fenced and 6.6
+ms mixed (milestone M6; 13.3 and 6.4 at M4), with sq8 14.4 and 6.1 ms; `vknn`
+14.2 and 6.0 ms; the first search of a new session 42 ms fenced and 13 ms
+mixed; an ARRAY literal instead of the `query` parameter costs 23 ms more
+there. One statement with
 1000 queries at precision balanced: 49 ms mixed, 34 ms with sq8. Engine, 10
 threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
 Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
@@ -1621,26 +1638,54 @@ fenced and 7.1 ms mixed; filtered searches: see
 [Filtered search](#filtered-search).
 
 **10 million vectors** (the first 10M of BIGANN / SIFT1B, 128 dimensions, with
-its ground truth for 10M; the 4-node cluster, 1000 queries; measured at
-milestone M4, before the snapshot table was segmented, which makes refreshes
-shorter):
+its ground truth for 10M; the 4-node cluster, 1000 queries; milestone M6:
+fenced build in memory, cache files on a second data disk of each node
+through the index option `cache_dir`):
 
 | Measurement | Flat | HNSW | HNSW with sq8 |
 |---|---:|---:|---:|
 | snapshot, cache file per node | 4.8 GB | 6.2 GB | 7.4 GB |
-| full build (`refresh_index`) | 123 s | 885 s | 939 s |
-| incremental refresh, 1000 adds and 500 deletes | 99 s | 146 s | 194 s |
-| recall@10 fast / balanced / best | 1.000 (exact) | 0.825 / 0.953 / 0.994 | 0.817 / 0.953 / 0.994 |
-| one search, mixed (client ms) | 89 ms | 6.8 ms | 6.3 ms |
-| 1000 queries in one statement, balanced, mixed | 17.6 s | 53 ms | 40 ms |
+| full build (`refresh_index`; vbuild / vload) | 132 s (65 / 55) | 899 s (828 / 65) | 944 s (843 / 94) |
+| incremental refresh, 1000 adds and 500 deletes | 99 s | 144 s | 157 s |
+| recall@10 fast / balanced / best | 1.000 (exact) | 0.826 / 0.953 / 0.995 | 0.818 / 0.952 / 0.995 |
+| one search, fenced / mixed (client ms) | 92 / 87 ms | 14.4 / 7.0 ms | 15.1 / 6.3 ms |
+| 1000 queries in one statement, balanced, fenced / mixed | 17.7 / 17.6 s | 154 / 57 ms | 138 / 52 ms |
 
 At 10M a larger `ef_search` keeps the recall of 1M: 200 gives 0.983 (1000
 queries in 0.4 s). The incremental refresh is dominated by storing and loading
-the whole snapshot on every node. An exact search over the delta view read the
-10M-row journal on every node (33 ms instead of 7 ms): its rows were all loaded
-the same day, so partitioning by date could not skip any, and at 2.7 GB it is
-above the size the journal replica is made for; a journal partitioned by day
-reads only the recent partitions.
+the whole snapshot on every node; that disk writes 100 MB/s, so vload took
+longer than with the caches on the system disk (192 MB/s) at milestone M4.
+An exact search over the delta view read the 10M-row journal on every node
+(33 ms instead of 7 ms): its rows were all loaded the same day, so
+partitioning by date could not skip any, and at 2.7 GB it is above the size
+the journal replica is made for; a journal partitioned by day reads only the
+recent partitions.
+
+**768 and 1536 dimensions** (1M generated vectors of Gaussian clusters, the
+size of text embeddings, metric cosine, recall against the exact search; the
+4-node cluster, same build and cache setup as the 10M test):
+
+| Measurement | 768: HNSW | 768: HNSW with sq8 | 1536: HNSW | 1536: HNSW with sq8 |
+|---|---:|---:|---:|---:|
+| cache file per node (flat: 2.9 GB / 5.7 GB) | 3.0 GB | 3.7 GB | 5.9 GB | 7.3 GB |
+| full build (`refresh_index`) | 197 s | 218 s | 360 s | 384 s |
+| incremental refresh, 1000 adds and 500 deletes | 82 s | 89 s | 130 s | 156 s |
+| recall@10 fast / balanced / best | 0.808 / 0.971 / 0.998 | 0.694 / 0.933 / 0.992 | 0.802 / 0.960 / 0.999 | 0.706 / 0.931 / 0.996 |
+| one search, fenced / mixed (client ms) | 21.7 / 13.2 ms | 22.8 / 12.8 ms | 30.4 / 19.9 ms | 30.3 / 19.7 ms |
+| 1000 queries, balanced, fenced / mixed | 159 / 110 ms | 111 / 61 ms | 254 / 167 ms | 173 / 103 ms |
+
+A flat index answers one search in 76 ms (768) and 112 ms (1536) mixed: it
+reads the whole file per query. sq8 halves batch times but loses more recall
+here than on SIFT (see [int8 quantisation](#int8-quantisation-sq8)).
+
+**A journal of one billion rows** (10M ids written 100 times, 8 numbers per
+vector, partitioned by day; flat index; the 4-node cluster): full build 104 s
+(the latest row of each id out of 1B rows), delta read after one day of
+changes 75 ms, an exact search through it 274 ms, incremental refresh of that
+day 31 s with the journal verified (15 s of it the verification over 1B rows)
+and 20.5 s without, a refresh with no change 1.6 s unverified and 16 s
+verified. On a large journal set `verify_every` to N so the full check runs at
+every Nth refresh. Details: docs/design.md.
 
 On the 3-node Eon test cluster (x86_64, 2 cores and 15 GB per node, Vertica
 26.2.0-2; HNSW index of 100,000 random vectors of 128 dimensions) a statement
@@ -1675,6 +1720,13 @@ hnswlib comparison):
     curl -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz && tar xzf sift.tar.gz
     make && make tools && make deploy
     scripts/benchmark.sh --data_dir=$PWD/sift [--hnswlib=<a clone of github.com/nmslib/hnswlib>]
+
+Without `--data_dir` it generates 1M vectors of 128 dimensions and measures
+recall against the exact search. Besides the tables above it measures
+filtered search (allow-lists of 100 to 100,000 ids from an unsegmented and a
+segmented table), range search, and how much of each cache file is in memory
+on every node (`vinfo` `resident_mb`); `--parts` and `--modes` choose what to
+run, `--help` lists everything.
 
 **Scale tests.** `scripts/scale.sh` measures one data set end to end: loading,
 full builds of a flat, an HNSW and an HNSW index with sq8 (`vvector.sizing`

@@ -129,18 +129,18 @@ fi
 FENCING=$(vsql -X -A -t -c "SELECT CASE WHEN MIN(is_fenced::INT) = 1 THEN 'fenced' ELSE 'not fenced' END FROM v_catalog.user_functions WHERE schema_name = 'vvector' AND function_name = 'vsearch'")
 if [ "$FIRST" = yes ]; then
     n=$((RUNS / 10)); [ "$n" -lt 10 ] && n=10
-    printf "%-10s %10s %10s   %s\n" shape first_p50 second_p50 "(client ms, $n new sessions, vsearch $FENCING)"
+    printf "%-13s %10s %10s   %s\n" shape first_p50 second_p50 "(client ms, $n new sessions, vsearch $FENCING)"
     for s in ${SHAPES//,/ }; do
         stmt=$(statement "$s")
         for ((i = 0; i < n; i++)); do
             { echo '\timing on'; echo "$stmt"; echo "$stmt"; } | vsql -X -q -A -t 2>&1 |
                 sed -n 's/.*All rows formatted: \([0-9.]*\) ms.*/\1/p' | paste -sd' ' -
         done | awk '{f[NR]=$1; g[NR]=$2} END {n=asort(f); asort(g); printf "%.2f %.2f\n", f[int((n+1)/2)], g[int((n+1)/2)]}' |
-            { read -r a b; printf "%-10s %10s %10s\n" "$s" "$a" "$b"; }
+            { read -r a b; printf "%-13s %10s %10s\n" "$s" "$a" "$b"; }
     done
     exit 0
 fi
-printf "%-10s %10s %10s %10s %10s   %s\n" shape client_p50 client_p99 server_p50 server_p99 "(ms, $RUNS runs, vsearch $FENCING)"
+printf "%-13s %10s %10s %10s %10s   %s\n" shape client_p50 client_p99 server_p50 server_p99 "(ms, $RUNS runs, vsearch $FENCING)"
 for s in ${SHAPES//,/ }; do
     if [ "$s" = delta1000 ]; then
         # Writes 1000 rows into the index's journal and deletes them physically afterwards, also when
@@ -160,5 +160,5 @@ for s in ${SHAPES//,/ }; do
                                                    ROW_NUMBER() OVER(ORDER BY start_timestamp) AS n
                                             FROM v_monitor.query_requests WHERE request_label = '${TAG}_$s' AND success) r WHERE n > 5")
     if [ "$s" = delta1000 ]; then vsql -X -q -c "DELETE FROM $JT WHERE id >= 2000000000; COMMIT;" > /dev/null; trap - EXIT; fi
-    printf "%-10s %10s %10s %10s %10s\n" "$s" $client $server
+    printf "%-13s %10s %10s %10s %10s\n" "$s" $client $server
 done
