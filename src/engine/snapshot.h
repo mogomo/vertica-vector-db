@@ -97,6 +97,9 @@ struct VectorSet {
     bool dead(std::uint64_t i) const { return tombstone_bits && (tombstone_bits[i >> 6] >> (i & 63) & 1u); }
     // Position of id, or -1. Binary search over ids, or over id_index when present.
     std::int64_t find(std::int64_t id) const;
+    // out[i] = find(want[i]) for n ids in ascending order, in one pass: each search starts where the
+    // one before ended and gallops forward (for many ids far faster than n binary searches).
+    void find_sorted(const std::int64_t *want, std::uint64_t n, std::int64_t *out) const;
 };
 
 // Owning, zero-filled snapshot bytes, aligned to 4096 bytes. On Linux the memory is mapped

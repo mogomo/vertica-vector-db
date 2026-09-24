@@ -26,7 +26,10 @@
 #   threads1, threads2, threads4   the snap shape with threads=1, 2, 4: the engine's share
 #   vknn       vknn with the query parameter FROM dual: no OVER(), no view, no stale check
 #   vknnrow    vknn on the query row of the query table (qid = 0), beside its qid
-# Creates index vvlat_tiny in SCHEMA (kept for later runs).
+#   filter100, filter10k, filter100k   the snap shape with an allow-list of 100, 10,000 or 100,000
+#              ids (rows of SCHEMA.vvlat_allow; filtered search)
+#   range10    the snap shape with k 16384 and the radius of the query's 10th neighbour (range search)
+# Creates index vvlat_tiny and table vvlat_allow in SCHEMA (kept for later runs).
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -euo pipefail
 
@@ -42,7 +45,7 @@ for arg in "$@"; do
         --queries=*) QUERIES="${arg#*=}" ;;
         --first_call) FIRST=yes ;;
         --echo_only) ECHO_ONLY=yes ;;
-        -h|--help)   sed -n '2,31p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
         *) echo "latency.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -63,6 +66,16 @@ SQL
     vsql -X -q -v ON_ERROR_STOP=1 -c "CALL vvector.refresh_index('vvlat_tiny');" > /dev/null
 }
 
+# Every 10th id of the index (100,000 of SIFT1M's 1,000,000); the filter shapes take subsets.
+setup_allow() {
+    vsql -X -q -v ON_ERROR_STOP=1 <<SQL > /dev/null
+DROP TABLE IF EXISTS $SCHEMA.vvlat_allow;
+CREATE TABLE $SCHEMA.vvlat_allow AS
+SELECT id, CASE WHEN n % 1000 = 0 THEN 100 WHEN n % 10 = 0 THEN 10000 ELSE 100000 END AS size
+FROM (SELECT id, ROW_NUMBER() OVER(ORDER BY id) - 1 AS n FROM (SELECT DISTINCT id FROM $SRC) d) i WHERE n < 100000;
+SQL
+}
+
 Q=$(vsql -X -A -t -c "SELECT TO_JSON(qvec) FROM $QUERIES WHERE qid = 0" 2>/dev/null || echo "[0]")
 QROW="SELECT 0 AS qid, (ARRAY$Q)::ARRAY[FLOAT] AS qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id"
 V="qid, qvec, id, vec, del, ver, snapshot_id"
@@ -78,16 +91,26 @@ statement() {   # SHAPE -> one SQL statement
                    echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, freshness='exact') OVER() FROM $SCHEMA.${INDEX}_delta;" ;;
         vknn)      echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='$INDEX', query='$Q', k=10) FROM dual;" ;;
         vknnrow)   echo "SELECT /*+LABEL(${TAG}_$1)*/ q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='$INDEX', k=10) FROM $QUERIES q WHERE q.qid = 0;" ;;
+        filter100|filter10k|filter100k)
+                   local size=${1#filter}; size=${size/k/000}
+                   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${INDEX}_snap UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM $SCHEMA.vvlat_allow WHERE size <= $size) x;" ;;
+        range10)   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=16384, radius=$RADIUS) OVER() FROM $SCHEMA.${INDEX}_snap;" ;;
         threads*)  echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, threads=${1#threads}) OVER() FROM $SCHEMA.${INDEX}_snap;" ;;
     esac
 }
 
+RADIUS=1
+if [[ ",$SHAPES," == *,range10,* ]] && [ "$ECHO_ONLY" = no ]; then
+    RADIUS=$(vsql -X -A -t -c "SELECT score FROM (SELECT vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, exact=true) OVER()
+                                FROM $SCHEMA.${INDEX}_snap) r WHERE rank = 10")
+fi
 if [ "$ECHO_ONLY" = yes ]; then
     for s in ${SHAPES//,/ }; do statement "$s" | cut -c1-300; done
     exit 0
 fi
 
 [[ ",$SHAPES," == *,tiny,* ]] && setup_tiny
+[[ ",$SHAPES," == *,filter* ]] && setup_allow
 FENCING=$(vsql -X -A -t -c "SELECT CASE WHEN MIN(is_fenced::INT) = 1 THEN 'fenced' ELSE 'not fenced' END FROM v_catalog.user_functions WHERE schema_name = 'vvector' AND function_name = 'vsearch'")
 if [ "$FIRST" = yes ]; then
     n=$((RUNS / 10)); [ "$n" -lt 10 ] && n=10

@@ -173,8 +173,8 @@ expect "a query parameter of another length is refused" "index 'vs_l2' has 16 di
 expect "no query at all is refused" "no query: give the query parameter, or query rows (qid, qvec)" "$(search_sql vs_l2 "" "$SCHEMA.vs_l2_snap");"
 expect "a query row without qid is refused" "a query row has a vector (qvec) but no qid" "
 $(search_sql vs_l2 "" "(SELECT NULL::INT AS qid, qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id FROM $SCHEMA.queries WHERE qid = 1) x");"
-expect "an allow-list row says when filtered search comes" "allow-list rows (filtered search) are not implemented yet (milestone M5)" "
-$(search_sql vs_l2 "" "(SELECT qid, qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id FROM $SCHEMA.queries WHERE qid = 1 UNION ALL SELECT NULL, NULL, 5, NULL, NULL, NULL, NULL) x");"
+expect "an allow-list row limits the results to its id (filtered search: tests/sql/test_filter.sh)" "^rows 1, id 5$" "
+SELECT 'rows ' || COUNT(*) || ', id ' || MAX(id) FROM ($(search_sql vs_l2 "" "(SELECT qid, qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id FROM $SCHEMA.queries WHERE qid = 1 UNION ALL SELECT NULL, NULL, 5, NULL, NULL, NULL, NULL) x")) r;"
 expect "a journal vector of another length is refused" "the journal vector of id 5 has 2" "
 $(search_sql vs_l2 ", freshness='exact'" "(SELECT qid, qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id FROM $SCHEMA.queries WHERE qid = 1 UNION ALL SELECT NULL, NULL, 5, ARRAY[1.0, 2.0], FALSE, 1, NULL) x");"
 

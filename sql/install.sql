@@ -117,9 +117,23 @@ CREATE OR REPLACE TRANSFORM FUNCTION vvector.vknn     AS LANGUAGE 'C++' NAME 'VK
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vinfo    AS LANGUAGE 'C++' NAME 'VInfoFactory'    LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vversion AS LANGUAGE 'C++' NAME 'VVersionFactory' LIBRARY vvector :fenced_search;
 
+-- Vector functions (only those Vertica has no equivalent for), fenced like the search functions.
+CREATE OR REPLACE FUNCTION vvector.vector_add        AS LANGUAGE 'C++' NAME 'VectorAddFactory'       LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_sub        AS LANGUAGE 'C++' NAME 'VectorSubFactory'       LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_mul        AS LANGUAGE 'C++' NAME 'VectorMulFactory'       LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.scalar_vector_mul AS LANGUAGE 'C++' NAME 'ScalarVectorMulFactory' LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_normalize  AS LANGUAGE 'C++' NAME 'VectorNormalizeFactory' LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_l1         AS LANGUAGE 'C++' NAME 'VectorL1Factory'        LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_l2sq       AS LANGUAGE 'C++' NAME 'VectorL2sqFactory'      LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_hamming    AS LANGUAGE 'C++' NAME 'VectorHammingFactory'   LIBRARY vvector :fenced_search;
+CREATE OR REPLACE FUNCTION vvector.vector_jaccard    AS LANGUAGE 'C++' NAME 'VectorJaccardFactory'   LIBRARY vvector :fenced_search;
+-- vector_sum and vector_avg are transform functions: a C++ aggregate cannot read an ARRAY argument.
+CREATE OR REPLACE TRANSFORM FUNCTION vvector.vector_sum AS LANGUAGE 'C++' NAME 'VectorSumFactory' LIBRARY vvector :fenced_search;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector.vector_avg AS LANGUAGE 'C++' NAME 'VectorAvgFactory' LIBRARY vvector :fenced_search;
+
 -- Rights. GRANT and REVOKE cannot name a function with an ARRAY argument (Vertica 26.2: syntax error
 -- at "ARRAY"), so rights are given per schema:
---   vvector        vsearch, vknn, vinfo, vversion: everyone (PUBLIC). This also reaches the stored
+--   vvector        vsearch, vknn, vinfo, vversion and the vector functions: everyone (PUBLIC). This also reaches the stored
 --                  procedures, so procedures.sql revokes them again and grants them to vvector_admin.
 --   vvector_admin  vbuild, vload, vconfig, vnode: role vvector_admin only. vload and vconfig write
 --                  files on the nodes; vbuild with base_snapshot reads a whole snapshot from the node

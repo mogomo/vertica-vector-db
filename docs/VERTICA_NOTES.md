@@ -297,3 +297,23 @@ Check again on other versions.
 - On a 4-node Enterprise database the snapshot table (`UNSEGMENTED ALL NODES`) makes the fixed part
   of a refresh grow with the nodes: for a 580 MB snapshot the vbuild statement (which inserts
   the chunks) took 8.7 s and vload 5.4 s, against 2.2 to 3.9 s and 1.5 to 2 s on one node.
+
+## Verified in milestone M5 (26.2.0-1, single node, aarch64, 2026-09-24)
+
+- No arithmetic on arrays: `ARRAY[1.0, 2.0] + ARRAY[3.0, 4.0]` and `ARRAY[1.0, 2.0] * 2` fail with
+  "ERROR 4286: Operator does not exist: array[numeric] + array[numeric]". Built in and useful for
+  vectors: `APPLY_SUM(a)`, `APPLY_AVG(a)`, `APPLY_MAX(a)` (over the elements of one array),
+  `ARRAY_CAT`, `EXPLODE(a) OVER()`, `IMPLODE(x)`; text to array `'[1.5, 2]'::ARRAY[FLOAT]` and
+  `STRING_TO_ARRAY('[1.5,2]')::ARRAY[FLOAT]`; array to text `TO_JSON(a)` (`a::VARCHAR` fails: "ERROR
+  2366: Cannot cast type array[float] to varchar").
+- A C++ scalar function can return ARRAY[FLOAT]: `returnType.addArrayType(Float8OID)` in
+  getPrototype, `addArrayType(Field(<FLOAT type>, ""), name, maxElems)` in getReturnType, and
+  `BlockWriter::getArrayRef(0)` with `setFloat(0, x)`, `next()` per element and `commit()`. With a
+  prototype of ARRAY[FLOAT] arguments, ARRAY[INT] and ARRAY[NUMERIC] arguments are cast. For an
+  unbounded argument type `VerticaType::getArrayBound()` is 0; `getMaxSize()` is the byte bound.
+  A transform function returns arrays the same way through `PartitionWriter::getArrayRef`.
+- A C++ aggregate function cannot read an ARRAY argument: `BlockReader::getArrayRef` in
+  `aggregate()` crashed the server (SIGSEGV in the ArrayReader constructor, called from
+  `aggregateArrs`) on the first call. Aggregates always run inside the server:
+  `CREATE AGGREGATE FUNCTION ... FENCED` is a syntax error (ERROR 4856). The database had to be
+  restarted. vector_sum and vector_avg are therefore transform functions (fenced like vsearch).

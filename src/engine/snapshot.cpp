@@ -50,6 +50,31 @@ std::int64_t VectorSet::find(std::int64_t id) const
     return ids[pos] == id && !dead(pos) ? static_cast<std::int64_t>(pos) : -1;
 }
 
+void VectorSet::find_sorted(const std::int64_t *want, std::uint64_t n, std::int64_t *out) const
+{
+    auto key = [this](std::uint64_t i) { return ids[id_index ? id_index[i] : i]; };
+    std::uint64_t lo = 0;                                // every entry before lo is below the next id
+    for (std::uint64_t j = 0; j < n; ++j) {
+        const std::int64_t id = want[j];
+        std::uint64_t a = lo, b = lo, step = 1;
+        while (b < count && key(b) < id) {               // gallop: a moves past entries below id
+            a = b + 1;
+            b = a + step;
+            step <<= 1;
+        }
+        if (b > count) b = count;
+        while (a < b) {                                  // then binary search in [a, b)
+            const std::uint64_t mid = a + (b - a) / 2;
+            if (key(mid) < id) a = mid + 1;
+            else b = mid;
+        }
+        lo = a;
+        if (lo == count) { out[j] = -1; continue; }
+        const std::uint64_t pos = id_index ? id_index[lo] : lo;
+        out[j] = ids[pos] == id && !dead(pos) ? static_cast<std::int64_t>(pos) : -1;
+    }
+}
+
 // ---- SnapshotBuffer
 
 namespace {

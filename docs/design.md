@@ -200,6 +200,89 @@ stay: they are needed for rescoring and for `precision='exact'`.
 SIFT1M recall@10 through SQL (1000 queries, the VM): fast 0.8839, balanced 0.9797, best 0.9989;
 the float index: 0.8926, 0.9804, 0.9987. Rescoring 2 x k candidates loses 0.0007 of recall.
 
+## Filtered search and range search (milestone M5)
+
+**Filtered search.** Allow-list rows (id set, vec and del NULL) reach vsearch with the queries. It
+sorts their ids, drops repeats, finds their positions in the snapshot (ids that are not there are
+ignored) and removes the positions the journal or the tombstones mask. Journal rows count only
+when their id is allowed. Then one of two paths (src/engine/search.cpp):
+
+- *Exact*: the allowed rows are copied into one block (in parallel, into memory that is not
+  cleared first) and searched with the tiled flat kernels, the journal beside them. Cost: the
+  allowed rows.
+- *Masked*: every position outside the list joins the skip mask, and the search runs as without a
+  filter (graph or flat scan, float rows or sq8 codes). The graph walk passes through masked
+  nodes but keeps only allowed ones in its result list, so it walks until it has ef of them:
+  about ef x count / allowed nodes. ef is not raised further.
+
+The exact path is taken below max(10000, sqrt(64 x ef x count)) allowed rows: the two costs grow
+as allowed and as 1 / allowed, so they meet near sqrt(c x ef x count). The plan's first rule,
+max(10 x ef, 10000), was far too low: measured on SIFT1M (VM, 8 threads, ef 100, float; recall of
+the masked graph against the exact path; tests/engine/bench_filter.cpp):
+
+| filter | allowed | exact path, batch q/s | masked graph, batch q/s | recall | exact, 1 query ms | graph, 1 query ms |
+|---|---|---|---|---|---|---|
+| 0.01% | 89 | 831,049 | 17.1 | 1.0000 | 0.002 | 320.8 |
+| 0.1% | 998 | 205,978 | 130.7 | 1.0000 | 0.026 | 41.8 |
+| 1% | 9,919 | 75,687 | 911.6 | 1.0000 | 0.246 | 6.10 |
+| 2% | 19,782 | 40,641 | 1,610.7 | 1.0000 | 0.395 | 3.51 |
+| 5% | 50,167 | 16,498 | 3,486.7 | 0.9999 | 1.104 | 1.77 |
+| 10% | 100,612 | 8,303 | 6,377.8 | 0.9994 | 2.489 | 1.18 |
+| 20% | 200,066 | 4,564 | 11,595.8 | 0.9981 | 4.276 | 0.99 |
+| 50% | 500,657 | 1,770 | 24,430.0 | 0.9925 | 7.009 | 1.44 |
+
+A batch is 1000 queries in one call; a single query is one call. The paths meet at about 68,000
+allowed rows for single queries and 120,000 for batches; the rule gives 80,000 for this index
+(c = 64). With sq8 codes the graph is faster (1%: 1,288 q/s; 50%: 35,832 q/s), which moves the
+meeting point down by about a quarter; one rule serves both. Before the parallel copy the exact
+path of a single query took 4.8 ms at 5% (a serial copy into zero-filled memory). On the 4-node
+cluster's x86 nodes (10 threads) both paths are slower, but they meet at the same place: about
+67,000 allowed rows for one query and 95,000 for a batch.
+
+Through SQL (VM, index sift_hnsw, one query, median at the client over 100 runs; the allow-list
+rows come from a table; scripts/latency.sh shapes filter100, filter10k, filter100k):
+
+| statement | fenced | mixed |
+|---|---|---|
+| no filter (`_snap`) | 7.4 ms | 1.9 ms |
+| 100 allowed ids | 8.6 ms | 3.0 ms |
+| 10,000 allowed ids | 12.5 ms | 5.3 ms |
+| 100,000 allowed ids | 29.8 ms | 13.9 ms |
+
+The engine's part is under 1.5 ms in every row; the rest is Vertica reading the allow-list rows and
+passing them to vsearch (about 0.12 microseconds per row mixed, twice that fenced). Finding the
+allowed ids in the snapshot with one galloping pass over the sorted ids (`VectorSet::find_sorted`)
+instead of one binary search per id saved 3 ms at 100,000 ids.
+
+**Range search on HNSW.** Before M5 the graph search kept ef = max(ef_search, k) candidates and
+cut them by the radius: to get "everything within r" one set k large and paid a walk with a
+candidate list of k. Now, with a radius, the walk starts with the preset ef (fast: 32) and makes
+the list four times longer, up to k, while more than a quarter of the list is within the radius
+(hnsw.cpp `walk`). A walk cannot be resumed with a longer list (it has dropped what did not fit),
+so each step walks again from the start; with a factor of four the earlier steps cost at most a
+third of the last one. The quarter keeps the list at least four times the answer, where recall is
+high. SIFT1M, k 16384, 100 queries, radius = the median over the queries of their r-th neighbour
+distance (so the mean number within the radius is larger than r):
+
+| r | mean within the radius | growing walk q/s | list of k q/s | recall | flat q/s |
+|---|---|---|---|---|---|
+| 10 | 407 | 2,674 | 485 | 0.9999 | 639 |
+| 100 | 1,163 | 1,268 | 489 | 0.9999 | 618 |
+| 1000 | 3,846 | 687 | 494 | 0.9999 | 558 |
+
+On the x86 cluster nodes: 1,752 / 964 / 552 queries per second against 426 / 425 / 423. Through SQL
+the range statement (k 16384, a radius holding the query's 10 nearest) costs what a plain search
+costs: 7.3 ms fenced, 1.9 ms mixed.
+
+A first version doubled the list while the whole list was within the radius: recall on random l1
+data fell to 0.93 (the answers sat at the end of the list, where the walk is least complete), and
+restarting at every doubling cost up to twice the last walk.
+
+**Vector functions.** src/engine/vecmath.cpp computes in double, element by element in index
+order. A C++ aggregate cannot read an ARRAY argument in Vertica 26.2 (the server crashed in
+`BlockReader::getArrayRef` inside `aggregate()`; VERTICA_NOTES), so vector_sum and vector_avg are
+transform functions, which can also run fenced.
+
 ## vload on every node
 
 `vload(...) OVER(PARTITION NODES)` runs one function instance on every node

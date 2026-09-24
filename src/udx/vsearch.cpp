@@ -6,8 +6,12 @@
 // built-in function of the index metric returns (VECTOR_L2, COSINE_SIMILARITY, DOT_PRODUCT; l1: the
 // Manhattan distance); rank 1 is the closest; ties by id ascending.
 // Parameters: index_name, k, precision, freshness, ef_search, exact, radius, threads, query,
-// rescore, oversampling, cache_dir. Tuning values: function parameter, then session parameter,
-// then index default (set_index_options), then built-in default.
+// rescore, oversampling, filtered, cache_dir.
+// Filtered search: allow-list rows (id set, vec and del NULL) limit the results to their ids, the
+// journal's rows included. filtered=true limits them also when no allow-list row arrives (a filter
+// that matched nothing returns nothing, not the unfiltered result).
+// Tuning values: function parameter, then session parameter, then index default
+// (set_index_options), then built-in default.
 // On an HNSW index the precision levels are presets of ef_search (fast: max(2 x k, 32), balanced,
 // the default: 100, best: 400); precision exact or exact=true search every vector (flat).
 // Thin adapter: the search is src/engine/flat.h and src/engine/hnsw.h.
@@ -18,6 +22,7 @@
 #include "../engine/parallel.h"
 #include "../engine/text.h"
 
+#include <algorithm>
 #include <cstring>
 #include <unordered_map>
 
@@ -64,14 +69,15 @@ public:
 
     bool empty() const { return entries_.empty(); }
 
-    // Marks every journal id that is in the snapshot, and copies the live vectors out.
+    // Marks every journal id that is in the snapshot, and copies the live vectors out; with an
+    // allow-list (sorted ids, may be null) only those of allowed ids.
     void apply(const vvector::VectorSet &set, std::vector<std::uint64_t> &skip, std::vector<std::int64_t> &ids,
-               std::vector<float> &rows) const
+               std::vector<float> &rows, const std::vector<std::int64_t> *allow) const
     {
         for (const auto &x : entries_) {
             const std::int64_t pos = set.find(x.first);
             if (pos >= 0) skip[pos >> 6] |= 1ull << (pos & 63);
-            if (!x.second.del) {
+            if (!x.second.del && (!allow || std::binary_search(allow->begin(), allow->end(), x.first))) {
                 ids.push_back(x.first);
                 const float *src = rows_.data() + std::uint64_t(x.second.slot) * stride_;
                 rows.insert(rows.end(), src, src + stride_);
@@ -132,6 +138,7 @@ class VSearch : public TransformFunction
             }
 
             Journal journal(stride);
+            std::vector<std::int64_t> allow_ids;
             vint wanted_snapshot = -1, rows = 0;
             do {
                 if ((++rows & 0xFFFF) == 0 && isCanceled()) return;
@@ -156,9 +163,7 @@ class VSearch : public TransformFunction
                 if (in.isNull(COL_ID)) continue;                     // the sentinel
                 const vint id = in.getIntRef(COL_ID);
                 const bool has_vec = !in.isNull(COL_VEC), has_del = !in.isNull(COL_DEL);
-                if (!has_vec && !has_del)
-                    fail("row with id " + std::to_string(id) + " and neither vec nor del: allow-list rows (filtered search) "
-                         "are not implemented yet (milestone M5)");
+                if (!has_vec && !has_del) { allow_ids.push_back(id); continue; }  // allow-list member
                 const bool del = has_del && in.getBoolRef(COL_DEL) == vbool_true;
                 if (!del && !has_vec) fail("journal row with id " + std::to_string(id) + " has no vector and is not a delete");
                 if (!apply_journal) continue;
@@ -179,6 +184,19 @@ class VSearch : public TransformFunction
             if (qids.empty()) fail("no query: give the query parameter, or query rows (qid, qvec)");
             const vvector::VectorSet &now = snap.vectors();
 
+            // The allow-list: sorted ids, and their positions in the snapshot.
+            const bool filtered = !allow_ids.empty() || (params.containsParameter("filtered") && params.getBoolRef("filtered") == vbool_true);
+            std::vector<std::uint32_t> allow_pos;
+            if (filtered) {
+                std::sort(allow_ids.begin(), allow_ids.end());
+                allow_ids.erase(std::unique(allow_ids.begin(), allow_ids.end()), allow_ids.end());
+                std::vector<std::int64_t> found(allow_ids.size());
+                now.find_sorted(allow_ids.data(), allow_ids.size(), found.data());
+                allow_pos.reserve(allow_ids.size());
+                for (const std::int64_t pos : found)
+                    if (pos >= 0) allow_pos.push_back(static_cast<std::uint32_t>(pos));
+            }
+
             // The snapshot without the ids the journal changed or deleted, and the journal's live vectors.
             std::vector<std::uint64_t> skip;
             std::vector<std::int64_t> extra_ids;
@@ -186,14 +204,15 @@ class VSearch : public TransformFunction
             if (!journal.empty() || now.tombstone_bits) {
                 skip.assign((now.count + 63) / 64, 0);
                 if (now.tombstone_bits) std::memcpy(skip.data(), now.tombstone_bits, skip.size() * 8);
-                journal.apply(now, skip, extra_ids, extra_rows);
+                journal.apply(now, skip, extra_ids, extra_rows, filtered ? &allow_ids : nullptr);
             }
             const vvector::RowBlock extra{extra_rows.data(), extra_ids.data(), extra_ids.size(), nullptr};
             const vvector::FlatSearch fs = ss.describe(now, queries.data(), qids.size());
             std::vector<vvector::Neighbor> found;
             std::vector<std::uint32_t> count;
             try {
-                ss.search(fs, now, skip.empty() ? nullptr : skip.data(), &extra, found, count, [this] { return isCanceled(); });
+                ss.search(fs, now, skip.empty() ? nullptr : skip.data(), &extra, found, count, [this] { return isCanceled(); },
+                          filtered ? &allow_pos : nullptr);
             } catch (const vvector::Cancelled &) {
                 return;
             }
@@ -238,6 +257,7 @@ class VSearchFactory : public TransformFunctionFactory
         add_common_parameters(parameterTypes);
         add_search_parameters(parameterTypes);
         parameterTypes.addVarchar(16, "freshness");
+        parameterTypes.addBool("filtered");
     }
 
     virtual TransformFunction *createTransformFunction(ServerInterface &srvInterface)

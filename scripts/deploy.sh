@@ -7,7 +7,8 @@
 #                   take down the node)
 #   --fenced=no     every function runs inside the Vertica process (fastest; a crash in the
 #                   library is a crash of the node)
-#   --fenced=mixed  vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion not fenced
+#   --fenced=mixed  vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion and the
+#                   vector functions not fenced
 #
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD,
 # VSQL_DATABASE from the environment. Nothing is stored here.
@@ -61,6 +62,6 @@ if [ "$UNDEPLOY" = no ]; then
     vsql -X -c "SELECT vvector.vversion() OVER();"
     vsql -X -c "SELECT schema_name || '.' || function_name AS function_name, is_fenced FROM v_catalog.user_functions
                 WHERE schema_name IN ('vvector', 'vvector_admin')
-                  AND function_name IN ('vversion','vbuild','vload','vconfig','vnode','vinfo','vsearch','vknn')
+                  AND function_name IN ('vversion','vbuild','vload','vconfig','vnode','vinfo','vsearch','vknn','vector_add','vector_avg')
                 ORDER BY 1;"
 fi

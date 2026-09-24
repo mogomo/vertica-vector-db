@@ -511,6 +511,27 @@ void search_one(const HnswGraph &g, const Scorer &sc, std::uint32_t ef, const st
     }
 }
 
+// One query, the up to max(ef, k) nearest allowed positions into w.top. With a radius (range
+// search) and ef below k, the walk starts with ef and grows it four times, up to k, while more than a
+// quarter of the candidate list is within the radius: the list stays at least four times the answer,
+// and the work follows the number of vectors within the radius, not k. Every step walks again from
+// the start (a walk cannot be resumed with a larger list: it drops what did not fit), so the steps
+// before the last cost at most a third more. The walk stops growing when the list is not full,
+// because then every reachable position was seen.
+template <class Scorer>
+void walk(const FlatSearch &s, const HnswGraph &g, const Scorer &sc, std::uint32_t ef, std::uint32_t k,
+          const std::uint64_t *skip, Worker &w)
+{
+    if (!s.has_radius || ef >= k) { search_one(g, sc, std::max(ef, k), skip, w); return; }
+    for (std::uint32_t e = std::max<std::uint32_t>(ef, 1);; e = static_cast<std::uint32_t>(std::min<std::uint64_t>(4ull * e, k))) {
+        search_one(g, sc, e, skip, w);
+        if (e >= k || w.top.size() < e) return;
+        std::uint64_t within = 0;
+        for (const Cand &c : w.top) within += within_radius(s, c.key);
+        if (4 * within <= e) return;
+    }
+}
+
 } // namespace
 
 std::uint32_t hnsw_level(std::int64_t id, std::uint32_t m, std::uint64_t seed)
@@ -706,7 +727,6 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
     out.assign(nq * k, Neighbor{0, 0});
     count.assign(nq, 0);
     if (nq == 0 || k == 0) return;
-    ef = std::max<std::uint32_t>(ef, s.k);
 
     const int threads = static_cast<int>(std::min<std::uint64_t>(std::max(1, s.threads), nq));
     std::vector<Worker> workers;
@@ -718,7 +738,7 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
         Worker &w = workers[t];
         std::vector<Neighbor> &found = sorted[t];
         for (std::uint64_t q = q0; q < q1; ++q) {
-            search_one(g, FloatScorer{set, s.queries + q * s.stride}, ef, skip, w);
+            walk(s, g, FloatScorer{set, s.queries + q * s.stride}, ef, s.k, skip, w);
             found.clear();
             for (const Cand &c : w.top) found.push_back(Neighbor{c.key, set.ids[c.pos]});
             std::sort(found.begin(), found.end(), closer);
@@ -744,7 +764,6 @@ void hnsw_search_codes(const FlatSearch &s, const VectorSet &set, const Sq8Codes
     out.assign(nq * k, Neighbor{0, 0});
     count.assign(nq, 0);
     if (nq == 0 || k == 0) return;
-    ef = std::max<std::uint32_t>(ef, s.k);
 
     const int threads = static_cast<int>(std::min<std::uint64_t>(std::max(1, s.threads), nq));
     std::vector<Worker> workers;
@@ -756,7 +775,7 @@ void hnsw_search_codes(const FlatSearch &s, const VectorSet &set, const Sq8Codes
         Worker &w = workers[t];
         std::vector<Neighbor> &found = sorted[t];
         for (std::uint64_t q = q0; q < q1; ++q) {
-            search_one(g, CodeScorer{set.metric, codes, s.query_codes + q * codes.stride, s.query_sums[q]}, ef, skip, w);
+            walk(s, g, CodeScorer{set.metric, codes, s.query_codes + q * codes.stride, s.query_sums[q]}, ef, s.k, skip, w);
             found.clear();
             for (const Cand &c : w.top) found.push_back(Neighbor{c.key, c.pos});
             std::sort(found.begin(), found.end(), closer);

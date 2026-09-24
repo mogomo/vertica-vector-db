@@ -103,7 +103,9 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify);
 // search. Positions marked in skip (journal mask, tombstones; may be null) are traversed but never
 // returned. extra (may be null) holds rows searched exactly beside the graph (the journal's live
 // vectors); both result lists are merged. Result layout and order as flat_search: (key, id).
-// With radius only the found neighbours within it are returned. One thread per query; the result
+// With radius only the found neighbours within it are returned; when ef is below k (range search),
+// the walk starts with ef and grows it fourfold, up to k, while more than a quarter of the candidates found
+// are within the radius, so a large k costs only as much as the vectors within the radius. One thread per query; the result
 // does not depend on the number of threads.
 void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, std::uint32_t ef,
                  const std::uint64_t *skip, const RowBlock *extra, std::vector<Neighbor> &out,
@@ -111,8 +113,9 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
 
 // The same walk on the sq8 codes (sq8.h) of set and of the queries (s.query_codes, s.query_sums):
 // the s.k nearest allowed positions of every query by their sq8 keys, in flat_search's layout, with
-// the position in place of the id (ties by position). No journal rows and no radius: the caller
-// rescores the result (search.h).
+// the position in place of the id (ties by position). No journal rows, and the radius only steers
+// the range walk of hnsw_search (on the approximate keys); the result is not cut by it: the caller
+// rescores the result and applies the radius (search.h).
 void hnsw_search_codes(const FlatSearch &s, const VectorSet &set, const Sq8Codes &codes, const HnswGraph &g,
                        std::uint32_t ef, const std::uint64_t *skip, std::vector<Neighbor> &out,
                        std::vector<std::uint32_t> &count, const std::function<bool()> &poll = std::function<bool()>());

@@ -6,20 +6,22 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M4 (int8 quantisation).** Two index types: `hnsw` (a
-graph index, approximate, the default) and `flat` (exact), each optionally
-with int8 codes (`sq8`) that make searches faster while the returned scores
-stay exact. k-nearest-neighbour search works for the metrics l2, cosine, dot
-and l1, for one query or thousands in one statement, with or without the rows
-written since the last refresh. A refresh adds only the changes since the
+**Status: milestone M5 (filtered search and vector functions).** Two index
+types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
+each optionally with int8 codes (`sq8`) that make searches faster while the
+returned scores stay exact. k-nearest-neighbour search works for the metrics
+l2, cosine, dot and l1, for one query or thousands in one statement, with or
+without the rows written since the last refresh, limited to a list of
+allowed ids (filtered search) or to a radius (range search). Vector
+functions add the arithmetic Vertica lacks (sum, difference, average,
+normalisation, l1, Hamming and Jaccard distance). A refresh adds only the changes since the
 last one to the index and rebuilds it in full only when that is needed. Exact
 results are tested to equal a full scan with Vertica's built-in functions;
 recall is measured on SIFT1M, also after 100 incremental refreshes. Tested on
 Vertica 26.2 on one node (aarch64, Rocky Linux 9, g++ 11.5), on a 3-node Eon
 cluster and on a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux
-8, g++ 8.5), fenced, unfenced and mixed. Not yet available: filtered search,
-range search on the graph and vector functions (M5). Treat this as a
-preview: try it on your own systems before you rely on it.
+8, g++ 8.5), fenced, unfenced and mixed. Treat this as a preview: try it on
+your own systems before you rely on it.
 
 Contents: [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
 [Prepare a table](#prepare-a-table) · [Register, refresh, schedule](#register-refresh-schedule) ·
@@ -509,7 +511,7 @@ seven columns; the role of a row is given by which columns are NULL:
 | set | set | NULL | NULL | NULL | a query |
 | NULL | NULL | set | set | false | a journal row: add or change (from the delta view) |
 | NULL | NULL | set | NULL | true | a journal row: delete (from the delta view) |
-| NULL | NULL | set | NULL | NULL | allow-list member for filtered search (milestone M5; refused now) |
+| NULL | NULL | set | NULL | NULL | an allow-list member: only allowed ids are returned (see [Filtered search](#filtered-search)) |
 | NULL | NULL | NULL | NULL | NULL | the sentinel row of a view: carries `snapshot_id` only |
 
 `ver` orders journal rows; `snapshot_id` tells vsearch which snapshot the view
@@ -532,13 +534,14 @@ Parameters:
 | freshness | snapshot | snapshot, exact | `exact` applies the journal rows of the input; `snapshot` ignores them |
 | radius | off | a number | only neighbours within it, at most k: l2 and l1 `score <= radius`; cosine and dot `score >= radius` (on HNSW: see [Range search](#range-search)) |
 | threads | 0 | 0 (one per core) to 64 | threads for one statement |
-| precision | balanced | fast, balanced, best, exact | the speed and recall trade-off, a preset of ef_search (HNSW; fast: 2 x k, at least 32; balanced: 100; best: 400) and, with sq8, of rescore and oversampling (fast: no rescoring; balanced: 2 x k candidates rescored; best: 4 x k). exact reads every float vector. A flat index without sq8 is always exact |
-| ef_search | 0 (preset) | 0 to 100000 | HNSW: the length of the candidate list; overrides the preset of `precision`; below k it is raised to k. No effect on a flat index |
+| precision | balanced | fast, balanced, best, exact | the speed and recall trade-off, a preset of ef_search (HNSW; fast: 2 x k, at least 32, and 32 with a radius; balanced: 100; best: 400) and, with sq8, of rescore and oversampling (fast: no rescoring; balanced: 2 x k candidates rescored; best: 4 x k). exact reads every float vector. A flat index without sq8 is always exact |
+| ef_search | 0 (preset) | 0 to 100000 | HNSW: the length of the candidate list; overrides the preset of `precision`; below k it is raised to k (with a radius it grows from there, see [Range search](#range-search)). No effect on a flat index |
 | exact | false | true, false | `true` reads every vector of an HNSW index (the same as `precision='exact'`) |
 | rescore, oversampling | preset of precision | true or false; 1 to 100 | sq8 only: rank by the bytes, then compute the exact scores of the best k x oversampling candidates from the floats (`rescore=true`), or return the k best with approximate scores (`rescore=false`). No effect on an index without sq8 |
+| filtered | false | true, false | `true` returns only allow-listed ids even when the input has no allow-list row (a filter that matched nothing returns nothing); without it, allow-list rows alone switch the filter on |
 | cache_dir | `/tmp/vvector` | absolute path | where the node cache is |
 
-Every tuning value except `index_name`, `query` and `radius` can also be set
+Every tuning value except `index_name`, `query`, `radius` and `filtered` can also be set
 for a session, and `precision`, `freshness`, `ef_search` and `threads` per
 index (`set_index_options`). The first that is set wins: function parameter,
 then session parameter, then index default, then built-in default.
@@ -707,10 +710,89 @@ With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
        0 |  6 |  0.99886816740036 |    1
        0 |  1 | 0.980580687522888 |    2
 
-At most k rows are returned; raise k for a wide radius. On an HNSW index the
-radius filters the candidates the graph search finds (ef_search of them), so
-it can miss vectors inside the radius; add `exact=true` for a complete answer
-(true range search on the graph comes with milestone M5).
+At most k rows are returned. To get every vector within the radius, ask for
+a large k; on an HNSW index that costs only as much as the vectors within the
+radius, not k:
+
+    SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                           USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=16384, radius=0.9) OVER()
+    FROM app.docs_snap;
+
+     qid | id |       score       | rank
+    -----+----+-------------------+------
+       0 |  6 |  0.99886816740036 |    1
+       0 |  1 | 0.980580687522888 |    2
+
+    SELECT vvector.vknn(ARRAY[0, 0.1, 1] USING PARAMETERS index_name='docs', k=16384, radius=0.95);
+
+     id |       score       | rank
+    ----+-------------------+------
+      4 | 0.995037198066711 |    1
+      7 | 0.970358312129974 |    2
+
+How it works on HNSW: the graph search starts with the ef_search of the
+precision level (fast: 32) and makes its candidate list four times longer,
+up to k, as long as more than a quarter of the list is within the radius. A
+narrow radius therefore stops after the first walk; a wide one grows to k.
+On SIFT1M (1M vectors, k 16384) the search with a radius that holds about 10
+vectors per query answers 2,674 queries per second against 485 when the list
+is k long from the start, at recall 0.9999 (docs/design.md). Like every
+graph search it is approximate: add `exact=true` for a complete answer.
+
+### Filtered search
+
+Only some vectors may be results: the documents of one customer, one
+language, one category. Send their ids as allow-list rows (id set, vec and
+del NULL) beside the query; vsearch returns only those ids. The examples
+group the colours of the Quick start into families:
+
+    CREATE TABLE app.families (id INT, family VARCHAR(20));
+    INSERT INTO app.families VALUES (1, 'red'); INSERT INTO app.families VALUES (6, 'red');
+    INSERT INTO app.families VALUES (5, 'warm'); INSERT INTO app.families VALUES (3, 'green');
+    INSERT INTO app.families VALUES (4, 'blue'); INSERT INTO app.families VALUES (7, 'blue');
+    INSERT INTO app.families VALUES (8, 'blue'); COMMIT;
+
+    SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                           USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3) OVER()
+    FROM (SELECT * FROM app.docs_snap
+          UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM app.families WHERE family = 'blue') x;
+
+     qid | id |       score       | rank
+    -----+----+-------------------+------
+       0 |  8 |  0.32893693447113 |    1
+       0 |  7 | 0.249459221959114 |    2
+       0 |  4 |                 0 |    3
+
+(Without the filter the same query returns 6, 1 and 5.) The filter applies to the journal rows too:
+with `freshness='exact'` and the `_delta` view, a vector added since the
+refresh is returned only when its id is allowed. Ids that are not in the
+index are ignored.
+
+A filter that matches nothing sends no allow-list row, and without any
+allow-list row vsearch does not filter. When the filter may be empty, add
+`filtered=true`: it returns nothing instead of the unfiltered answer.
+
+    SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                           USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3, filtered=true) OVER()
+    FROM (SELECT * FROM app.docs_snap
+          UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM app.families WHERE family = 'purple') x;
+
+     qid | id | score | rank
+    -----+----+-------+------
+    (0 rows)
+
+How it is searched: when fewer than max(10,000, sqrt(64 x ef_search x
+vectors in the index)) allowed vectors remain (80,000 for 1M vectors at the
+default precision), vsearch reads exactly those vectors: the answer is exact
+and fast. With more, it walks the graph (or scans a flat index) and skips
+the vectors outside the list. On SIFT1M a filter of 1% of the vectors
+answers 75,700 queries per second in a batch (0.25 ms for a single query);
+50% of the vectors 24,400 per second with recall 0.99 (docs/design.md).
+The allow-list is part of the statement's input, so a list of millions of
+ids costs the time Vertica needs to send them.
+
+For a filter that keeps most rows, searching without it and filtering the
+results can be simpler; see [Recipes](#recipes).
 
 ### Join the results to your data
 
@@ -727,9 +809,91 @@ it can miss vectors inside the radius; add `exact=true` for a complete answer
         2 |  1 | red      | 0.980580687522888
         3 |  5 | yellow   | 0.832050263881683
 
-A filter on your own columns can be applied after the search: ask for more
-neighbours than you need (for example `k=100`), join, filter, and keep the
-first rows. Filtered search inside the index comes with milestone M5.
+### Recipes
+
+The examples use the live rows of the journal as a view:
+
+    CREATE VIEW app.docs_live AS
+    SELECT id, vec FROM (SELECT id, vec, del, ROW_NUMBER() OVER(PARTITION BY id ORDER BY ts DESC, del DESC) AS rn
+                         FROM app.docs) j
+    WHERE rn = 1 AND NOT del;
+
+**Filter after the search** (post-filter). Ask for more neighbours than you
+need, join, filter and keep the first rows. Simple, and fine when the filter
+removes few rows; with a selective filter use [Filtered search](#filtered-search).
+
+    SELECT r.id, f.family, r.score
+    FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                                 USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=30) OVER()
+          FROM app.docs_snap) r
+    JOIN app.families f ON f.id = r.id
+    WHERE f.family <> 'red'
+    ORDER BY r.rank LIMIT 3;
+
+     id | family |       score
+    ----+--------+-------------------
+      5 | warm   | 0.832050263881683
+      8 | blue   |  0.32893693447113
+      3 | green  | 0.303203642368317
+
+**Recommendation by centroids.** "More like these, less like that": the
+query is the average of the liked vectors minus the average of the disliked
+ones ([Vector functions](#vector-functions)).
+
+    SELECT r.rank, r.id, t.title, r.score
+    FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='docs', k=3) OVER()
+          FROM (SELECT * FROM app.docs_snap
+                UNION ALL
+                SELECT 1, vvector.vector_sub(liked.vector_avg, disliked.vector_avg), NULL, NULL, NULL, NULL, NULL
+                FROM (SELECT vvector.vector_avg(vec) OVER() FROM app.docs_live WHERE id IN (1, 5)) liked
+                CROSS JOIN (SELECT vvector.vector_avg(vec) OVER() FROM app.docs_live WHERE id = 4) disliked) x) r
+    LEFT JOIN app.titles t ON t.id = r.id ORDER BY r.rank;
+
+     rank | id | title  |       score
+    ------+----+--------+-------------------
+        1 |  6 | orange | 0.618346929550171
+        2 |  1 | red    | 0.588348388671875
+        3 |  5 | yellow | 0.554700195789337
+
+Add the liked ids as allow-list rows the other way round (or filter them
+out afterwards) to leave them out of the answer.
+
+**The best match per group.** Search once with a k large enough to reach
+every group, then keep the first row of each group:
+
+    SELECT family, id, score FROM (
+      SELECT f.family, r.id, r.score, ROW_NUMBER() OVER(PARTITION BY f.family ORDER BY r.rank) AS n
+      FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                                   USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=100) OVER()
+            FROM app.docs_snap) r
+      JOIN app.families f ON f.id = r.id) g
+    WHERE n = 1 ORDER BY score DESC;
+
+     family | id |       score
+    --------+----+-------------------
+     red    |  6 |  0.99886816740036
+     warm   |  5 | 0.832050263881683
+     blue   |  8 |  0.32893693447113
+     green  |  3 | 0.303203642368317
+
+**Near-duplicates.** Every vector as a query, k 2 (the vector itself and its
+nearest other one), pairs above a threshold:
+
+    SELECT r.qid AS id, r.id AS near_id, r.score
+    FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                                 USING PARAMETERS index_name='docs', k=2) OVER()
+          FROM (SELECT * FROM app.docs_snap
+                UNION ALL SELECT id, vec, NULL, NULL, NULL, NULL, NULL FROM app.docs_live) x) r
+    WHERE r.id <> r.qid AND r.score >= 0.97 AND r.qid < r.id
+    ORDER BY r.score DESC;
+
+     id | near_id |       score
+    ----+---------+-------------------
+      7 |       8 |  0.98894989490509
+      1 |       6 | 0.970142483711243
+
+For a large table run it in slices of query ids (`WHERE id % 10 = 0`, ...):
+each statement searches all its query rows in one call.
 
 ## Index types and tuning
 
@@ -927,11 +1091,71 @@ estimates an index before you load it.
 
 ## Vector functions
 
-Milestone M5 adds vector functions that Vertica does not have (sum,
-difference, normalisation, Hamming and Jaccard distance, average). Until then
-use Vertica's own `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and
-`VECTOR_MAGNITUDE`, and for the l1 distance an expression such as
-`ABS(a[0] - b[0]) + ABS(a[1] - b[1]) + ...`.
+Vertica 26.2 has no arithmetic on arrays (`ARRAY[1, 2] + ARRAY[3, 4]` is an
+error). vvector adds what is missing, in schema `vvector`, for everyone
+(PUBLIC). They compute in FLOAT64; ARRAY[INT] and ARRAY[NUMERIC] arguments
+are cast to ARRAY[FLOAT] (except Hamming and Jaccard, which take ARRAY[INT]).
+A NULL argument gives NULL. Vectors of different lengths and NULL elements
+are errors. They run fenced unless deployed with `FENCED=no` or `mixed`.
+
+| Function | Returns | Meaning |
+|---|---|---|
+| `vector_add(a, b)` | ARRAY[FLOAT] | a[i] + b[i] |
+| `vector_sub(a, b)` | ARRAY[FLOAT] | a[i] - b[i] |
+| `vector_mul(a, b)` | ARRAY[FLOAT] | a[i] x b[i] (element by element) |
+| `scalar_vector_mul(s, a)` | ARRAY[FLOAT] | s x a[i] |
+| `vector_normalize(a)` | ARRAY[FLOAT] | a divided by its length (unit length); a zero vector stays zero |
+| `vector_l1(a, b)` | FLOAT | sum of ABS(a[i] - b[i]) (Manhattan distance; the score of an l1 index) |
+| `vector_l2sq(a, b)` | FLOAT | sum of (a[i] - b[i])^2 (`VECTOR_L2` squared, without the square root) |
+| `vector_hamming(a, b)` | INT | the number of bits that differ, on ARRAY[INT]: elements 0 and 1, or 64 bits packed per element |
+| `vector_jaccard(a, b)` | FLOAT | bits set in both / bits set in either (Tanimoto similarity), on ARRAY[INT] like Hamming; 1 when neither has a bit set |
+| `vector_sum(a) OVER(...)` | ARRAY[FLOAT] | element sum of the vectors of a partition |
+| `vector_avg(a) OVER(...)` | ARRAY[FLOAT] | element average of the vectors of a partition (a centroid) |
+
+    SELECT vvector.vector_add(ARRAY[1, 2, 3], ARRAY[0.5, 0.5, 0.5]) AS sum,
+           vvector.vector_sub(ARRAY[1, 2, 3], ARRAY[0.5, 0.5, 0.5]) AS difference,
+           vvector.scalar_vector_mul(2, ARRAY[1, 2, 3]) AS twice;
+
+          sum      |  difference   |     twice
+    ---------------+---------------+---------------
+     [1.5,2.5,3.5] | [0.5,1.5,2.5] | [2.0,4.0,6.0]
+
+    SELECT vvector.vector_normalize(ARRAY[3, 4]) AS unit, vvector.vector_l1(ARRAY[0, 0], ARRAY[3, 4]) AS l1,
+           vvector.vector_l2sq(ARRAY[0, 0], ARRAY[3, 4]) AS l2sq, VECTOR_L2(ARRAY[0, 0], ARRAY[3, 4]) AS l2;
+
+       unit    | l1 | l2sq | l2
+    -----------+----+------+----
+     [0.6,0.8] |  7 |   25 |  5
+
+    SELECT vvector.vector_hamming(ARRAY[1, 0, 1, 1], ARRAY[1, 1, 0, 1]) AS hamming,
+           vvector.vector_jaccard(ARRAY[1, 0, 1, 1], ARRAY[1, 1, 0, 1]) AS jaccard,
+           vvector.vector_hamming(ARRAY[255], ARRAY[15]) AS packed;
+
+     hamming | jaccard | packed
+    ---------+---------+--------
+           2 |     0.5 |      4
+
+`vector_sum` and `vector_avg` are transform functions, not aggregates
+(Vertica 26.2 aggregates cannot take an array): write them with `OVER()` for
+the whole input or `OVER(PARTITION BY ...)` per group, with only the
+partition columns beside them, and put anything else in an outer query.
+NULL vectors are skipped; a partition of only NULL vectors gives NULL.
+
+    SELECT family, vector_avg FROM (SELECT family, vvector.vector_avg(vec) OVER(PARTITION BY family)
+                                    FROM app.docs_live d JOIN app.families f USING (id)) c ORDER BY family;
+
+     family |                          vector_avg
+    --------+--------------------------------------------------------------
+     blue   | [0.16666666666666667,0.10000000000000002,0.9333333333333332]
+     green  | [0.1,0.9,0.0]
+     red    | [1.0,0.125,0.0]
+     warm   | [0.5,0.5,0.0]
+
+Use Vertica's own functions where they exist: `VECTOR_L2`,
+`COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_MAGNITUDE` (package VectorOps),
+`APPLY_SUM(a)` for the sum of the elements of one vector (also `APPLY_AVG`,
+`APPLY_MAX`, `APPLY_MIN`), `'[1.5, 2]'::ARRAY[FLOAT]` from text and
+`TO_JSON(a)` to text.
 
 ## Operations
 
@@ -1080,7 +1304,6 @@ cache), starting with `vknn:`.
 | `vsearch: query vector text: expected ',' or ']' at character N` (and similar) | malformed `query` text | write `'[1.5, 2, -3e-2]'` |
 | `vsearch: query Q has no vector (qvec is NULL)`, `a query row has a vector (qvec) but no qid` | incomplete query row | set both qid and qvec |
 | `vsearch: journal row with id I has no vector and is not a delete` | a journal row with a NULL vector and del false | fix the row, or set del |
-| `vsearch: row with id I and neither vec nor del: allow-list rows ... (milestone M5)` | filtered search is not available yet | filter after the search (see Search) |
 | `vsearch: k must be 1 to 16384`, `precision must be ...`, `freshness must be ...`, `ef_search must be ...`, `oversampling must be 1 to 100`, `threads must be 0 (one per core) to 64`, `radius must be a finite number` | a parameter out of range | use a value from the parameter table |
 | `vsearch: session parameter NAME = 'v' is not an integer` (or `index default ...`) | a bad session value or index default | `ALTER SESSION SET UDPARAMETER FOR vvector NAME = ...`, or `set_index_options` |
 | `vsearch: the snapshot of index 'x' changed while the query ran: run it again` | a refresh changed the dimensions during the query | run the query again |
@@ -1116,6 +1339,10 @@ cache), starting with `vknn:`.
 | `vvector.set_index_options: ...` | a value out of range or of a later milestone | see the option table |
 | `vvector.schedule_refresh: cron_expr may hold digits, spaces and * / , - only` | a bad cron expression | e.g. `'0 * * * *'` |
 | `vvector.set_journal_replica: mode must be auto, on or off` | a bad mode | `'auto'`, `'on'` or `'off'` |
+| `vector_add: the vectors have different lengths: N and M elements` (any vector function, `vector_avg`, `vector_sum`) | two vectors of different lengths | vectors of one length |
+| `vector_l1: element I of the second vector is NULL` (any vector function; `vector_avg: element I of a vector is NULL`) | a NULL inside an array | replace the NULL, or filter the row |
+| `Function vvector.vector_hamming(array[numeric], array[numeric]) does not exist` (or `array[float]`) | Hamming and Jaccard take ARRAY[INT] (bits) | cast to `ARRAY[INT]` |
+| `ERROR 2521: Cannot specify anything other than user defined transforms and partitioning expressions in the SELECT list` | `vector_sum` and `vector_avg` are transform functions: only PARTITION BY columns may stand beside them | put other expressions in an outer query (see [Vector functions](#vector-functions)) |
 | `journal replica: not created: ... A DBA can run: CREATE PROJECTION ...` (a NOTICE) | the caller may not create a projection on the journal table, or the name is taken | run the three statements as the table owner, or ignore it (searches work, only the cluster delta read stays slower) |
 
 Warnings of `status` and `sizing` are explained in their text.
@@ -1222,6 +1449,16 @@ costs more: `SELECT 1` 2.7 ms, vsearch `_snap` 12.8 ms fenced and 7.6 ms mixed,
 takes 10.7 ms mixed with the journal replica, which is made there by default,
 and 23.4 ms without it (see [Operations](#operations)).
 
+**Filtered and range search** (the VM, SIFT1M, one query, median at the
+client): with an allow-list of 100 ids 8.6 ms fenced / 3.0 ms mixed, 10,000
+ids 12.5 / 5.3 ms, 100,000 ids 29.8 / 13.9 ms (against 7.4 / 1.9 ms without a
+filter); most of the added time is Vertica passing the allow-list rows.
+Engine alone, 1000 queries: a filter of 1% of the vectors 75,700 queries/s
+(exact), 50% 24,400 queries/s (recall 0.99). A range search with k 16384 and
+a radius that holds about 10 vectors per query costs what a plain search
+costs (1.9 ms mixed); in the engine it answers 2,674 queries/s against 485
+with a candidate list of k. Details: docs/design.md.
+
 The first search of a session costs more when vsearch is fenced, because the
 session starts its own fenced process and maps the index: 13.3 ms instead of
 7.6 ms (HNSW, 1M vectors); in mixed mode 2.4 ms instead of 2.1 ms. Keep
@@ -1300,9 +1537,20 @@ Index and search:
   best on SIFT1M). `precision='exact'` or a flat index gives exact answers at
   the cost of reading every vector: about 2 to 3 ms per million vectors of 128
   dimensions on 8 cores.
-- On an HNSW index `radius` filters the candidates of the graph search: a
-  vector inside the radius can be missed (use `exact=true`). Range search on
-  the graph: M5.
+- Range search on an HNSW index is approximate like every graph search: a
+  vector inside the radius can be missed (use `exact=true` for a complete
+  answer). At most k rows (k up to 16384) are returned.
+- Filtered search: the allow-list is sent as rows with every statement (one
+  row per allowed id); vvector cannot read a filter column itself. Above the
+  exact-search limit the graph walk passes through the vectors outside the
+  list; with a very selective filter just above that limit the walk is slow
+  (it visits about ef_search x vectors / allowed nodes). `vknn` has no
+  allow-list.
+- `vector_sum` and `vector_avg` are transform functions, not aggregates
+  (Vertica 26.2 aggregates cannot take an ARRAY argument): use them with
+  `OVER()` or `OVER(PARTITION BY ...)` and only partition columns beside
+  them. Hamming and Jaccard work on bits of ARRAY[INT] (0/1 elements or
+  packed 64-bit words), not on sets of values.
 - `vknn` searches the snapshot only: no journal and no stale check (a node
   that missed a refresh answers from its old snapshot until `load_all`).
 - `register_index` creates an HNSW index by default since milestone M2 (it
@@ -1366,13 +1614,13 @@ Operations:
 | File | What it does |
 |---|---|
 | `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed]`, `make undeploy` |
-| `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring (`search.cpp`), threads, query text |
-| `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...) |
+| `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring and filters (`search.cpp`), the arithmetic of the vector functions (`vecmath.cpp`), threads, query text |
+| `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...), and one per family of vector functions (`vector_functions.cpp`, `vector_aggregates.cpp`) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M) to text for COPY |
-| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp` and `test_sq8.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M); `run_all.sh` runs them in every mode |
+| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`; `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

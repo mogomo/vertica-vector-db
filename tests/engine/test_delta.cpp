@@ -250,6 +250,17 @@ static void rounds(const char *what, Metric metric, bool graph)
         CHECK(next.set.count == cur.set.count + got.appended && next.set.tombstones == cur.set.tombstones + got.tombstoned);
         if (!same_live(next, full, live)) { std::printf("  %s round %d: live vectors differ\n", what, round); CHECK(false); }
         for (const std::int64_t id : gone) CHECK(next.set.find(id) == -1);
+        {   // find_sorted gives what find gives: live, gone, never seen and repeated-position ids
+            std::set<std::int64_t> ask(gone.begin(), gone.end());
+            for (const auto &x : live) ask.insert(x.first);
+            for (std::int64_t i = -3; i <= 30000; i += 97) ask.insert(i);
+            const std::vector<std::int64_t> want(ask.begin(), ask.end());
+            std::vector<std::int64_t> got_pos(want.size());
+            next.set.find_sorted(want.data(), want.size(), got_pos.data());
+            bool same_pos = true;
+            for (std::size_t i = 0; i < want.size(); ++i) same_pos &= got_pos[i] == next.set.find(want[i]);
+            CHECK(same_pos);
+        }
         if (!same_results(next, full, graph)) { std::printf("  %s round %d: search differs from a full build\n", what, round); CHECK(false); }
         if (graph) {
             std::uint64_t reached, alive;

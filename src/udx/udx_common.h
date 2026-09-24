@@ -34,7 +34,7 @@ using Vertica::vint;
 //   qid, qvec set                       a query row
 //   id, vec set, del false              journal add or replace (delta view)
 //   id set, del true                    journal delete (delta view)
-//   id set, vec and del NULL            allow-list member (filtered search, milestone M5)
+//   id set, vec and del NULL            allow-list member (filtered search)
 //   only snapshot_id set                sentinel: the snapshot the view belongs to
 enum InputColumn { COL_QID = 0, COL_QVEC, COL_ID, COL_VEC, COL_DEL, COL_VER, COL_SNAPSHOT_ID, COL_COUNT };
 
@@ -225,12 +225,14 @@ struct SearchSettings {
     bool use_graph(const vvector::VectorSet &s) const { return s.has_graph() && !exact && precision != "exact"; }
 
     // Candidate list size of the graph search: ef_search, else the preset of the precision level
-    // (fast: max(2 x k, 32), balanced (the default): 100, best: 400); at least k.
+    // (fast: max(2 x k, 32), with a radius 32; balanced (the default): 100; best: 400). The search
+    // raises it to k; with a radius it starts there and grows while the candidates are within the
+    // radius (range search, hnsw.h).
     std::uint32_t ef() const
     {
         vint ef = ef_search;
-        if (ef == 0) ef = precision == "best" ? 400 : precision == "balanced" ? 100 : std::max<vint>(2 * k, 32);
-        return static_cast<std::uint32_t>(std::max(ef, k));
+        if (ef == 0) ef = precision == "best" ? 400 : precision == "balanced" ? 100 : has_radius ? 32 : std::max<vint>(2 * k, 32);
+        return static_cast<std::uint32_t>(ef);
     }
 
     // The FlatSearch description of queries (n rows of the index's stride) with these values.
@@ -256,12 +258,17 @@ struct SearchSettings {
 
     // Searches the snapshot s (positions in skip, may be null, are never returned) and the extra
     // rows beside it (the journal's live vectors, may be null): graph or flat, codes or float rows,
-    // as the settings say.
+    // as the settings say. filter (may be null): only these positions of s can be results.
     void search(const vvector::FlatSearch &fs, const vvector::VectorSet &s, const std::uint64_t *skip,
                 const vvector::RowBlock *extra, std::vector<vvector::Neighbor> &out, std::vector<std::uint32_t> &count,
-                const std::function<bool()> &poll) const
+                const std::function<bool()> &poll, const std::vector<std::uint32_t> *filter = nullptr) const
     {
         vvector::SearchPlan p;
+        if (filter) {
+            p.filtered = true;
+            p.allow = filter->data();
+            p.n_allow = filter->size();
+        }
         p.graph = use_graph(s);
         p.ef = ef();
         p.codes = use_codes(s);
