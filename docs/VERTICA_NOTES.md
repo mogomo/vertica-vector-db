@@ -351,3 +351,26 @@ Check again on other versions.
   of a scheduled refresh cannot be read from `v_monitor.sessions`. A trigger with `CRON '* * * * *'`
   fired at second 27 of every minute here. `CREATE OR REPLACE PROCEDURE` of a procedure a trigger
   uses fails with "ROLLBACK 3128: DROP failed due to dependencies": drop the trigger first.
+- Roles (26.2.0-1, session 12): a role granted to a role works as a hierarchy (a user whose default
+  role holds another role gets that role's rights). A role granted to PUBLIC is NOT enabled for any
+  user (a user without roles was still refused after `GRANT r TO PUBLIC`, in a new session); the
+  database parameter `EnableAllRolesOnLogin` (default 0) exists for that, a DBA's choice. A REVOKE
+  of a right that was never granted is only "NOTICE 2061 ... could not be revoked ... Cannot revoke
+  privilege that you did not grant". A function without EXECUTE gives "ERROR 3457: Function
+  s.f(int) does not exist, or permission is denied for s.f(int)"; a table without SELECT
+  "ERROR 4367: Permission denied for relation t".
+- `FencedUDxMemoryLimitMB` (26.2.0-1, session 12): -1 (the default) = no limit. Set with
+  `ALTER DATABASE DEFAULT SET FencedUDxMemoryLimitMB = 400;`, back with `ALTER DATABASE DEFAULT CLEAR
+  FencedUDxMemoryLimitMB;`; it applies to fenced processes started afterwards. It is enforced as the
+  soft address-space limit (RLIMIT_AS) of each fenced process: `/proc/<pid>/limits` showed "Max
+  address space 419430400" with 400, "unlimited" with -1; resident set and data size stay unlimited.
+  A vbuild that maps more fails at once with its own "out of memory: cannot map N MB" (ENOMEM), and
+  a MAP_SHARED file mapping counts against the limit exactly like anonymous memory.
+- PL/vSQL and a UDx query that fails on several nodes (26.2.0-2, 3-node Eon, session 12): inside a
+  `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END` block the CALL ends with "ERROR 4278: Operation
+  canceled" and the handler does not run. Without the block the caller gets the real error ("ERROR
+  3399: Failure in UDx RPC call ... message: vconfig: on <node>: cannot create directory ...").
+  A CALL that fails rolls back the changes it had not committed (an UPDATE before the failing query
+  was gone afterwards, in the same session and in a new one). So vvector commits a change that
+  depends on a multi-node load only after the load (set_index_options cache_dir) and does not rely
+  on a handler around such a query.

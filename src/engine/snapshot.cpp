@@ -3,6 +3,7 @@
 #include "version.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -11,6 +12,8 @@
 
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace vvector {
@@ -84,11 +87,27 @@ std::uint64_t round_page(std::uint64_t n) { return (n + PAGE - 1) / PAGE * PAGE;
 
 SnapshotBuffer::~SnapshotBuffer() { release(); }
 
+void SnapshotBuffer::back_with_file(const std::string &dir)
+{
+#if defined(__linux__)
+    if (data_ || capacity_) throw std::logic_error("SnapshotBuffer::back_with_file on a buffer in use");
+    if (fd_ >= 0) return;
+    std::string path = dir + "/build.XXXXXX";
+    const int fd = mkstemp(&path[0]);
+    if (fd < 0) throw std::runtime_error("cannot create a build file in " + dir + ": " + std::strerror(errno));
+    ::unlink(path.c_str());
+    fd_ = fd;
+#else
+    (void)dir;
+#endif
+}
+
 void SnapshotBuffer::release()
 {
     if (!data_) return;
 #if defined(__linux__)
-    munmap(data_, capacity_);
+    if (data_) munmap(data_, capacity_);
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 #else
     std::free(data_);
 #endif
@@ -98,7 +117,18 @@ void SnapshotBuffer::release()
 
 void SnapshotBuffer::allocate(std::uint64_t bytes)
 {
+#if defined(__linux__)
+    if (fd_ >= 0) {                 // keep the file, drop its content
+        if (data_) munmap(data_, capacity_);
+        data_ = nullptr;
+        size_ = capacity_ = 0;
+        if (ftruncate(fd_, 0) != 0) throw std::runtime_error(std::string("cannot empty the build file: ") + std::strerror(errno));
+    } else {
+        release();
+    }
+#else
     release();
+#endif
     reserve(bytes);
     size_ = bytes;
 }
@@ -108,8 +138,11 @@ void SnapshotBuffer::reserve(std::uint64_t bytes)
     if (bytes <= capacity_) return;
     const std::uint64_t want = round_page(bytes);
 #if defined(__linux__)
+    if (fd_ >= 0 && ftruncate(fd_, static_cast<off_t>(want)) != 0)
+        throw std::runtime_error("cannot grow the build file to " + std::to_string(want >> 20) + " MB: " + std::strerror(errno));
     void *p = data_ ? mremap(data_, capacity_, want, MREMAP_MAYMOVE)
-                    : mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+          : fd_ >= 0 ? mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0)
+                     : mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED)
         throw std::runtime_error("out of memory: cannot map " + std::to_string(want >> 20) + " MB for the snapshot");
 #else
@@ -128,6 +161,7 @@ void SnapshotBuffer::swap(SnapshotBuffer &other) noexcept
     std::swap(data_, other.data_);
     std::swap(size_, other.size_);
     std::swap(capacity_, other.capacity_);
+    std::swap(fd_, other.fd_);
 }
 
 void SnapshotBuffer::set_size(std::uint64_t bytes)

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Integration test of the snapshot path: vbuild -> vvector.snapshot -> vload ->
 # vinfo -> vsearch reading the node cache; the input rules of vbuild and vsearch, and
-# the cache rules (session parameter, stale cache, unknown index).
+# the cache rules (session parameter, stale cache, unknown index); the index option cache_dir
+# (the procedures load into it, a query without cache_dir finds it through the default directory,
+# a bad or unusable directory is refused, back to the default).
 #
 #   tests/sql/test_snapshot.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--keep] [--echo_only]
 #
@@ -145,6 +147,16 @@ SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
   SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='vvtest_x', metric='l1') OVER()
   FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec, FALSE AS del UNION ALL SELECT 2, ARRAY[3.0, 4.0], TRUE
         UNION ALL SELECT 3, ARRAY[5.0, 6.0], NULL) v) b;"
+expect "build_in='file' builds the same snapshot as a build in memory (sizes and counts)" "^same$" "
+SELECT CASE WHEN r.v = f.v THEN 'same' ELSE 'ram ' || r.v || ', file ' || f.v END FROM
+ (SELECT COUNT(*) || ' chunks ' || SUM(OCTET_LENGTH(chunk)) || ' bytes ' || MAX(vector_count) || ' vectors' AS v FROM (
+   SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw'$CD) OVER() FROM $SCHEMA.vectors) b) r
+ CROSS JOIN
+ (SELECT COUNT(*) || ' chunks ' || SUM(OCTET_LENGTH(chunk)) || ' bytes ' || MAX(vector_count) || ' vectors' AS v FROM (
+   SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='hnsw', build_in='file'$CD) OVER() FROM $SCHEMA.vectors) b) f;"
+expect "an unknown build_in is refused" "build_in must be ram or file, not 'disk'" "
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', build_in='disk') OVER()
+FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "a NaN element is refused" "element 2 is not a finite float32 value" "
 SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 'NaN'::FLOAT] AS vec) v;"
@@ -178,6 +190,52 @@ SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest_none'$C
 
 expect "bad index name is refused" "is not valid" "
 SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='../etc') OVER() FROM dual;"
+
+echo "== the index option cache_dir"
+# The directory is inside the test's cache directory, so it is on the same disk (on a cluster the
+# default may be a link to a data disk). ".alt" is not a valid index name: never listed as an index.
+ALT="$CACHE_DIR/.alt"
+IXC=vvtest_cd
+SEARCH_C="SELECT 'rows: ' || COUNT(*) FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+    USING PARAMETERS index_name='$IXC', query='[$(printf '0.5, %.0s' $(seq 1 $((DIMS - 1))))0.5]', k=3) OVER() FROM $SCHEMA.${IXC}_snap) r;"
+vinfo_file() {  # PATTERN: every UP node reports the snapshot file of $IXC under PATTERN (vinfo without cache_dir)
+    echo "SELECT CASE WHEN COUNT(DISTINCT v.node_name) = MAX(u.up) AND MIN(CASE WHEN v.cache_file LIKE '$1/$IXC/%' THEN 1 ELSE 0 END) = 1
+                 THEN 'every node: $1' ELSE 'cache_file ' || MAX(v.cache_file) || ' on ' || COUNT(DISTINCT v.node_name) || ' nodes' END
+          FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXC') OVER(PARTITION NODES) FROM vvector.probe) v
+          CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
+}
+run_sql "cleanup of an earlier run" "CALL vvector.unregister_index('$IXC');" > /dev/null
+[ "$ECHO_ONLY" = yes ] || rm -rf "${ALT:?}/$IXC"
+expect "register a static index with cache_dir $ALT, refresh" "index $IXC refreshed: snapshot [0-9]*, full build" "
+CALL vvector.register_index('$IXC', '$SCHEMA.vectors', 'id', 'vec', NULL, NULL, 'l2', NULL, 'flat');
+CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '$ALT');
+CALL vvector.refresh_index('$IXC');"
+expect "vinfo without cache_dir finds the snapshot in that directory" "^every node: $ALT$" "$(vinfo_file "$ALT")"
+expect "a search without cache_dir finds it too" "^rows: 3$" "$SEARCH_C"
+if [ "$ECHO_ONLY" = no ]; then
+    if [ -f "$ALT/$IXC/ACTIVE" ] && ! ls /tmp/vvector/$IXC/*.vv > /dev/null 2>&1 && grep -q "cache_dir=$ALT" /tmp/vvector/$IXC/OPTIONS; then
+        echo "PASS  this node: the snapshot is in $ALT, the default directory holds only OPTIONS naming it"
+    else
+        echo "FAIL  this node: the snapshot is in $ALT, the default directory holds only OPTIONS naming it"
+        ls -la "$ALT/$IXC" /tmp/vvector/$IXC 2>&1 | sed 's/^/      got: /' | head -12
+        FAILED=$((FAILED + 1))
+    fi
+fi
+expect "the stale check works through the redirect" "snapshot cache stale on .*: run vload" "
+SELECT vvector.vsearch($Q, 999999999 USING PARAMETERS index_name='$IXC') OVER() FROM dual;"
+expect "status names the directory" "node cache directory: $ALT (index option cache_dir)" "CALL vvector.status('$IXC');"
+expect "a path with .. is refused" "cache_dir must be an absolute path of letters, digits and / . _ - without . or .. parts, or default" "
+CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/tmp/../etc');"
+expect "a directory that cannot be used is refused with vload's message" "vload: on .*cannot create directory /proc/vvector_no" "
+CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/proc/vvector_no');"
+expect "... and the option stays" "node cache directory: $ALT (index option cache_dir)" "CALL vvector.status('$IXC');"
+expect "... and searches still work" "^rows: 3$" "$SEARCH_C"
+expect "back to the default directory: loaded there at once" "^every node: /tmp/vvector$" "
+CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'default');
+$(vinfo_file /tmp/vvector)"
+expect "a search without cache_dir uses it" "^rows: 3$" "$SEARCH_C"
+expect "unregister names the directory the cache files stay in" "Cache files under <cache_dir>/$IXC stay" "CALL vvector.unregister_index('$IXC');"
+[ "$ECHO_ONLY" = yes ] || rm -rf "${ALT:?}/$IXC" "/tmp/vvector/$IXC"
 
 run_sql "cleanup" "DELETE FROM vvector.snapshot WHERE index_name = 'vvtest'; COMMIT;" > /dev/null
 

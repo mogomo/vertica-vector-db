@@ -1,7 +1,10 @@
 // vvector engine: per-node snapshot cache.
 //   <cache_dir>/<index>/<snapshot_id>.vv   snapshot file, read with mmap
 //   <cache_dir>/<index>/ACTIVE             text file with the active snapshot id
-//   <cache_dir>/<index>/OPTIONS            text file with the index defaults (set_index_options)
+//   <cache_dir>/<index>/OPTIONS            text file with the index defaults (set_index_options);
+//                                          it may name another cache directory of the index (the
+//                                          index option cache_dir): a query then reads ACTIVE,
+//                                          OPTIONS and the snapshot there (one hop, never a chain)
 // POSIX only. No Vertica includes.
 #ifndef VVECTOR_ENGINE_CACHE_H
 #define VVECTOR_ENGINE_CACHE_H
@@ -31,13 +34,22 @@ bool valid_index_name(const std::string &index);
 
 std::string snapshot_path(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id);
 
+// <cache_dir>/<index>, created (mode 0700) when it is missing.
+std::string ensure_index_dir(const std::string &cache_dir, const std::string &index);
+
 // Returns false when the index has no ACTIVE file in this cache.
 bool read_active(const std::string &cache_dir, const std::string &index, std::int64_t &snapshot_id);
 
-// Names of the indexes that have an ACTIVE file in this cache.
+// Names of the indexes that have an ACTIVE or an OPTIONS file in this cache, in directories owned
+// by this process's user.
 std::vector<std::string> list_cached_indexes(const std::string &cache_dir);
 
-// Index defaults: name -> value. Names: precision, freshness, ef_search, threads.
+// A cache directory given as an index option: an absolute path of letters, digits and / . _ -,
+// without "." or ".." components, at most 1000 characters.
+bool valid_cache_dir(const std::string &dir);
+
+// Index defaults: name -> value. Names: precision, freshness, ef_search, threads, memory_mode,
+// cache_dir (the directory that holds the index, when it is not this one).
 using IndexOptions = std::map<std::string, std::string>;
 
 // Parses "name=value" items separated by newlines or commas. Empty values are left out.
@@ -60,20 +72,25 @@ public:
 
     // verify: read and check the whole file (vload). Otherwise (a query mapping) the kernel is asked
     // to read the file ahead; compact (memory_mode compact, an index with sq8 codes): everything but
-    // the float rows, which only rescoring reads, a few rows per query.
-    void open(const std::string &path, bool verify, bool compact = false);
+    // the float rows, which only rescoring reads, a few rows per query. prewarm false: no read-ahead
+    // advice (vinfo, which must not load a file just to report how much of it is in memory).
+    void open(const std::string &path, bool verify, bool compact = false, bool prewarm = true);
     // Opens the active snapshot of an index. The mapping is kept by the process and shared by later
     // calls: a new mapping of a large file pays a page fault for every page a search touches, which
     // costs several times the search. What ACTIVE and OPTIONS say is trusted for ACTIVE_CHECK_MS;
     // after that, or when the kept snapshot is older than at_least, both are read again (at_least =
     // the largest int64: always read them again). A kept
     // mapping is dropped when its file is gone or replaced, or its index has a newer snapshot.
-    void open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least = 0);
+    void open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least = 0,
+                     bool prewarm = true);
 
     const VectorSet &vectors() const { return set_; }
     std::int64_t snapshot_id() const { return snapshot_id_; }
     const std::string &path() const { return path_; }
     std::uint64_t size() const { return size_; }
+    // Bytes of the mapped file that are in memory now (page cache), from mincore: what a query can
+    // read without going to disk. Takes about 1 ms per 4 GB.
+    std::uint64_t resident_bytes() const;
     // The index defaults read with the snapshot (open_active only).
     const IndexOptions &options() const { return options_; }
 

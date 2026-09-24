@@ -122,6 +122,7 @@ floats, so scores agree to about 7 digits):
     make deploy               # install into the database, fenced (the default)
     make deploy FENCED=no     # every function inside the Vertica process
     make deploy FENCED=mixed  # vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion not fenced
+    make deploy SEARCH=public # searching for every user (default: the role vvector_search)
     make undeploy             # remove the library and its functions; tables and data stay
     tests/sql/run_all.sh      # integration tests: fenced, unfenced, mixed (creates test schemas)
 
@@ -151,29 +152,39 @@ snapshots, which are in schema `vvector_admin`:
 | `vvector.manifest` | table: one row per index with its source, options and state |
 | `vvector.probe` | table (8192 rows, segmented): makes node-wise functions run once on every node |
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
-| role `vvector_admin` | may build, load and manage indexes |
+| role `vvector_admin` | may build, load and manage indexes; holds `vvector_search` |
+| role `vvector_search` | may search (the functions in `vvector`) |
 | functions in `vvector` | `vsearch`, `vknn`, `vinfo`, `vversion` (search and information) |
 | functions in `vvector_admin` | `vbuild`, `vload`, `vconfig`, `vnode` (build and load; `refresh_index` and `load_all` call them) |
 | procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
 
 Rights:
 
-- **Searching is open to everyone.** `vsearch`, `vknn`, `vinfo`, `vversion`
-  and the procedure `sizing` are granted to PUBLIC. A search needs no view:
-  `vknn` and `vsearch ... FROM dual` with the `query` parameter search any
-  index by its name. So SELECT on the views of an index does not decide who
-  may search it. The views protect the journal rows only: the `_delta` view
-  shows the rows of the source table, and it is not granted to anyone. Grant
-  SELECT on the views to the users who should run exact searches (with the
-  changes since the refresh). Anyone who may connect can find the k nearest
-  ids of any index; do not index vectors whose ids or distances must stay
-  hidden from some users of the database.
+- **Searching needs the role `vvector_search`**: `vsearch`, `vknn`, `vinfo`,
+  `vversion` and the vector functions (`GRANT vvector_search TO someone;
+  ALTER USER someone DEFAULT ROLE vvector_search;`, or `SET ROLE
+  vvector_search` in the session). `make deploy SEARCH=public` opens
+  searching to every user, as it was before milestone M6 (a role granted to
+  PUBLIC is not enabled for anyone in Vertica, so `GRANT vvector_search TO
+  PUBLIC` does not do that). The procedure
+  `sizing` is open to everyone. The role covers every index: a search needs
+  no view (`vknn` and `vsearch ... FROM dual` with the `query` parameter
+  search any index by its name), so SELECT on the views of an index does not
+  decide who may search it. The views protect the journal rows only: the
+  `_delta` view shows the rows of the source table, and it is not granted to
+  anyone. Grant SELECT on the views to the users who should run exact
+  searches (with the changes since the refresh). Whoever has the role can
+  find the k nearest ids of any index.
+- **The manifest** (`vvector.manifest`: source tables, boundaries, who runs a
+  refresh) is readable by `vvector_admin` only; queries never read it.
 - **Building and loading needs the role `vvector_admin`**
   (`GRANT vvector_admin TO someone; ALTER USER someone DEFAULT ROLE vvector_admin;`,
   or `SET ROLE vvector_admin` in the session): the functions in schema
   `vvector_admin` and every procedure except `sizing`. `vbuild` is there
   because an incremental build reads a whole snapshot from the node cache:
   open to everyone, it would hand out the vectors of every index.
+  `vvector_admin` holds `vvector_search`, so an index administrator can also
+  search.
   `schedule_refresh` also needs a superuser: Vertica lets only a superuser
   create a trigger.
 - Rights are given per schema because Vertica 26.2 cannot grant a single
@@ -302,7 +313,9 @@ The refresh marks the manifest row (`refresh_started_at`,
 If its session is killed or its node goes down, the mark stays. The next
 refresh ignores it at once when the session is gone from
 `v_monitor.sessions` and the caller can see that: a superuser sees every
-session, another user only its own. A refresh started by
+session, another user only its own. A mark of the caller's own session is
+ignored too (a refresh of that session failed on a cluster in a way that left
+the mark). A refresh started by
 [schedule_refresh](#schedule_refresh) runs in a session that
 `v_monitor.sessions` does not show; its mark reads "scheduled, internal
 session ..." and counts by its age only. A mark is always ignored after 6
@@ -394,7 +407,10 @@ replaces the schedule.
 
     CALL vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
                                    tombstone_ratio, rebuild_every, memory_mode, precision_default,
-                                   freshness_default, ef_search_default, threads_default [, verify_every]);
+                                   freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir]]);
+
+    -- keep the node caches of index docs on a data disk (loaded there at once):
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/data/vvector');
 
     -- verify the journal every 10 refreshes instead of at every one:
     CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 10);
@@ -407,7 +423,8 @@ replaces the schedule.
 
     NOTICE 2005:  vvector: index docs options changed. Build options apply at the next refresh; query defaults apply now.
 
-NULL keeps a value; the 13-argument form leaves `verify_every` as it is.
+NULL keeps a value; the 13-argument form leaves `verify_every` and `cache_dir`
+as they are, the 14-argument form `cache_dir`.
 Query defaults (precision, freshness, ef_search, threads) apply at once on every
 node (within 200 ms); `'default'` (text) or `0` (numbers) sets one back to the
 built-in default. Build options apply at the next refresh. Values that belong
@@ -427,6 +444,17 @@ to later milestones are refused with a message that names the milestone.
 | freshness_default | snapshot, exact | snapshot | in use |
 | ef_search_default | 0 to 100000 | 0 (preset) | in use (HNSW) |
 | threads_default | 0 (one per core) to 64 | 0 | in use |
+| cache_dir | an absolute path (letters, digits, `/ . _ -`), or `default` | the default directory (`/tmp/vvector`, or the session parameter) | in use: where every node keeps the cache files of this index; see [Operations](#operations) |
+
+`cache_dir` takes effect at once: the active snapshot is loaded into the new
+directory on every node (as `load_all` does), and the change counts only when
+every node has it; if a node cannot load it, the option stays as it was and
+the error (vload's) says why. The files in the old
+directory stay; remove them by hand. From then on the refresh, `load_all` and
+`status` use the option, also in a session that sets the `cache_dir` session
+parameter. Queries without a `cache_dir` parameter find the index through a
+small `OPTIONS` file that names the directory, which vvector writes into the
+default directory (and into the one of the calling session) on every node.
 
 ### status and sizing
 
@@ -550,7 +578,7 @@ Parameters:
 | exact | false | true, false | `true` reads every vector of an HNSW index (the same as `precision='exact'`) |
 | rescore, oversampling | preset of precision | true or false; 1 to 100 | sq8 only: rank by the bytes, then compute the exact scores of the best k x oversampling candidates from the floats (`rescore=true`), or return the k best with approximate scores (`rescore=false`). No effect on an index without sq8 |
 | filtered | false | true, false | `true` returns only allow-listed ids even when the input has no allow-list row (a filter that matched nothing returns nothing); without it, allow-list rows alone switch the filter on |
-| cache_dir | `/tmp/vvector` | absolute path | where the node cache is |
+| cache_dir | the index option `cache_dir`, else `/tmp/vvector` | absolute path | where the node cache is; without it (and without the session parameter) a query follows the index option |
 
 Every tuning value except `index_name`, `query`, `radius` and `filtered` can also be set
 for a session, and `precision`, `freshness`, `ef_search` and `threads` per
@@ -1125,8 +1153,8 @@ estimates an index before you load it.
 ## Vector functions
 
 Vertica 26.2 has no arithmetic on arrays (`ARRAY[1, 2] + ARRAY[3, 4]` is an
-error). vvector adds what is missing, in schema `vvector`, for everyone
-(PUBLIC). They compute in FLOAT64; ARRAY[INT] and ARRAY[NUMERIC] arguments
+error). vvector adds what is missing, in schema `vvector`, for the role
+`vvector_search` (for everyone with `make deploy SEARCH=public`). They compute in FLOAT64; ARRAY[INT] and ARRAY[NUMERIC] arguments
 are cast to ARRAY[FLOAT] (except Hamming and Jaccard, which take ARRAY[INT]).
 A NULL argument gives NULL. Vectors of different lengths and NULL elements
 are errors. They run fenced unless deployed with `FENCED=no` or `mixed`.
@@ -1253,17 +1281,43 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   Without `index_name` it lists every index in the cache directory.
   Other columns: max_ver, quantization, graph_bytes, tombstones,
   base_snapshot, precision_default, ef_search_default, threads_default,
-  cache_file (or why the cache cannot be read).
-- **Cache directory**: `/tmp/vvector` by default. Another one per session:
-  `ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/data/vvector';`
+  cache_file (or why the cache cannot be read), resident_mb (how much of the
+  cache file is in the node's memory now: what a query reads without going to
+  disk; vinfo itself reads nothing ahead).
+- **Cache directory**: `/tmp/vvector` by default. Per index (recommended):
+  the option `cache_dir` of [set_index_options](#set_index_options); the
+  procedures and every query then use it without further settings. Per
+  session: `ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/data/vvector';`
   (the refresh and every query must use the same one), or `cache_dir=` per
-  call. `/tmp` may be cleaned at reboot: that is safe (`load_all` restores
-  it), but a node answers "run vload" until then. Use a directory on a data
-  disk that belongs to the database's operating system user (vload creates
-  it with mode 0700 if it is missing): a search reads only cache files and
-  index directories of that user, and treats any other as "no cache" (the
-  search functions are PUBLIC and any user can set cache_dir, so a file
-  someone else wrote is never read).
+  call. The order: the function parameter, the session parameter, the index
+  option, the default; inside the procedures the index option comes first.
+  `/tmp` may be cleaned at reboot: that is safe (`load_all` restores it),
+  but a node answers "run vload" until then. Use a directory on a data disk
+  that belongs to the database's operating system user (vload creates it
+  with mode 0700 if it is missing): a search reads only cache files and
+  index directories of that user, and treats any other as "no cache" (any
+  user who may search can set cache_dir, so a file someone else wrote is
+  never read).
+- **Memory**: a search reads the cache file through the page cache, and
+  `vinfo` shows how much of it is in memory (`resident_mb`). Vertica's own
+  scans go through the same cache, so a large scan can push index pages out;
+  the next search then reads them from disk (on the test VM: one search of
+  0.3 s for a 632 MB index, then normal speed; at 100M vectors a minute or
+  more). Two ways to keep an index in memory, both with `cache_dir` on a RAM
+  file system: `/dev/shm` (no setup; the memory is taken for good, and
+  after a reboot the cache is empty until `load_all`), or a tmpfs mounted
+  with huge pages, which is also faster (a root step on every node, for
+  example `mount -t tmpfs -o size=8G,huge=always,mode=0755 tmpfs
+  /data/vvhot` and `chown` to the database user): on the test VM batches of
+  1000 searches took 22% less time and single searches 4 instead of 5 ms.
+  Size it for the index files of every index placed there, plus one more
+  snapshot during a refresh.
+  A refresh whose build needs more than half of the smallest node's free
+  memory (with the page cache) builds in a file in the index's cache
+  directory instead, about 10% slower, and says so in its note; the kernel
+  can then write the build out instead of running out of memory. That does
+  not get around `FencedUDxMemoryLimitMB`: Vertica applies it as the address
+  space limit of the fenced process, which counts a file mapping too.
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options
   are rows of `vvector.manifest`: a backup of the database contains them.
 - **Disk space**: a refresh keeps the active and the previous snapshot in the
@@ -1296,6 +1350,11 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   no refresh runs; the copy takes about as long as writing the stored
   snapshots once (2.3 GB: a few seconds on the test VM). The copy does not
   touch the caches on the nodes, which stay valid.
+  Upgrading from a version before milestone M6, where searching was open to
+  PUBLIC: `make deploy` moves the search functions to the role
+  `vvector_search` and closes the manifest to PUBLIC. Grant the role to the
+  users who search, or deploy with `make deploy SEARCH=public` to keep the
+  old behaviour.
 - **Monitoring**: the refresh labels its statements `vvector_verify` (count
   and digest of the journal recomputed), `vvector_digest` (carried forward from
   the new rows, or taken for a full build), `vvector_build` and `vvector_load`:
@@ -1309,12 +1368,12 @@ by hand.
 
 | Function | Rights | What it does |
 |---|---|---|
-| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
+| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
 | `vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time |
-| `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; returns (node_name, status) |
+| `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir, index_cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; with `index_cache_dir` (the index option; '' = none) into that directory, plus an OPTIONS file that names it in the default directory and in the session's; returns (node_name, status) |
 | `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
-| `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | PUBLIC | what every node has cached (see above) |
-| `vvector.vversion() OVER()` | PUBLIC | (library_version, format_version, build_flags) |
+| `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | vvector_search | what every node has cached (see above) |
+| `vvector.vversion() OVER()` | vvector_search | (library_version, format_version, build_flags) |
 
 A snapshot built and loaded by hand (the procedures do the same, plus the
 views, the manifest and the checks):
@@ -1376,12 +1435,13 @@ cache), starting with `vknn:`.
 | `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
 | `vload: on NODE: pieces are missing or duplicated`, `bad snapshot: checksum mismatch`, `cannot write ...` | a damaged transfer or a full disk | check disk space of cache_dir; `load_all` |
 | `vload`, `vinfo`, `vsearch`: `cache_dir '...' must be an absolute path`, `index name '...' is not valid` | bad cache_dir or index name | use `/path` and letters, digits, underscore |
-| `vsearch: index 'x': OPTIONS file in the cache: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
+| `vsearch: index 'x': OPTIONS file in the cache DIR: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
 | `vvector.register_index: ...` (table, column, type, metric, margin, op_col needs ver_col, already registered) | a bad argument; the message names it | fix the argument |
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
 | `vvector.refresh_index: index x: no live vector up to the delta boundary B ...; N rows of T are newer` | every live row was written after the boundary (within the margin before the refresh, or after the start of an open writer), for example the first refresh right after a load | refresh again when the margin has passed; the rows are found meanwhile with `freshness='exact'`. On one node with `CLOCK_TIMESTAMP()` versions a margin of 0 is safe |
 | `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
 | `vvector.refresh_index: index x is being refreshed since T UTC (by USER, session S). Two refreshes of one index cannot run at the same time ...` | another refresh of the index runs (by hand or by the schedule), or one was killed and left its mark (a superuser, or the same user, gets past a killed one at once) | wait until it ends; if none runs, `UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'x'; COMMIT;` (or wait for the hours the message names) |
+| `Function vvector.vsearch(...) does not exist, or permission is denied for vvector.vsearch(...)` (or vknn, vinfo, a vector function) | the user lacks the role `vvector_search`, or has it but not enabled | `GRANT vvector_search TO someone; ALTER USER someone DEFAULT ROLE vvector_search;` (or `make deploy SEARCH=public`) |
 | `Permission denied for schema vvector_admin` | a build or load function called without the role `vvector_admin` | `GRANT vvector_admin TO someone;` and enable it (default role or `SET ROLE`) |
 | `Function vvector.refresh_index(unknown) does not exist, or permission is denied ...` (any procedure) | the caller lacks the role `vvector_admin`, or has it but not enabled in the session | grant it and enable it (default role or `SET ROLE vvector_admin`) |
 | `Only a Super User can drop triggers` (from `schedule_refresh`) | `schedule_refresh` was called by a user who is not a superuser | a superuser runs `schedule_refresh` |
@@ -1561,11 +1621,12 @@ Vertica and SDK:
 - A transform function is not called on empty input: the views carry a
   sentinel row for that reason.
 - Rights are granted per schema (Vertica cannot grant a single function with
-  an ARRAY argument): the search functions in `vvector` are PUBLIC, the build
-  and load functions in `vvector_admin` need the role `vvector_admin`.
-- Searching is PUBLIC and cannot be limited per index: `vknn` and
-  `vsearch ... FROM dual` search any index by name, without a view. The views
-  protect the journal rows, not the index.
+  an ARRAY argument): the search functions in `vvector` need the role
+  `vvector_search`, the build and load functions in `vvector_admin` the role
+  `vvector_admin`.
+- Searching cannot be limited per index: whoever has `vvector_search` can
+  search every index by name (`vknn`, `vsearch ... FROM dual`), without a
+  view. The views protect the journal rows, not the index.
 - `schedule_refresh` needs a superuser (Vertica: only a superuser may create
   a trigger).
 - A UNION ALL of `ARRAY[INT]` and `ARRAY[NUMERIC]` columns fails inside

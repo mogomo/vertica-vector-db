@@ -2,10 +2,11 @@
 //   vvector.vinfo([USING PARAMETERS index_name='docs']) OVER(PARTITION NODES) FROM vvector.probe
 // Output (node_name, index_name, snapshot_id, max_ver, vector_count, dims, metric, index_type,
 // quantization, graph_bytes, tombstones, base_snapshot, precision_default, freshness_default,
-// ef_search_default, threads_default, cache_file, loaded). The defaults are the index defaults of
-// set_index_options (NULL = the built-in default). vector_count counts the live vectors; the
-// snapshot has vector_count + tombstones positions.
-// Without index_name it lists every index of the cache directory that has an ACTIVE file.
+// ef_search_default, threads_default, cache_file, loaded, resident_mb). The defaults are the index
+// defaults of set_index_options (NULL = the built-in default). vector_count counts the live vectors;
+// the snapshot has vector_count + tombstones positions. resident_mb: how much of the cache file is in
+// the node's memory now (page cache; milestone M6).
+// Without index_name it lists every index of the cache directory that has an ACTIVE or OPTIONS file.
 #include "udx_common.h"
 
 #include <limits>
@@ -16,7 +17,7 @@ using namespace vvector_udx;
 static const char *const FN = "vinfo";
 
 enum { C_NODE, C_INDEX, C_SNAPSHOT, C_MAX_VER, C_COUNT, C_DIMS, C_METRIC, C_TYPE, C_QUANT, C_GRAPH, C_TOMB, C_BASE,
-       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_COLUMNS };
+       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_COLUMNS };
 
 class VInfo : public TransformFunction
 {
@@ -46,7 +47,8 @@ class VInfo : public TransformFunction
                     // Always read ACTIVE again, not what this process trusted for the last 200 ms:
                     // refresh_index calls vinfo right after a vload in the same session.
                     vvector::MappedSnapshot snap;
-                    snap.open_active(cache_dir, name, std::numeric_limits<std::int64_t>::max());
+                    // No read-ahead advice: vinfo reports what is in memory and must not load it.
+                    snap.open_active(cache_dir, name, std::numeric_limits<std::int64_t>::max(), false);
                     const vvector::VectorSet &s = snap.vectors();
                     out.setInt(C_SNAPSHOT, snap.snapshot_id());
                     out.setInt(C_MAX_VER, s.max_ver);
@@ -64,11 +66,13 @@ class VInfo : public TransformFunction
                     option(out, C_THREADS, snap.options(), "threads");
                     out.getStringRef(C_FILE).copy(snap.path());
                     out.setBool(C_LOADED, vbool_true);
+                    out.setInt(C_RESIDENT, (vint)(snap.resident_bytes() / 1048576));
                 } catch (std::runtime_error &e) {
                     // Not loaded or damaged: say why in the cache_file column.
                     for (int c = C_SNAPSHOT; c < C_FILE; ++c) out.setNull(c);
                     out.getStringRef(C_FILE).copy(std::string(e.what()).substr(0, 1024));
                     out.setBool(C_LOADED, vbool_false);
+                    out.setNull(C_RESIDENT);
                 }
                 out.next();
             }
@@ -77,6 +81,7 @@ class VInfo : public TransformFunction
                 for (int c = C_INDEX; c < C_FILE; ++c) out.setNull(c);
                 out.getStringRef(C_FILE).copy("no indexes in " + cache_dir);
                 out.setBool(C_LOADED, vbool_false);
+                out.setNull(C_RESIDENT);
                 out.next();
             }
         } catch (std::exception &e) {
@@ -97,6 +102,7 @@ class VInfoFactory : public TransformFunctionFactory
         for (int i = 0; i < 4; ++i) returnType.addVarchar();
         returnType.addVarchar();           // cache_file
         returnType.addBool();
+        returnType.addInt();               // resident_mb
     }
 
     virtual void getReturnType(ServerInterface &srvInterface, const SizedColumnTypes &inputTypes,
@@ -120,6 +126,7 @@ class VInfoFactory : public TransformFunctionFactory
         outputTypes.addVarchar(16, "threads_default");
         outputTypes.addVarchar(1200, "cache_file");
         outputTypes.addBool("loaded");
+        outputTypes.addInt("resident_mb");
     }
 
     virtual void getParameterType(ServerInterface &srvInterface, SizedColumnTypes &parameterTypes)

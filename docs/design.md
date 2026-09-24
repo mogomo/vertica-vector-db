@@ -343,7 +343,21 @@ project this code comes from):
 - Layout: `<cache_dir>/<index>/<snapshot_id>.vv`, `<cache_dir>/<index>/ACTIVE`
   and `<cache_dir>/<index>/OPTIONS` (the index defaults of set_index_options).
 - cache_dir: function parameter, then session parameter
-  (`ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '...'`), then `/tmp/vvector`.
+  (`ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '...'`), then the
+  index option `cache_dir` (milestone M6), then `/tmp/vvector`. A query cannot
+  read the manifest, so the option reaches it as a file: vconfig writes the
+  index defaults into the index's directory, and into the default directory
+  (and the calling session's) an OPTIONS file that also holds
+  `cache_dir=<dir>`. `open_active` reads OPTIONS in the directory it resolved;
+  when that names another directory it takes ACTIVE, OPTIONS and the snapshot
+  from there: one hop, never a chain, both directories owned by the database
+  user. The redirect is read with ACTIVE, inside the 200 ms trust window, so a
+  warm query still does no file system work. The procedures pass the option to
+  vbuild, vload, vinfo and vconfig as the function parameter (vload must write
+  there whatever a session says). A new value loads the active snapshot into
+  the new directory in the same transaction and is committed only after every
+  node loaded it; a failure rolls it back (no exception handler: around a
+  failing multi-node UDx query PL/vSQL gets "Operation canceled").
 - vload writes to a temporary file, verifies size, structure, checksum and id
   order, renames it into place, replaces ACTIVE by rename and syncs the
   directory. A failed load leaves the cache as it was.
@@ -402,6 +416,58 @@ project this code comes from):
   2 bytes per vector per search thread of visited marks in the process
   between calls (2 MB per thread for 1M vectors).
 
+## Memory placement (milestone M6)
+
+Measured on the VM (Vertica 26.2.0-1, 34 GB, SIFT1M HNSW index of 632 MB,
+fenced, single searches from one session and batches of 1000 queries; local
+results of session 12).
+
+- The search side is lazy by construction: the cache file is mapped
+  read-only and shared, pages come in when a search touches them and are
+  file cache, which the kernel can reclaim. `vinfo` reports `resident_mb`
+  (mincore over the file): how much of it is in memory now. vinfo maps the
+  file without read-ahead advice, so asking does not load it.
+- Vertica reads its own storage through the page cache: a scan of a 269 MB
+  table (after the cache was emptied) grew the page cache by 277 MB. So large
+  scans compete with the index pages under the kernel's LRU.
+- Worst case, the whole page cache emptied (`drop_caches`): `resident_mb`
+  4 MB; the first search 321 ms, the next four 15 ms on average, then normal
+  again (median 7 ms); after the series the file was resident again (630
+  MB): the read-ahead advice of the new mapping reloads the whole file at
+  disk speed (here about 2 GB/s). At 100M vectors (66 GB for HNSW) the same
+  reload takes the better part of a minute, and the searches during it are
+  slow: that is where the next two points matter.
+- A cache directory on tmpfs (`/dev/shm`, the index option `cache_dir`):
+  the same warm speed (median 5 to 6 ms) and immune to eviction: after the
+  page cache was emptied the index stayed resident and the first search took
+  10 ms. The price: the memory is taken for good, and after a reboot the
+  cache is empty until `load_all` (or the next refresh) fills it.
+- Huge pages: a tmpfs mounted with `huge=always` (a DBA's mount; the test
+  used 2 GB at /mnt/vvhuge, removed afterwards) held the file on 2 MB pages
+  (ShmemHugePages 651 MB). Batches of 1000 queries took 28 to 29 ms instead
+  of 35 to 37 ms (22% less), single searches a median of 4 instead of 5 ms:
+  the graph walk's random reads miss the TLB less. A file on xfs cannot get
+  huge pages for a read-only mapping on these kernels, and copying the
+  snapshot into anonymous memory would break the "mmap, no copies" rule, so
+  this is a deployment recommendation (README), not code.
+- `FencedUDxMemoryLimitMB` is enforced as the address-space limit (RLIMIT_AS)
+  of each fenced process (VERTICA_NOTES): with 400 MB, a SIFT1M build fails at
+  its first 257 MB mapping, in memory or in a file alike.
+- The build buffer can live in a file (vbuild `build_in='file'`: an unlinked
+  file in the index's cache directory, mapped shared, grown with ftruncate
+  and mremap): its pages are page cache that the kernel writes out and
+  reclaims, so a build larger than the free memory finishes, slower, instead
+  of running the node out of memory. Cost where memory is plentiful: flat
+  SIFT1M 3.64 to 3.88 s (+7%), HNSW 36.7 to 41.6 s (+13%); the bytes are
+  identical. `refresh_index` chooses it by itself when the build estimate
+  (the one `status` prints) exceeds half of the smallest node's free memory
+  plus page cache, and says so in the refresh note. It does not get around
+  `FencedUDxMemoryLimitMB` (address space).
+- A separate `hot_dir` for the ids, codes and graph (PLAN 17.1 d) is not
+  built: at the scales measured so far one slow search per eviction is the
+  whole cost, and `cache_dir` on a tmpfs already pins a whole index. To be
+  decided with the 100M proof, where the float rows alone are 51 GB.
+
 ## Freshness: exact results between refreshes
 
 The vector table is a journal: rows are only inserted, a delete is a row with
@@ -456,8 +522,11 @@ unique, it can change, and it cannot be part of a projection.
   build reads less.
 - One refresh per index at a time: a refresh marks the manifest row with one
   conditional UPDATE (`refresh_started_at`, `refresh_started_by` = user and
-  session) and removes the mark at the end, also on error. A mark whose
-  session is gone from `v_monitor.sessions` is ignored at once (milestone M6),
+  session) and removes the mark at the end, also on error (as far as PL/vSQL
+  can catch it: a UDx query that fails on several nodes ends the CALL without
+  the handler, VERTICA_NOTES; a mark of the caller's own session is therefore
+  also ignored). A mark whose session is gone from `v_monitor.sessions` is
+  ignored at once (milestone M6),
   so a killed refresh no longer blocks the index for hours. A superuser sees
   every session there, another user only its own, so the check covers what
   the caller can see. A refresh run by a schedule trigger runs in a session

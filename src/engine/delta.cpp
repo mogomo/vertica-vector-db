@@ -139,6 +139,7 @@ bool IncrementalBuilder::finish(std::int64_t max_ver, std::int64_t base_snapshot
     snapshot_layout(h);
 
     SnapshotBuffer buf;
+    buf.swap(out);                  // takes over out's file backing, if it has one (build_in='file')
     buf.allocate(h.total_bytes);
     std::uint8_t *base = buf.data();
     const std::size_t row_bytes = std::size_t(stride) * 4;

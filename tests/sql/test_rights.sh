@@ -7,9 +7,11 @@
 # Creates a user vvrights_<random suffix> with a random password, the role vvector_admin as its
 # default role, USAGE and CREATE on the test schema and SELECT on the journal. As that user:
 # register_index, refresh_index (first build, incremental, full), status, searches (vsearch over the
-# delta view, vsearch FROM dual, vknn) and unregister_index. With its roles switched off (SET ROLE
-# NONE) the same user can still search (the search functions are PUBLIC), but cannot call vbuild,
-# vload, vconfig or vnode (schema vvector_admin), read vvector.snapshot or run refresh_index.
+# delta view, vsearch FROM dual, vknn) and unregister_index (vvector_admin holds vvector_search).
+# With its roles switched off (SET ROLE NONE) the same user cannot search (vsearch, vknn, vinfo need
+# the role vvector_search since milestone M6), cannot read the manifest, cannot call vbuild, vload,
+# vconfig or vnode (schema vvector_admin), read vvector.snapshot or run refresh_index; sizing stays
+# open. With the role vvector_search alone it can search, but not build, load or read the manifest.
 # The user and the schema are dropped at the end, also when the test fails (EXIT trap).
 #
 # Needs a superuser connection (CREATE USER); skipped with a message otherwise.
@@ -102,15 +104,25 @@ expect_as "vsearch over the delta view" "^rows 10$" "
 SELECT 'rows ' || COUNT(*) FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
     USING PARAMETERS index_name='$IX', query='$QUERY', k=10, freshness='exact') OVER() FROM $SCHEMA.${IX}_delta) s;"
 
-echo "== the same user with its roles switched off: search yes, build and load no"
-expect_as "vsearch FROM dual (PUBLIC)" "^rows 10$" "$NO_ROLE
-SELECT 'rows ' || COUNT(*) FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+DENIED="ermission denied\|does not exist, or permission is denied"
+SEARCH_DUAL="SELECT 'rows ' || COUNT(*) FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
     USING PARAMETERS index_name='$IX', query='$QUERY', k=10) OVER()
     FROM (SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec,
                  NULL::BOOLEAN AS del, NULL::INT AS ver, NULL::INT AS snapshot_id) d) s;"
-expect_as "vknn FROM dual (PUBLIC)" "^rows 5$" "$NO_ROLE
-SELECT 'rows ' || COUNT(*) FROM (SELECT vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='$IX', query='$QUERY', k=5) FROM dual) s;"
-DENIED="ermission denied\|does not exist, or permission is denied"
+KNN_DUAL="SELECT 'rows ' || COUNT(*) FROM (SELECT vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='$IX', query='$QUERY', k=5) FROM dual) s;"
+VINFO="SELECT 'vinfo rows ' || COUNT(*) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) i;"
+
+echo "== the same user with its roles switched off: no search, no build or load"
+expect_as "vsearch FROM dual is refused without the role vvector_search" "$DENIED" "$NO_ROLE
+$SEARCH_DUAL"
+expect_as "vknn is refused" "$DENIED" "$NO_ROLE
+$KNN_DUAL"
+expect_as "vinfo is refused" "$DENIED" "$NO_ROLE
+$VINFO"
+expect_as "the manifest cannot be read" "$DENIED" "$NO_ROLE
+SELECT COUNT(*) FROM vvector.manifest;"
+expect_as "sizing stays open to everyone" "vvector.sizing: 1000000 vectors of 128 dimensions" "$NO_ROLE
+CALL vvector.sizing(1000000, 128, 'hnsw', 'none');"
 expect_as "vbuild is refused" "$DENIED" "$NO_ROLE
 SELECT COUNT(*) FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='$IX', base_snapshot=1) OVER() FROM $SCHEMA.journal) b;"
 expect_as "vload is refused" "$DENIED" "$NO_ROLE
@@ -122,6 +134,22 @@ SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM v
 expect_as "vvector.snapshot cannot be read" "$DENIED" "$NO_ROLE
 SELECT COUNT(*) FROM vvector.snapshot;"
 expect_as "refresh_index is refused" "$DENIED" "$NO_ROLE
+CALL vvector.refresh_index('$IX');"
+
+echo "== the role vvector_search alone: search yes, build, load and the manifest no"
+run_sql "grant vvector_search" "GRANT vvector_search TO $TEST_USER;" > /dev/null
+SEARCH_ROLE="SET ROLE vvector_search;"
+expect_as "vsearch FROM dual" "^rows 10$" "$SEARCH_ROLE
+$SEARCH_DUAL"
+expect_as "vknn FROM dual" "^rows 5$" "$SEARCH_ROLE
+$KNN_DUAL"
+expect_as "vinfo" "^vinfo rows [1-9]" "$SEARCH_ROLE
+$VINFO"
+expect_as "vbuild is refused" "$DENIED" "$SEARCH_ROLE
+SELECT COUNT(*) FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='$IX', base_snapshot=1) OVER() FROM $SCHEMA.journal) b;"
+expect_as "the manifest cannot be read" "$DENIED" "$SEARCH_ROLE
+SELECT COUNT(*) FROM vvector.manifest;"
+expect_as "refresh_index is refused" "$DENIED" "$SEARCH_ROLE
 CALL vvector.refresh_index('$IX');"
 
 echo "== back with the role"

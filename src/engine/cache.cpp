@@ -131,6 +131,14 @@ static std::string index_dir(const std::string &cache_dir, const std::string &in
     return cache_dir + "/" + index;
 }
 
+std::string ensure_index_dir(const std::string &cache_dir, const std::string &index)
+{
+    const std::string dir = index_dir(cache_dir, index);
+    make_dir(cache_dir);
+    make_dir(dir);
+    return dir;
+}
+
 std::string snapshot_path(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id)
 {
     return index_dir(cache_dir, index) + "/" + std::to_string(snapshot_id) + ".vv";
@@ -151,17 +159,37 @@ std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
     std::vector<std::string> indexes;
     DIR *d = opendir(cache_dir.c_str());
     if (!d) return indexes;
-    while (dirent *e = readdir(d))
-        if (valid_index_name(e->d_name) && owned(cache_dir + "/" + e->d_name) && is_file(cache_dir + "/" + e->d_name + "/ACTIVE"))
+    while (dirent *e = readdir(d)) {
+        const std::string dir = cache_dir + "/" + e->d_name;
+        if (valid_index_name(e->d_name) && owned(dir) && (is_file(dir + "/ACTIVE") || is_file(dir + "/OPTIONS")))
             indexes.push_back(e->d_name);
+    }
     closedir(d);
     std::sort(indexes.begin(), indexes.end());
     return indexes;
 }
 
+bool valid_cache_dir(const std::string &dir)
+{
+    if (dir.size() < 2 || dir.size() > 1000 || dir[0] != '/') return false;
+    std::size_t start = 1;
+    for (std::size_t i = 1; i <= dir.size(); ++i) {
+        if (i < dir.size() && dir[i] != '/') {
+            const char c = dir[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+                return false;
+            continue;
+        }
+        const std::string part = dir.substr(start, i - start);
+        if (part.empty() ? i < dir.size() : part.find_first_not_of('.') == std::string::npos) return false;
+        start = i + 1;
+    }
+    return true;
+}
+
 // ---- index options
 
-static const char *const OPTION_NAMES[] = {"precision", "freshness", "ef_search", "threads", "memory_mode"};
+static const char *const OPTION_NAMES[] = {"precision", "freshness", "ef_search", "threads", "memory_mode", "cache_dir"};
 
 IndexOptions parse_index_options(const std::string &text)
 {
@@ -181,6 +209,12 @@ IndexOptions parse_index_options(const std::string &text)
         bool known = false;
         for (const char *n : OPTION_NAMES) known = known || name == n;
         if (!known) throw std::runtime_error("unknown index option '" + name + "'");
+        if (name == "cache_dir") {
+            if (!value.empty() && !valid_cache_dir(value))
+                throw std::runtime_error("index option cache_dir: '" + value + "' is not an absolute path of letters, digits and / . _ -");
+            if (!value.empty()) out[name] = value;
+            continue;
+        }
         for (char c : value)
             if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
                 throw std::runtime_error("index option " + name + ": value '" + value + "' is not valid");
@@ -255,12 +289,28 @@ static void prewarm(void *m, std::uint64_t size, bool compact)
     madvise(static_cast<std::uint8_t *>(m) + rest, size - rest, MADV_WILLNEED);
 }
 
+std::uint64_t MappedSnapshot::resident_bytes() const
+{
+    if (!map_ || size_ == 0) return 0;
+    const std::uint64_t page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    const std::uint64_t pages = (size_ + page - 1) / page;
+#if defined(__APPLE__)
+    std::vector<char> in(pages);
+#else
+    std::vector<unsigned char> in(pages);
+#endif
+    if (mincore(map_, size_, in.data()) != 0) return 0;
+    std::uint64_t n = 0;
+    for (auto v : in) n += v & 1;
+    return std::min(n * page, size_);
+}
+
 MappedSnapshot::~MappedSnapshot()
 {
     if (map_ && !kept_) munmap(map_, size_);
 }
 
-void MappedSnapshot::open(const std::string &path, bool verify, bool compact)
+void MappedSnapshot::open(const std::string &path, bool verify, bool compact, bool prewarm_it)
 {
     int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) fail("cannot open", path);
@@ -276,7 +326,7 @@ void MappedSnapshot::open(const std::string &path, bool verify, bool compact)
     // the file is in the page cache (vload reads all of it to verify it), and after a restart it
     // reads the file in large pieces instead of page by page as the search touches it. Pre-mapping
     // every page (MAP_POPULATE) was measured: it makes the first query of a session slower.
-    if (!verify) prewarm(m, st.st_size, compact);
+    if (!verify && prewarm_it) prewarm(m, st.st_size, compact);
     if (map_ && !kept_) munmap(map_, size_);
     kept_.reset();
     map_ = m;
@@ -293,7 +343,8 @@ void MappedSnapshot::open(const std::string &path, bool verify, bool compact)
     }
 }
 
-void MappedSnapshot::open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least)
+void MappedSnapshot::open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least,
+                                 bool prewarm_it)
 {
     const std::string key = index_dir(cache_dir, index);
     const Clock::time_point now = Clock::now();
@@ -303,27 +354,42 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
                        st.snapshot_id >= at_least;
     if (!fresh) {
         std::int64_t id = 0;
-        struct stat dir_st;
-        if (stat(key.c_str(), &dir_st) == 0 && dir_st.st_uid != geteuid()) {
+        // The index directory, and the one its OPTIONS file names as the index's cache directory
+        // (the index option cache_dir; one hop, never a chain).
+        auto check_owner = [&](const std::string &dir) {
+            struct stat dir_st;
+            if (stat(index_dir(dir, index).c_str(), &dir_st) == 0 && dir_st.st_uid != geteuid()) {
+                states.erase(key);
+                throw std::runtime_error("no snapshot cache for index '" + index + "' in " + dir +
+                                         ": the directory is not owned by the database's operating system user");
+            }
+        };
+        auto options_of = [&](const std::string &dir) {
+            try {
+                return read_index_options(dir, index);
+            } catch (const std::runtime_error &e) {
+                throw std::runtime_error("index '" + index + "': OPTIONS file in the cache " + dir + ": " + e.what() + ": run vvector.load_all");
+            }
+        };
+        std::string dir = cache_dir;
+        check_owner(dir);
+        IndexOptions options = options_of(dir);
+        const auto home = options.find("cache_dir");
+        if (home != options.end() && home->second != dir) {
+            dir = home->second;
+            check_owner(dir);
+            options = options_of(dir);
+        }
+        options.erase("cache_dir");
+        if (!read_active(dir, index, id)) {
             states.erase(key);
-            throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir +
-                                     ": the directory is not owned by the database's operating system user");
+            throw std::runtime_error("no snapshot cache for index '" + index + "' in " + dir + ": run vload");
         }
-        if (!read_active(cache_dir, index, id)) {
-            states.erase(key);
-            throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir + ": run vload");
-        }
-        const std::string path = snapshot_path(cache_dir, index, id);
-        IndexOptions options;
-        try {
-            options = read_index_options(cache_dir, index);
-        } catch (const std::runtime_error &e) {
-            throw std::runtime_error("index '" + index + "': OPTIONS file in the cache: " + e.what() + ": run vvector.load_all");
-        }
+        const std::string path = snapshot_path(dir, index, id);
         if (!st.mapping || st.path != path || !st.mapping->is_file(path)) {
             try {
                 const auto mode = options.find("memory_mode");
-                open(path, false, mode != options.end() && mode->second == "compact");
+                open(path, false, mode != options.end() && mode->second == "compact", prewarm_it);
             } catch (const std::runtime_error &e) {
                 states.erase(key);
                 throw std::runtime_error(std::string("snapshot cache of index '") + index + "' is missing or damaged (" +

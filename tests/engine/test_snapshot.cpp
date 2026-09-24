@@ -4,6 +4,7 @@
 #include "../../src/engine/hnsw.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -188,6 +189,38 @@ int main()
         CHECK(t.set.ids[0] == 1 && t.set.ids[299] == 300);
         t.buffer.data()[h.off_graph + h.graph_bytes / 2] ^= 1;
         CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), true); }, "checksum"));
+    }
+
+    // A build in a file (SnapshotBuilder::build_in_file): the same bytes as a build in memory,
+    // with a graph and codes, in any order of arrival; the file is gone right away.
+    {
+        char tmpl[] = "/tmp/vvector_build_XXXXXX";
+        const std::string dir = mkdtemp(tmpl);
+        auto make = [&](bool in_file, SnapshotBuffer &out) {
+            SnapshotBuilder b(Metric::Cosine);
+            if (in_file) b.build_in_file(dir);
+            std::vector<float> v(40);
+            for (std::uint64_t i = 0; i < 30000; ++i) {
+                const std::uint64_t k = (i * 7919) % 30000;
+                test_vector(k, 40, 5, true, v.data());
+                b.add(static_cast<std::int64_t>(10 + 3 * k), v.data(), 40);
+            }
+            HnswParams p;
+            p.threads = 1;
+            const GraphSection g = hnsw_graph_section(p);
+            b.finish(9, out, &g);
+        };
+        SnapshotBuffer ram, file;
+        make(false, ram);
+        make(true, file);
+#if defined(__linux__)
+        CHECK(file.file_backed() && !ram.file_backed());
+#endif
+        CHECK(ram.size() == file.size() && std::memcmp(ram.data(), file.data(), ram.size()) == 0);
+        CHECK(!throws([&] { snapshot_open(file.data(), file.size(), true); }));
+        CHECK(std::system(("test -z \"$(ls -A " + dir + ")\"").c_str()) == 0);     // nothing left in the directory
+        file.clear();
+        std::system(("rm -rf " + dir).c_str());
     }
 
     return finish("test_snapshot");

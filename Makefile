@@ -11,7 +11,9 @@
 #                             engine benchmarks; with DATA_DIR on SIFT1M (DIR/sift_*.fvecs), else random
 #                             data (flat only); with HNSWLIB_DIR (a clone of github.com/nmslib/hnswlib)
 #                             also the same HNSW measurements made with hnswlib, for comparison
-#   make deploy [FENCED=yes|no|mixed]   install the library and functions (default: fenced)
+#   make deploy [FENCED=yes|no|mixed] [SEARCH=role|public]
+#                             install the library and functions (default: fenced; searching for the
+#                             role vvector_search, or for every user with SEARCH=public)
 #   make undeploy             remove functions and library
 #   make clean
 
@@ -19,6 +21,7 @@ SDK_HOME ?= /opt/vertica/sdk
 CXX      ?= g++
 OPT      ?= -O3
 FENCED   ?= yes
+SEARCH   ?= role
 
 # Same C++ ABI as the Vertica server. Always 1 since Vertica 24.1.
 VERTICA_CXX11_ABI ?= 1
@@ -81,7 +84,7 @@ $(BUILD_DIR)/tools/%: tools/%.cpp Makefile
 	$(CXX) $(COMMON_FLAGS) -o $@ $<
 
 deploy: $(LIB)
-	scripts/deploy.sh --fenced=$(FENCED)
+	scripts/deploy.sh --fenced=$(FENCED) --search=$(SEARCH)
 
 undeploy:
 	scripts/deploy.sh --undeploy

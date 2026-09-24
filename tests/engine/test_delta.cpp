@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -513,6 +514,42 @@ static void test_parallel_duplicates()
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
+// An incremental build into a file-backed buffer (vbuild build_in='file') gives the same bytes.
+static void test_incremental_in_file()
+{
+    Live live;
+    for (std::int64_t i = 0; i < 3000; ++i) live[i] = dup_vector(i, 12, 9);
+    HnswParams hp;
+    hp.m = 8;
+    hp.threads = 1;
+    TestSet base;
+    full_build(base, live, Metric::L2, &hp);
+    std::vector<Change> ch;
+    for (std::int64_t i = 0; i < 200; ++i) ch.push_back(Change{i * 7, true, {}});
+    for (std::int64_t i = 0; i < 300; ++i) ch.push_back(Change{5000 + i, false, dup_vector(i, 12, 9)});
+    auto run = [&](SnapshotBuffer &out) {
+        IncrementalBuilder b(base.set);
+        for (const Change &c : ch) {
+            if (c.del) { b.remove(c.id); continue; }
+            float *row = b.begin_add(c.id, 12);
+            std::memcpy(row, c.vec.data(), 12 * 4);
+            b.end_add();
+        }
+        return b.finish(77, 5, out, &hp);
+    };
+    char tmpl[] = "/tmp/vvector_inc_XXXXXX";
+    const std::string dir = mkdtemp(tmpl);
+    SnapshotBuffer ram, file;
+    file.back_with_file(dir);
+    CHECK(run(ram) && run(file));
+    CHECK(ram.size() == file.size() && std::memcmp(ram.data(), file.data(), ram.size()) == 0);
+#if defined(__linux__)
+    CHECK(file.file_backed());
+#endif
+    file.clear();
+    std::system(("rm -rf " + dir).c_str());
+}
+
 int main(int argc, char **argv)
 {
     std::string dir;
@@ -525,6 +562,7 @@ int main(int argc, char **argv)
     rounds("hnsw cosine", Metric::Cosine, true);
     rounds("hnsw dot", Metric::Dot, true);
     test_parallel_duplicates();
+    test_incremental_in_file();
     test_sift(dir);
     return finish("test_delta");
 }

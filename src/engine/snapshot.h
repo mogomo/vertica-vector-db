@@ -122,6 +122,12 @@ public:
     void swap(SnapshotBuffer &other) noexcept;
     // Drops the memory.
     void clear() { release(); }
+    // Backs the buffer with a file in dir instead of anonymous memory (Linux; elsewhere a no-op):
+    // its pages are then page cache that the kernel can write out and reclaim, so a buffer larger
+    // than the free memory still works (slower). The file is unlinked at once: nothing is left
+    // behind, also after a crash. Call it while the buffer is empty.
+    void back_with_file(const std::string &dir);
+    bool file_backed() const { return fd_ >= 0; }
 
     std::uint8_t *data() { return data_; }
     const std::uint8_t *data() const { return data_; }
@@ -132,6 +138,7 @@ private:
     void release();
     std::uint8_t *data_ = nullptr;
     std::uint64_t size_ = 0, capacity_ = 0;
+    int fd_ = -1;                 // back_with_file: the unlinked file
 };
 
 // Fills the section offsets and total_bytes of h from count, row_stride, flags, sq8_bytes and graph_bytes.
@@ -189,6 +196,9 @@ public:
 
     std::uint64_t count() const { return ids_.size(); }
     std::uint32_t dims() const { return dims_; }
+    // Builds in a file in dir instead of anonymous memory (SnapshotBuffer::back_with_file). Call it
+    // before the first row.
+    void build_in_file(const std::string &dir) { buffer_.back_with_file(dir); }
 
     // Sorts by id, writes ids, header, the sq8 and graph sections if given, and the checksum into
     // the buffer and hands it over to out. Throws std::runtime_error on a repeated id or no vectors,

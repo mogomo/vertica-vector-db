@@ -57,6 +57,8 @@ int main()
         m.open_active(dir, "g");
         CHECK(m.snapshot_id() == 1 && m.vectors().max_ver == 77 && m.vectors().count == n && m.vectors().dims == 32);
         CHECK(m.size() == big.buffer.size());
+        // Just written and read back by the load: in the page cache.
+        CHECK(m.resident_bytes() > 0 && m.resident_bytes() <= m.size());
     }
 
     // A load with a missing chunk fails and leaves the cache as it was.
@@ -145,6 +147,37 @@ int main()
         CHECK(read_index_options(dir, "g").size() == 2);
         write_index_options(dir, "fresh_index", IndexOptions());        // creates the directory
         CHECK(read_index_options(dir, "fresh_index").empty());
+    }
+
+    // The index option cache_dir: OPTIONS in one directory names the directory that holds the index;
+    // a query reads ACTIVE, OPTIONS and the snapshot there. One hop, never a chain.
+    {
+        CHECK(valid_cache_dir("/data/vvector") && valid_cache_dir("/a/.b/c-d_e/") && valid_cache_dir("/tmp/vvector/.alt"));
+        CHECK(!valid_cache_dir("") && !valid_cache_dir("/") && !valid_cache_dir("data") && !valid_cache_dir("/a/../b") &&
+              !valid_cache_dir("/a/./b") && !valid_cache_dir("/a//b") && !valid_cache_dir("/a b") && !valid_cache_dir("/a/..") &&
+              !valid_cache_dir("/a;b") && !valid_cache_dir(std::string(1001, 'a').insert(0, "/")));
+        CHECK(parse_index_options("cache_dir=/data/vv,threads=2").at("cache_dir") == "/data/vv");
+        CHECK(throws([] { parse_index_options("cache_dir=../x"); }, "index option cache_dir"));
+        const std::string home = dir + "/home";
+        TestSet small2;
+        build(small2, 7, 3);
+        load(home, "r", 11, small2.buffer);
+        write_index_options(home, "r", parse_index_options("threads=3"));
+        write_index_options(dir, "r", parse_index_options("threads=3,cache_dir=" + home));
+        CHECK(list_cached_indexes(dir) == std::vector<std::string>({"fresh_index", "g", "r"}));     // an OPTIONS file lists it
+        MappedSnapshot m;
+        m.open_active(dir, "r");
+        CHECK(m.snapshot_id() == 11 && m.vectors().count == 7 && m.path() == snapshot_path(home, "r", 11));
+        CHECK(m.options().count("cache_dir") == 0 && m.options().at("threads") == "3");
+        // One hop: an OPTIONS file in the home that names a third directory is not followed.
+        write_index_options(home, "r", parse_index_options("cache_dir=" + dir + "/third"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(ACTIVE_CHECK_MS + 50));
+        MappedSnapshot again;
+        again.open_active(dir, "r");
+        CHECK(again.path() == snapshot_path(home, "r", 11));
+        // A redirect to a directory without the index: "no snapshot cache ... in <that directory>".
+        write_index_options(dir, "q", parse_index_options("cache_dir=" + dir + "/nowhere"));
+        CHECK(throws([&] { MappedSnapshot x; x.open_active(dir, "q"); }, ("no snapshot cache for index 'q' in " + dir + "/nowhere").c_str()));
     }
 
     std::system(("rm -rf " + dir).c_str());

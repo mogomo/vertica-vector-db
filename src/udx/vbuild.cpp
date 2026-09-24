@@ -8,7 +8,9 @@
 // Parameters: index_name, metric (l2 | cosine | dot | l1), index_type (flat | hnsw), max_ver (the
 // journal watermark: a parameter, not a column, because every input column costs transfer time
 // per row), m (HNSW links per node, 16), ef_construction (200), threads (graph build threads,
-// 0 = one per core), quantization (none | sq8), base_snapshot, cache_dir.
+// 0 = one per core), quantization (none | sq8), base_snapshot, cache_dir, build_in (ram | file:
+// build in an unlinked file in <cache_dir>/<index_name> instead of anonymous memory, so the kernel
+// can write the snapshot out and reclaim its pages; for builds larger than the free memory).
 // Output (byte_offset, chunk, vector_count, dims, max_ver, format_version); vector_count counts
 // the live vectors (tombstoned positions are not counted).
 // Thin adapter around src/engine/snapshot.h, src/engine/delta.h and src/engine/hnsw.h.
@@ -42,6 +44,9 @@ class VBuild : public TransformFunction
             const vint efc = params.containsParameter("ef_construction") ? params.getIntRef("ef_construction") : 200;
             const vint base = params.containsParameter("base_snapshot") ? params.getIntRef("base_snapshot") : 0;
             const int threads = vvector::resolve_threads(params.containsParameter("threads") ? params.getIntRef("threads") : 0);
+            const std::string build_in = params.containsParameter("build_in") ? params.getStringRef("build_in").str() : "ram";
+            if (build_in != "ram" && build_in != "file") fail("build_in must be ram or file, not '" + build_in + "'");
+            const std::string build_dir = build_in == "file" ? vvector::ensure_index_dir(resolve_cache_dir(srvInterface), name) : "";
             if (type != "flat" && type != "hnsw") fail("index_type must be flat or hnsw, not '" + type + "'");
             if (quant != "none" && quant != "sq8") fail("quantization must be none or sq8, not '" + quant + "'");
             if (m < 2 || m > 256) fail("m must be 2 to 256");
@@ -55,6 +60,7 @@ class VBuild : public TransformFunction
             const vvector::HnswParams *graph = type == "hnsw" ? &hp : nullptr;
             const auto poll = [this] { return isCanceled(); };
             vvector::SnapshotBuffer buffer;
+            if (!build_dir.empty()) buffer.back_with_file(build_dir);
             vint rows = 0;
             if (base != 0) {
                 const std::string node = srvInterface.getCurrentNodeName();
@@ -90,6 +96,7 @@ class VBuild : public TransformFunction
                 }
             } else {
                 vvector::SnapshotBuilder builder(vvector::parse_metric(metric));
+                if (!build_dir.empty()) builder.build_in_file(build_dir);
                 do {
                     if ((++rows & 0xFFFF) == 0 && isCanceled()) return;
                     if (in.isNull(0)) fail("index '" + name + "': id must not be NULL");
@@ -168,6 +175,7 @@ class VBuildFactory : public TransformFunctionFactory
         parameterTypes.addInt("threads");
         parameterTypes.addVarchar(16, "quantization");
         parameterTypes.addInt("base_snapshot");
+        parameterTypes.addVarchar(16, "build_in");
     }
 
     virtual TransformFunction *createTransformFunction(ServerInterface &srvInterface)

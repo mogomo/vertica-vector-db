@@ -1,7 +1,8 @@
--- vvector install. Run by scripts/deploy.sh, which sets three vsql variables:
+-- vvector install. Run by scripts/deploy.sh, which sets four vsql variables:
 --   libfile         quoted absolute path of libvvector.so on the initiator node
 --   fenced_build    FENCED or NOT FENCED: vbuild, vload, vconfig, vnode (memory-heavy or writing)
 --   fenced_search   FENCED or NOT FENCED: vsearch, vknn, vinfo, vversion (the query path)
+--   search_grantees who may search: vvector_search, or "vvector_search, PUBLIC" (--search=public)
 -- Safe to run again: tables and their data are kept; missing manifest columns are added.
 \set ON_ERROR_STOP on
 
@@ -79,6 +80,7 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_mode VARCHAR(16) D
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS tombstone_ratio FLOAT DEFAULT 0.2;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS rebuild_every INT DEFAULT NULL;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS verify_every INT DEFAULT 1;               -- verify the journal digest every N refreshes, 0 = never
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS cache_dir VARCHAR(1024) DEFAULT NULL;     -- the node cache directory of the index, NULL = the default
 -- Query defaults (set_index_options; NULL = the built-in default; the next query uses them):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS precision_default VARCHAR(16) DEFAULT NULL;
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS freshness_default VARCHAR(16) DEFAULT NULL;
@@ -126,9 +128,10 @@ FROM (SELECT 1 FROM (SELECT '2000-01-01 00:00:00'::TIMESTAMP AS t UNION ALL SELE
       TIMESERIES ts AS '1 second' OVER (ORDER BY t)) g;
 COMMIT;
 
--- CREATE ROLE has no IF NOT EXISTS: on a second install the error is expected.
+-- CREATE ROLE has no IF NOT EXISTS: on a second install the errors are expected.
 \set ON_ERROR_STOP off
 CREATE ROLE vvector_admin;
+CREATE ROLE vvector_search;
 \set ON_ERROR_STOP on
 
 -- Search and information functions live in schema vvector: call them as vvector.vsearch(...) or put
@@ -158,14 +161,23 @@ CREATE OR REPLACE TRANSFORM FUNCTION vvector.vector_avg AS LANGUAGE 'C++' NAME '
 
 -- Rights. GRANT and REVOKE cannot name a function with an ARRAY argument (Vertica 26.2: syntax error
 -- at "ARRAY"), so rights are given per schema:
---   vvector        vsearch, vknn, vinfo, vversion and the vector functions: everyone (PUBLIC). This also reaches the stored
---                  procedures, so procedures.sql revokes them again and grants them to vvector_admin.
+--   vvector        vsearch, vknn, vinfo, vversion and the vector functions: role vvector_search
+--                  (milestone M6; before, everyone), or also PUBLIC with deploy --search=public. (A role
+--                  granted to PUBLIC is not enabled for anyone, so GRANT vvector_search TO PUBLIC would
+--                  not do: VERTICA_NOTES.) This also reaches the stored procedures, so procedures.sql
+--                  revokes them again and grants them to vvector_admin (sizing: PUBLIC).
 --   vvector_admin  vbuild, vload, vconfig, vnode: role vvector_admin only. vload and vconfig write
 --                  files on the nodes; vbuild with base_snapshot reads a whole snapshot from the node
 --                  cache, so it must not be open to users who may not read the indexed tables.
+-- vvector_admin holds vvector_search. The manifest (source tables, boundaries, who refreshes) is
+-- read by vvector_admin only; queries never read it.
 GRANT USAGE ON SCHEMA vvector TO PUBLIC;
-GRANT SELECT ON vvector.manifest, vvector.probe TO PUBLIC;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector TO PUBLIC;
+-- Upgrade from the PUBLIC search of earlier versions (a NOTICE on a new install: nothing to revoke).
+REVOKE SELECT ON vvector.manifest, vvector.probe FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector FROM PUBLIC;
+GRANT SELECT ON vvector.probe TO :search_grantees;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector TO :search_grantees;
+GRANT vvector_search TO vvector_admin;
 GRANT USAGE ON SCHEMA vvector_admin TO vvector_admin;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector_admin TO vvector_admin;
 GRANT ALL ON vvector.snapshot, vvector.manifest TO vvector_admin;

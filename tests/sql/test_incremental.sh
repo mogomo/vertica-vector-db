@@ -27,7 +27,8 @@
 # - rows after the boundary (an INT version column, margin 10): they are served by the delta, not built
 #   into the snapshot; a first refresh with no row up to the boundary stops with a message that says
 #   so; a physical DELETE of such a row before the next refresh never reaches the snapshot; a
-#   physical UPDATE of one is built with its new vector; neither needs a full build.
+#   physical UPDATE of one is built with its new vector; neither needs a full build;
+# - a refresh whose build estimate exceeds half of the free memory builds in a file (build_in).
 # With --sift=SCHEMA (sift_base and sift_query of scripts/load_dataset.sh in that schema) also the
 # acceptance test of milestone M3: an HNSW index on 900,000 SIFT1M vectors, then 100 refreshes of
 # 1000 adds and 500 deletes each, tombstone_ratio 0.03 (a full build must fire on the way); at the
@@ -291,6 +292,13 @@ expect "the tiny index: manifest counts and status" "^vector_count 5, tombstones
 SELECT 'vector_count ' || vector_count || ', tombstones ' || tombstones || ', note: ' || LEFT(refresh_note, 9) FROM vvector.manifest WHERE index_name = 'vi_tiny';"
 expect "status of the tiny index" "5 live vectors, 1 tombstones" "CALL vvector.status('vi_tiny');"
 
+echo "== a build larger than half of the free memory is made in a file"
+change_round
+expect "the refresh builds in a file (index_bytes set by hand to 4 PB) and says so" "index vih_l2 $INCR .*; built in a file: the build needs about" "
+UPDATE vvector.manifest SET index_bytes = 4000000000000000 WHERE index_name = 'vih_l2'; COMMIT;
+CALL vvector.refresh_index('vih_l2');"
+built_equals_live "vih_l2 after the build in a file" vih_l2
+
 echo "== rows after the boundary: served by the delta, never built before they are below it"
 # INT versions: the boundary is the highest version minus the margin (10), so a new row with a
 # higher version moves it without waiting.
@@ -357,6 +365,11 @@ if [ "$ECHO_ONLY" = no ]; then
 fi
 expect "the mark is gone after the refresh" "^mark: 0$" "
 SELECT 'mark: ' || COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = 'vif_cos';"
+expect "a mark of the caller's own session (left by a refresh of this session that failed) is ignored" "index vif_cos refreshed" "
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP(),
+       refresh_started_by = CURRENT_USER() || ', session ' || (SELECT session_id FROM v_monitor.current_session)
+    WHERE index_name = 'vif_cos'; COMMIT;
+CALL vvector.refresh_index('vif_cos');"
 expect "a mark whose session is gone: ignored at once (a superuser sees every session)" "index vif_cos refreshed" "
 UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '1 minute', refresh_started_by = 'someone, session x'
     WHERE index_name = 'vif_cos'; COMMIT;
