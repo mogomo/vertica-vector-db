@@ -13,7 +13,8 @@
 #   only when their id is allowed; precision exact still equals the full scan over the allowed live rows;
 # - an empty allow-list with filtered=true returns nothing; ids that are not in the index are ignored;
 # - range search: radius with k 16384 on HNSW returns only vectors within the radius, with recall
-#   >= 0.95 of the full scan within the radius; the same with vknn and with sq8 codes.
+#   >= 0.95 of the full scan within the radius; the same with vknn and with sq8 codes; with an
+#   allow-list and a radius, exactly the allowed rows within the radius.
 #
 # Test data: schema VVFILTER (or --schema=NAME), dropped at the end.
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
@@ -135,6 +136,18 @@ range "vf_cos (sq8): radius $R_COS with k 16384" vf_cos cos "$R_COS" \
     "$(search_sql vf_cos ", k=16384, radius=$R_COS" "(SELECT * FROM $SCHEMA.vf_cos_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries20) x")"
 range "vknn on vf_l2: radius $R_L2 with k 16384" vf_l2 l2 "$R_L2" \
     "SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='vf_l2', k=16384, radius=$R_L2) FROM $SCHEMA.queries20 q"
+
+expect "vf_l2, allow-list a_pct with the radius: every allowed row within it, nothing else" "^filtered range ok" "
+DROP TABLE IF EXISTS $SCHEMA.got; DROP TABLE IF EXISTS $SCHEMA.ref;
+CREATE TABLE $SCHEMA.got AS $(search_sql vf_l2 ", k=16384, radius=$R_L2" "(SELECT * FROM $SCHEMA.vf_l2_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries20
+    UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM $SCHEMA.a_pct) x");
+CREATE TABLE $SCHEMA.ref AS SELECT q.qid, l.id, VECTOR_L2(l.vec, q.qvec) AS d FROM $SCHEMA.queries20 q CROSS JOIN ($LIVE) l
+    WHERE l.id IN (SELECT id FROM $SCHEMA.a_pct) AND VECTOR_L2(l.vec, q.qvec) <= $R_L2 + 1e-5;
+SELECT CASE WHEN missing = 0 AND foreign_ids = 0 AND n_ref > 0 THEN 'filtered range ok ' ELSE 'filtered range bad ' END
+       || 'results ' || n_got || ', allowed within the radius ' || n_ref || ', missing ' || missing || ', not allowed or outside ' || foreign_ids FROM (
+  SELECT (SELECT COUNT(*) FROM $SCHEMA.got) AS n_got, (SELECT COUNT(*) FROM $SCHEMA.ref WHERE d <= $R_L2 - 1e-5) AS n_ref,
+         (SELECT COUNT(*) FROM $SCHEMA.ref r WHERE r.d <= $R_L2 - 1e-5 AND NOT EXISTS (SELECT 1 FROM $SCHEMA.got g WHERE g.qid = r.qid AND g.id = r.id)) AS missing,
+         (SELECT COUNT(*) FROM $SCHEMA.got g WHERE NOT EXISTS (SELECT 1 FROM $SCHEMA.ref r WHERE r.qid = g.qid AND r.id = g.id)) AS foreign_ids) x;"
 
 echo "== filtered search with the journal (500 adds, 500 deletes, 200 replacements, no refresh)"
 expect "journal the changes; the new ids 900000002, 900000004, ... join allow-list a_half" "^delta rows: 1200$" "

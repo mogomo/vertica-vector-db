@@ -12,7 +12,9 @@
 # the role vvector_search since milestone M6), cannot read the manifest, cannot call vbuild, vload,
 # vconfig or vnode (schema vvector_admin), read vvector.snapshot or run refresh_index; sizing stays
 # open. With the role vvector_search alone it can search, but not build, load or read the manifest.
-# The user and the schema are dropped at the end, also when the test fails (EXIT trap).
+# unregister_index of an index that a superuser scheduled is refused with a clear message, and the
+# index stays complete. The user and the schema are dropped at the end, also when the test fails
+# (EXIT trap).
 #
 # Needs a superuser connection (CREATE USER); skipped with a message otherwise.
 # Test data: schema VVRIGHTS (or --schema=NAME), dropped and recreated; index vr_rights.
@@ -155,6 +157,13 @@ CALL vvector.refresh_index('$IX');"
 echo "== back with the role"
 expect_as "schedule_refresh needs a superuser (Vertica: triggers)" "Super User\|[Pp]ermission denied\|superuser" "
 CALL vvector.schedule_refresh('$IX', '0 3 * * *');"
+run_sql "a superuser schedules it" "CALL vvector.schedule_refresh('$IX', '0 3 * * *');" > /dev/null
+expect_as "unregister_index of an index with a schedule: refused before anything is removed" "has a refresh schedule; only a superuser can remove it" "
+CALL vvector.unregister_index('$IX');"
+expect "... and the index is still complete" "^registered 1, views 2$" "
+SELECT 'registered ' || (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = '$IX') || ', views '
+       || (SELECT COUNT(*) FROM v_catalog.views WHERE LOWER(table_schema) = LOWER('$SCHEMA'));"
+run_sql "the superuser removes the schedule" "DROP TRIGGER vvector.${IX}_refresh_trigger; DROP SCHEDULE vvector.${IX}_refresh_schedule;" > /dev/null
 expect_as "unregister_index" "index $IX unregistered" "CALL vvector.unregister_index('$IX');"
 expect "the views are gone" "^views 0$" "
 SELECT 'views ' || COUNT(*) FROM v_catalog.views WHERE LOWER(table_schema) = LOWER('$SCHEMA');"

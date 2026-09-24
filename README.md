@@ -6,7 +6,7 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M5 (filtered search and vector functions).** Two index
+**Status: milestone M6 in progress (memory and cache placement, scale tests).** Two index
 types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
 each optionally with int8 codes (`sq8`) that make searches faster while the
 returned scores stay exact. k-nearest-neighbour search works for the metrics
@@ -121,17 +121,22 @@ floats, so scores agree to about 7 digits):
     make test                 # engine unit tests, no database needed
     make deploy               # install into the database, fenced (the default)
     make deploy FENCED=no     # every function inside the Vertica process
-    make deploy FENCED=mixed  # vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion not fenced
+    make deploy FENCED=mixed  # vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion and the vector functions not fenced
     make deploy SEARCH=public # searching for every user (default: the role vvector_search)
     make undeploy             # remove the library and its functions; tables and data stay
     tests/sql/run_all.sh      # integration tests: fenced, unfenced, mixed (creates test schemas)
+
+`tests/sql/run_all.sh` deploys the library again in every mode and ends with
+the default deploy (fenced, search for the role only). After a deploy with
+`FENCED=mixed` or `SEARCH=public`, run `make deploy` with your settings again
+when the tests are done.
 
 What the modes mean:
 
 | Mode | Where the functions run | For | Risk |
 |---|---|---|---|
 | `yes` (default) | a separate fenced process per session | safety first | none for the node; about 6 ms more per statement |
-| `mixed` | build and load fenced, search in the Vertica process | single searches with low latency | a fault in vsearch, vknn, vinfo or vversion would stop the node |
+| `mixed` | build and load fenced, search in the Vertica process | single searches with low latency | a fault in vsearch, vknn, vinfo, vversion or a vector function would stop the node |
 | `no` | everything in the Vertica process | the lowest latency and fastest refresh | a fault in any vvector function would stop the node |
 
 The measurements behind this are in [Performance and results](#performance-and-results).
@@ -186,7 +191,8 @@ Rights:
   `vvector_admin` holds `vvector_search`, so an index administrator can also
   search.
   `schedule_refresh` also needs a superuser: Vertica lets only a superuser
-  create a trigger.
+  create a trigger. For the same reason `unregister_index` of an index with a
+  schedule needs a superuser (it drops the trigger).
 - Rights are given per schema because Vertica 26.2 cannot grant a single
   function that has an ARRAY argument.
 
@@ -194,9 +200,10 @@ A user who registers and refreshes an index needs, besides `vvector_admin`,
 USAGE and CREATE on the schema of the source table (the views go there) and
 SELECT on the table. `tests/sql/test_rights.sh` checks this with a user that
 has no other rights: register, full and incremental refresh, status, search
-and unregister work; with the role switched off (`SET ROLE NONE`) the same
-user can still search, but not build, load, refresh or read
-`vvector.snapshot`.
+and unregister work; with its roles switched off (`SET ROLE NONE`) the same
+user can neither search nor build, load, refresh or read the manifest or
+`vvector.snapshot`; with `vvector_search` alone it can search, but not build,
+load or read the manifest. Only `sizing` stays open to everyone.
 
 ## Prepare a table
 
@@ -240,6 +247,12 @@ their own storage and are found quickly:
 
     INSERT INTO app.docs (id, vec) VALUES (7, ARRAY[0.1, 0.2, 0.3]);   -- add or change
     INSERT INTO app.docs (id, del) VALUES (8, TRUE);                    -- delete
+
+(These two statements show the pattern. The examples of this manual use the
+table of the Quick start and add their own rows where they say so; they give
+the search results shown whether or not you ran these two; only the listing
+of the delta view in [With the changes since the refresh](#with-the-changes-since-the-refresh)
+then also shows ids 7 and 8.)
 
 To keep the journal append-only, grant the users that write to it INSERT
 only, no UPDATE or DELETE on the table.
@@ -430,8 +443,7 @@ NULL keeps a value; the 13-argument form leaves `verify_every` and `cache_dir`
 as they are, the 14-argument form `cache_dir`.
 Query defaults (precision, freshness, ef_search, threads) apply at once on every
 node (within 200 ms); `'default'` (text) or `0` (numbers) sets one back to the
-built-in default. Build options apply at the next refresh. Values that belong
-to later milestones are refused with a message that names the milestone.
+built-in default. Build options apply at the next refresh.
 
 | Option | Values | Default | Now |
 |---|---|---|---|
@@ -465,6 +477,7 @@ default directory (and into the one of the calling session) on every node.
 
     NOTICE 2005:  vvector: index docs: hnsw index, 5 live vectors, 1 tombstones (tombstone_ratio 0.2), refresh_mode auto, 1 incremental refreshes since the last full build (rebuild_every never)
     NOTICE 2005:  vvector: index docs: journal digest verified at every refresh (verify_every 1); 0 refreshes since the last verification or full build
+    NOTICE 2005:  vvector: index docs: node cache directory: the default (/tmp/vvector, or the cache_dir session parameter)
     NOTICE 2005:  vvector: index docs: last refresh: refreshed: snapshot 963, incremental from snapshot 962 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.347 seconds; journal verified in 0.021 seconds
     NOTICE 2005:  vvector: index docs: 3 journal rows in the delta, read in 7 ms
     NOTICE 2005:  vvector: index docs: journal replica auto: none: a single node reads the delta locally already
@@ -496,7 +509,9 @@ may call it:
 
 `load_all` repairs node caches (a node that was down during a refresh, a
 deleted cache directory). `unregister_index` leaves the cache files on the
-nodes: remove `<cache_dir>/<index_name>` by hand.
+nodes: remove `<cache_dir>/<index_name>` by hand. An index with a schedule
+can be unregistered by a superuser only (Vertica lets only a superuser drop a
+trigger); for anyone else `unregister_index` stops before it removes anything.
 
 ### Scripts
 
@@ -622,6 +637,15 @@ costs nothing measurable. To build the text from a stored vector:
 `SELECT TO_JSON(qvec) FROM ...` (it prints enough digits to read back the
 same value).
 
+The same search without a view reads no table at all. It gives up the stale
+check (a node that missed a refresh answers from its old snapshot, see
+[vknn](#vknn-one-vector-per-row-without-over)), and the input columns must be
+typed NULLs:
+
+    SELECT vvector.vsearch(NULL::INT, NULL::ARRAY[FLOAT], NULL::INT, NULL::ARRAY[FLOAT], NULL::BOOLEAN, NULL::INT, NULL::INT
+                           USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3) OVER()
+    FROM dual;
+
 ### One query as a row
 
     SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
@@ -635,6 +659,12 @@ same value).
        7 |  5 | 0.703597545623779 |    2
 
 ### Many queries from a table
+
+The queries are rows of a table:
+
+    CREATE TABLE app.questions (qid INT, qvec ARRAY[FLOAT]);
+    INSERT INTO app.questions VALUES (100, ARRAY[1.0, 0.2, 0.0]);
+    INSERT INTO app.questions VALUES (200, ARRAY[0.1, 0.1, 1.0]); COMMIT;
 
     SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
                            USING PARAMETERS index_name='docs', k=2) OVER()
@@ -702,7 +732,7 @@ With the `query` parameter (used for every row whose vector is NULL):
       1 | 0.980580687522888 |    2
       5 | 0.832050263881683 |    3
 
-Parameters: those of vsearch without `freshness`. `vknn` searches the
+Parameters: those of vsearch without `freshness` and `filtered`. `vknn` searches the
 snapshot only: it does not apply the journal, and it does not check that the
 node's cache matches the active snapshot (it has no view input that carries
 the snapshot id). Right after a refresh a node may answer from the previous
@@ -747,6 +777,19 @@ With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
        0 |  5 | 0.832050263881683 |    3
 
 ### Range search
+
+The examples from here on use the index after one more refresh and three more
+changes (the colours 7 and 8 are two shades of blue, 3 becomes a lighter
+green), refreshed again:
+
+    CALL vvector.refresh_index('docs');
+    INSERT INTO app.docs (id, vec) VALUES (3, ARRAY[0.1, 0.9, 0.0]);
+    INSERT INTO app.docs (id, vec) VALUES (7, ARRAY[0.2, 0.2, 0.9]);
+    INSERT INTO app.docs (id, vec) VALUES (8, ARRAY[0.3, 0.1, 0.9]);
+    COMMIT;
+    CALL vvector.refresh_index('docs');
+
+The live vectors are now 1, 3, 4, 5, 6, 7 and 8 (2 was deleted above).
 
     SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
                            USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=10, radius=0.9, freshness='exact') OVER()
@@ -860,6 +903,13 @@ results can be simpler; see [Recipes](#recipes).
 
 ### Join the results to your data
 
+The payload stays in your own tables:
+
+    CREATE TABLE app.titles (id INT, title VARCHAR(40));
+    INSERT INTO app.titles VALUES (1, 'red'); INSERT INTO app.titles VALUES (2, 'dark red');
+    INSERT INTO app.titles VALUES (3, 'green'); INSERT INTO app.titles VALUES (4, 'blue');
+    INSERT INTO app.titles VALUES (5, 'yellow'); INSERT INTO app.titles VALUES (6, 'orange'); COMMIT;
+
     SELECT r.rank, r.id, t.title, r.score
     FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
                                  USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3) OVER()
@@ -869,7 +919,7 @@ results can be simpler; see [Recipes](#recipes).
 
      rank | id |  title   |       score
     ------+----+----------+-------------------
-        1 |  2 | dark red | 0.996240615844727
+        1 |  6 | orange   |  0.99886816740036
         2 |  1 | red      | 0.980580687522888
         3 |  5 | yellow   | 0.832050263881683
 
@@ -1085,8 +1135,8 @@ searched exactly) and incremental refresh (which keeps the range). The
 | best | the same, ef_search 400 | 4 x k candidates rescored |
 | exact | not used: every float vector is read | |
 
-`rescore` and `oversampling` override the preset per query, per session or
-per index. SIFT1M (1M vectors of 128 dimensions, k = 10), engine alone:
+`rescore` and `oversampling` override the preset per query or per session
+(not per index). SIFT1M (1M vectors of 128 dimensions, k = 10), engine alone:
 
 | Search | recall@10 float | recall@10 sq8 | queries/s float | queries/s sq8 |
 |---|---:|---:|---:|---:|
@@ -1235,7 +1285,8 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
 
 - **Multi-node**: every refresh loads the snapshot on every node (`vload`
   through `vvector.probe`); every node answers from its own cache file.
-  Tested on one node and on a 3-node Eon cluster. A search runs on the node
+  Tested on one node, on a 3-node Eon cluster and on a 4-node Enterprise
+  cluster. A search runs on the node
   that receives the statement; the index is not split over nodes.
 - **Journal replica on a cluster**: a statement over the `_delta` view
   reads the journal. With the journal segmented over the nodes, every node
@@ -1327,7 +1378,7 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   snapshot during a refresh.
   A refresh whose build needs more than half of the smallest node's free
   memory (with the page cache) builds in a file in the index's cache
-  directory instead, about 10% slower, and says so in its note; the kernel
+  directory instead (on the test VM 7% slower for flat, 13% for HNSW), and says so in its note; the kernel
   can then write the build out instead of running out of memory. That does
   not get around `FencedUDxMemoryLimitMB`: Vertica applies it as the address
   space limit of the fenced process, which counts a file mapping too.
@@ -1389,12 +1440,14 @@ by hand.
 | `vvector.vversion() OVER()` | vvector_search | (library_version, format_version, build_flags) |
 
 A snapshot built and loaded by hand (the procedures do the same, plus the
-views, the manifest and the checks):
+views, the manifest and the checks). vbuild needs one row per id and no
+delete rows, so it reads the live rows (the view `app.docs_live` of
+[Recipes](#recipes)), not the journal:
 
     INSERT INTO vvector.snapshot
     SELECT 'docs', 900, byte_offset, chunk FROM (
       SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='docs', metric='cosine') OVER()
-      FROM app.docs) b;
+      FROM app.docs_live) b;
     COMMIT;
     SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
     FROM (SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE
@@ -1428,6 +1481,8 @@ cache), starting with `vknn:`.
 | `vsearch: query vector text: expected ',' or ']' at character N` (and similar) | malformed `query` text | write `'[1.5, 2, -3e-2]'` |
 | `vsearch: query Q has no vector (qvec is NULL)`, `a query row has a vector (qvec) but no qid` | incomplete query row | set both qid and qvec |
 | `vsearch: journal row with id I has no vector and is not a delete` | a journal row with a NULL vector and del false | fix the row, or set del |
+| `vsearch: a journal row has no id (id is NULL but not its vector, delete flag or version)` | a hand-made input row with values but no id (the views leave such rows out) | set the id, or leave the row out |
+| `vsearch: no snapshot cache for index 'x' in DIR: the directory is not owned by the database's operating system user` | the index directory under that cache_dir belongs to another operating system user; it is not trusted | use the index's own cache_dir; remove or `chown` the foreign directory |
 | `vsearch: k must be 1 to 16384`, `precision must be ...`, `freshness must be ...`, `ef_search must be ...`, `oversampling must be 1 to 100`, `threads must be 0 (one per core) to 64`, `radius must be a finite number` | a parameter out of range | use a value from the parameter table |
 | `vsearch: session parameter NAME = 'v' is not an integer` (or `index default ...`) | a bad session value or index default | `ALTER SESSION SET UDPARAMETER FOR vvector NAME = ...`, or `set_index_options` |
 | `vsearch: the snapshot of index 'x' changed while the query ran: run it again` | a refresh changed the dimensions during the query | run the query again |
@@ -1444,7 +1499,6 @@ cache), starting with `vknn:`.
 | `vload: on NODE: bad snapshot graph: ... in FILE`, `vsearch: bad snapshot graph: ...` | the graph section of the snapshot or cache file is damaged (vload checks every link) | `CALL vvector.refresh_index('x')` |
 | `vload: on NODE: bad snapshot sq8 section: ... in FILE`, `vsearch: bad snapshot sq8 section: ...` | the int8 codes of the snapshot or cache file are damaged (vload checks every row) | `CALL vvector.refresh_index('x', 'full')` |
 | `vbuild: index 'x': the base snapshot has quantization sq8, not none: refresh with mode full` (or `none, not sq8`) | a hand-made incremental build with another quantization than the base (a refresh builds in full by itself when the option changed) | `CALL vvector.refresh_index('x', 'full')` |
-| `... is not implemented yet (milestone Mn)`, `... not supported yet (milestone Mn)` | a feature of a later milestone | use what the message says is available |
 | `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
 | `vload: on NODE: pieces are missing or duplicated`, `bad snapshot: checksum mismatch`, `cannot write ...` | a damaged transfer or a full disk | check disk space of cache_dir; `load_all` |
 | `vload`, `vinfo`, `vsearch`: `cache_dir '...' must be an absolute path`, `index name '...' is not valid` | bad cache_dir or index name | use `/path` and letters, digits, underscore |
@@ -1458,11 +1512,12 @@ cache), starting with `vknn:`.
 | `Permission denied for schema vvector_admin` | a build or load function called without the role `vvector_admin` | `GRANT vvector_admin TO someone;` and enable it (default role or `SET ROLE`) |
 | `Function vvector.refresh_index(unknown) does not exist, or permission is denied ...` (any procedure) | the caller lacks the role `vvector_admin`, or has it but not enabled in the session | grant it and enable it (default role or `SET ROLE vvector_admin`) |
 | `Only a Super User can drop triggers` (from `schedule_refresh`) | `schedule_refresh` was called by a user who is not a superuser | a superuser runs `schedule_refresh` |
+| `vvector.unregister_index: index x has a refresh schedule; only a superuser can remove it ...` | the index has a schedule and the caller is not a superuser; nothing was removed | a superuser runs `unregister_index` |
 | `vvector.load_on_nodes: index x, snapshot S: loaded on N of M nodes` | a node could not load (disk, rights) | vinfo shows the cause per node; `load_all` |
 | `vvector.push_options: index x: options written on N of M nodes` | a node could not write its cache directory | check the cache directory; `load_all` |
 | `vvector.<procedure>: index x is not registered` | a wrong index name | `SELECT index_name FROM vvector.manifest` |
 | `vvector.set_index_options: memory_mode compact needs quantization sq8` | `compact` on an index without sq8, or `quantization none` while `memory_mode` is `compact` | set sq8 first, or `memory_mode ram` in the same call |
-| `vvector.set_index_options: ...` | a value out of range or of a later milestone | see the option table |
+| `vvector.set_index_options: ...` | a value out of range | see the option table |
 | `vvector.schedule_refresh: cron_expr may hold digits, spaces and * / , - only` | a bad cron expression | e.g. `'0 * * * *'` |
 | `vvector.set_journal_replica: mode must be auto, on or off` | a bad mode | `'auto'`, `'on'` or `'off'` |
 | `vector_add: the vectors have different lengths: N and M elements` (any vector function, `vector_avg`, `vector_sum`) | two vectors of different lengths | vectors of one length |
@@ -1641,7 +1696,8 @@ Vertica and SDK:
   search every index by name (`vknn`, `vsearch ... FROM dual`), without a
   view. The views protect the journal rows, not the index.
 - `schedule_refresh` needs a superuser (Vertica: only a superuser may create
-  a trigger).
+  a trigger), and so does `unregister_index` of an index with a schedule
+  (it drops the trigger).
 - A UNION ALL of `ARRAY[INT]` and `ARRAY[NUMERIC]` columns fails inside
   Vertica 26.2 (INTERNAL 5445); cast to `ARRAY[FLOAT]` first.
 - Fenced mode adds about 6 ms per statement, and about 6 ms more to the first
@@ -1731,7 +1787,9 @@ Index and search:
   nodes, big-endian hosts, Windows.
 
 Operations:
-- A new index default is seen by queries within 200 ms; a new snapshot at once.
+- A new index default is seen by queries within 200 ms. A new snapshot: at
+  once by vsearch over a view (its snapshot_id makes the node look again),
+  within 200 ms by vknn and by vsearch without a view.
 - Two refreshes of one index at the same time are refused: the second one
   gets an error. A refresh whose session was killed leaves its mark in the
   manifest; the next refresh ignores it at once when it can see that the
@@ -1766,14 +1824,14 @@ Operations:
 
 | File | What it does |
 |---|---|
-| `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed]`, `make undeploy` |
+| `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed] [SEARCH=role\|public]`, `make undeploy` |
 | `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring and filters (`search.cpp`), the arithmetic of the vector functions (`vecmath.cpp`), threads, query text |
 | `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...), and one per family of vector functions (`vector_functions.cpp`, `vector_aggregates.cpp`) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
-| `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `scale.sh` |
+| `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `demo.sh`, `scale.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M, BIGANN) to text for COPY, and generates random clustered vectors |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`; `run_all.sh` runs them in every mode |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

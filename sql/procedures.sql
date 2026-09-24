@@ -1219,9 +1219,13 @@ BEGIN
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.unregister_index: index % is not registered', nm;
     END IF;
-    -- Only a superuser may drop a trigger, even with IF EXISTS: drop them only when schedule_refresh made them.
+    -- Only a superuser may drop a trigger, even with IF EXISTS: drop them only when schedule_refresh made
+    -- them, and refuse before anything is removed when the caller cannot.
     IF (SELECT COUNT(*) FROM v_catalog.stored_proc_triggers WHERE LOWER(schema_name) = 'vvector'
                                                           AND LOWER(trigger_name) = LOWER(nm || '_refresh_trigger')) > 0 THEN
+        IF (SELECT COUNT(*) FROM v_catalog.users WHERE user_name = CURRENT_USER() AND is_super_user) = 0 THEN
+            RAISE EXCEPTION 'vvector.unregister_index: index % has a refresh schedule; only a superuser can remove it (Vertica allows only superusers to drop triggers): a superuser runs CALL vvector.unregister_index(''%'')', nm, nm;
+        END IF;
         EXECUTE 'DROP TRIGGER IF EXISTS vvector.' || nm || '_refresh_trigger';
     END IF;
     IF (SELECT COUNT(*) FROM v_catalog.user_schedules WHERE LOWER(schema_name) = 'vvector'

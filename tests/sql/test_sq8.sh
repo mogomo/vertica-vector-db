@@ -191,7 +191,7 @@ if [ -n "$SIFT" ]; then
     echo "== SIFT1M ($SIFT.sift_base): HNSW index with sq8 codes sift_sq8, m 16, ef_construction 200"
     expect "register and refresh sift_sq8" "index sift_sq8 refreshed" "
 CALL vvector.unregister_index('sift_sq8');
-CALL vvector.register_index('sift_sq8', '$SIFT.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw');
+CALL vvector.register_index('sift_sq8', '$SIFT.sift_base', 'id', 'vec', 'del', 'ts', 'l2', 0, 'hnsw');
 CALL vvector.set_index_options('sift_sq8', $SQ8);
 CALL vvector.refresh_index('sift_sq8');"
     for p in fast balanced best; do

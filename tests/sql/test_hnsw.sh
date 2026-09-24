@@ -162,7 +162,7 @@ if [ -n "$SIFT" ]; then
     echo "== SIFT1M ($SIFT.sift_base): HNSW index sift_hnsw, m 16, ef_construction 200"
     expect "register and refresh sift_hnsw" "index sift_hnsw refreshed" "
 CALL vvector.unregister_index('sift_hnsw');
-CALL vvector.register_index('sift_hnsw', '$SIFT.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw');
+CALL vvector.register_index('sift_hnsw', '$SIFT.sift_base', 'id', 'vec', 'del', 'ts', 'l2', 0, 'hnsw');
 CALL vvector.refresh_index('sift_hnsw');"
     for p in fast balanced best; do
         run_sql "recall $p" "SELECT 'SIFT1M precision $p: recall@10 ' || (COUNT(*) / 10000.0)::NUMERIC(6,4) FROM

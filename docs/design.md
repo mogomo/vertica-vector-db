@@ -1066,3 +1066,20 @@ same day), indexes flat, HNSW and HNSW with sq8 (m 16, ef_construction 200), fen
   A journal with daily partitions prunes all but the recent days (the README layout).
 - Build memory and page cache were no problem with 78 GB per node: the three indexes and their
   previous snapshots took 44 GB of cache files per node; 67 GB stayed available.
+
+Repeated at milestone M6 (the segmented snapshot table, the caches on a second data disk through
+the index option cache_dir, the same journal restored to 10M rows; scripts/scale.sh):
+
+| | flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| full refresh (vbuild / vload) | 132 s (65 / 55) | 899 s (828 / 65) | 944 s (843 / 94) |
+| incremental, 1000 adds + 500 deletes (vbuild / vload) | 99 s (35 / 57) | 144 s (55 / 82) | 157 s (68 / 82) |
+| recall@10 fast / balanced / best | 1.0000 | 0.8258 / 0.9528 / 0.9946 | 0.8181 / 0.9521 / 0.9945 |
+| one search, client ms median, fenced / mixed | 92.0 / 87.4 | 14.4 / 7.0 | 15.1 / 6.3 |
+| 1000 queries, balanced, fenced / mixed | 17.7 s / 17.6 s | 154 / 57 ms | 138 / 52 ms |
+
+The vbuild statement is faster (one copy of the chunks written instead of four); vload is slower,
+because the cache files now go to a disk that writes at 102 MB/s instead of 192 MB/s (dd with direct
+I/O on node 1; it reads faster, 722 against 511 MB/s). Searches read from the page cache and do not
+change. A refresh that changes nothing: 5.6 s, of it 3.5 s the journal verification over 10M rows
+(`verify_every` 1).
