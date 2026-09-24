@@ -10,6 +10,7 @@
 #include "../engine/flat.h"
 #include "../engine/hnsw.h"
 #include "../engine/parallel.h"
+#include "../engine/search.h"
 #include "../engine/snapshot.h"
 
 #include <cerrno>
@@ -184,15 +185,18 @@ inline bool one_of(const std::string &v, std::initializer_list<const char *> all
 }
 
 // The tuning values of a search (vsearch, vknn), read with the precedence of Settings and checked.
-// On a flat index every precision is exact and ef_search has no effect; rescore and oversampling
-// have no effect before int8 quantisation (milestone M4). All are checked, so that the same SQL
-// works on every index.
+// On a flat index without codes every precision is exact and ef_search has no effect; rescore and
+// oversampling act on an index with sq8 codes only. All are checked, so that the same SQL works on
+// every index. Presets of the precision levels (PLAN 4.1): fast: ef max(2 x k, 32), no rescoring;
+// balanced (the default): ef 100, rescoring of 2 x k candidates; best: ef 400, 4 x k; exact: every
+// vector, float rows.
 struct SearchSettings {
     static const vint MAX_K = 16384;
     vint k = 10;
     std::string precision;
     vint ef_search = 0;
     bool exact = false;
+    bool rescore = true;
     double oversampling = 1.0;
     int threads = 1;
     bool has_radius = false;
@@ -208,8 +212,8 @@ struct SearchSettings {
         ef_search = cfg.integer("ef_search", 0);
         if (ef_search < 0 || ef_search > 100000) fail("ef_search must be 0 (preset) to 100000");
         exact = cfg.boolean("exact", false);
-        cfg.boolean("rescore", true);
-        oversampling = cfg.real("oversampling", 1.0);
+        rescore = cfg.boolean("rescore", precision != "fast");
+        oversampling = cfg.real("oversampling", precision == "best" ? 4.0 : precision == "balanced" ? 2.0 : 1.0);
         if (!(oversampling >= 1.0 && oversampling <= 100.0)) fail("oversampling must be 1 to 100");
         threads = vvector::resolve_threads(cfg.integer("threads", 0));
         has_radius = params.containsParameter("radius");
@@ -244,22 +248,26 @@ struct SearchSettings {
         return fs;
     }
 
+    // The search ranks by the sq8 codes when the index has them, unless precision is exact or exact is true.
+    bool use_codes(const vvector::VectorSet &s) const
+    {
+        return (s.flags & vvector::FLAG_SQ8) && !exact && precision != "exact";
+    }
+
     // Searches the snapshot s (positions in skip, may be null, are never returned) and the extra
-    // rows beside it (the journal's live vectors, may be null): graph or flat, as the settings say.
+    // rows beside it (the journal's live vectors, may be null): graph or flat, codes or float rows,
+    // as the settings say.
     void search(const vvector::FlatSearch &fs, const vvector::VectorSet &s, const std::uint64_t *skip,
                 const vvector::RowBlock *extra, std::vector<vvector::Neighbor> &out, std::vector<std::uint32_t> &count,
                 const std::function<bool()> &poll) const
     {
-        if (use_graph(s)) {
-            const vvector::HnswGraph graph = vvector::hnsw_open(s, false);
-            vvector::hnsw_search(fs, s, graph, ef(), skip, extra, out, count, poll);
-            return;
-        }
-        vvector::RowBlock blocks[2];
-        blocks[0] = vvector::RowBlock{s.vectors, s.ids, s.count, skip};
-        std::size_t n = 1;
-        if (extra && extra->n) blocks[n++] = *extra;
-        vvector::flat_search(fs, blocks, n, out, count, poll);
+        vvector::SearchPlan p;
+        p.graph = use_graph(s);
+        p.ef = ef();
+        p.codes = use_codes(s);
+        p.rescore = rescore;
+        p.oversampling = oversampling;
+        vvector::index_search(fs, s, p, skip, extra, out, count, poll);
     }
 };
 

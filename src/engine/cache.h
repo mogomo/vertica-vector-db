@@ -58,7 +58,10 @@ public:
     MappedSnapshot(const MappedSnapshot &) = delete;
     MappedSnapshot &operator=(const MappedSnapshot &) = delete;
 
-    void open(const std::string &path, bool verify);
+    // verify: read and check the whole file (vload). Otherwise (a query mapping) the kernel is asked
+    // to read the file ahead; compact (memory_mode compact, an index with sq8 codes): everything but
+    // the float rows, which only rescoring reads, a few rows per query.
+    void open(const std::string &path, bool verify, bool compact = false);
     // Opens the active snapshot of an index. The mapping is kept by the process and shared by later
     // calls: a new mapping of a large file pays a page fault for every page a search touches, which
     // costs several times the search. What ACTIVE and OPTIONS say is trusted for ACTIVE_CHECK_MS;

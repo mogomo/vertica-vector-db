@@ -276,3 +276,24 @@ Check again on other versions.
   unregister_index drops them only when they exist.
 - The SDK gives a UDx the user of the session (`ServerInterface::getUserName()`, VerticaUDx.h),
   not the user's roles or rights.
+
+## Verified in milestone M4 (26.2.0-3, 4-node Enterprise mode, x86_64; 26.2.0-1 single node, 2026-09-24)
+
+- `COSINE_SIMILARITY`, `DOT_PRODUCT`, `VECTOR_L2` and `VECTOR_MAGNITUDE` come from the package
+  `VectorOps` (`/opt/vertica/packages/VectorOps`, `Autoinstall=True` in its `package.conf`). A
+  database created without its packages has none of them ("ERROR 3457: Function VECTOR_L2(...)
+  does not exist"). Its script `/opt/vertica/packages/VectorOps/ddl/install.sql`, run as dbadmin,
+  creates `public.VectorOpsLib` and the four functions. vvector itself does not use them; the
+  integration tests compare with them. The same database had no `APPROXIMATE_PERCENTILE`
+  (package `approximate`, `public.ApproximateLib`; scripts/benchmark.sh and latency.sh use it) and
+  no `LISTAGG`.
+- ERROR 4817 "Subqueries in the SELECT or ORDER BY are not supported if the query has aggregates
+  and the subquery is not part of the GROUP BY": a scalar subquery beside `COUNT(...)` in the
+  select list. A CROSS JOIN with the subquery as a derived table works.
+- `REGEXP_REPLACE(s, pattern, replacement, position)`: the fourth argument is the position, not
+  the flags (a string there: "ERROR 3681: Invalid input syntax for integer").
+- `TRANSLATE` of a 65000+ byte column ("may give a 256000-octet result; the limit is 65000
+  octets", ERROR 9688); `TRANSLATE(LEFT(col, n), ...)` works.
+- On a 4-node Enterprise database the snapshot table (`UNSEGMENTED ALL NODES`) makes the fixed part
+  of a refresh grow with the nodes: for a 580 MB snapshot the vbuild statement (which inserts
+  the chunks) took 8.7 s and vload 5.4 s, against 2.2 to 3.9 s and 1.5 to 2 s on one node.

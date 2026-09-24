@@ -70,12 +70,12 @@ int main(int argc, char **argv)
     std::uint64_t n = 1000000, nq = 10000, ngt = 0;
     bool have_gt = false;
     if (!dir.empty()) {
-        if (!read_vecs(dir + "/" + dataset + "_base.fvecs", base, dims, n) ||
-            !read_vecs(dir + "/" + dataset + "_query.fvecs", queries, qdims, nq) || qdims != dims) {
+        if (!bench::read_vecs(dir + "/" + dataset + "_base.fvecs", base, dims, n) ||
+            !bench::read_vecs(dir + "/" + dataset + "_query.fvecs", queries, qdims, nq) || qdims != dims) {
             std::fprintf(stderr, "bench_flat: cannot read the %s files in %s\n", dataset.c_str(), dir.c_str());
             return 1;
         }
-        have_gt = read_vecs(dir + "/" + dataset + "_groundtruth.ivecs", gt, gdims, ngt) && ngt == nq;
+        have_gt = bench::read_vecs(dir + "/" + dataset + "_groundtruth.ivecs", gt, gdims, ngt) && ngt == nq;
         std::printf("data: %s, %llu vectors of %u dimensions, %llu queries\n", dataset.c_str(), (unsigned long long)n, dims,
                     (unsigned long long)nq);
     } else {

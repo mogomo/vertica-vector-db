@@ -4,10 +4,10 @@ These steps were run as written on:
 
 | Item      | Tested with |
 |-----------|-------------|
-| Hardware  | x86_64 with AVX-512, 2 cores, 15 GB RAM per node |
+| Hardware  | x86_64 with AVX-512: 2 cores, 15 GB RAM per node (Eon); 10 cores, 78 GB RAM per node (Enterprise) |
 | OS        | Red Hat Enterprise Linux 8.10 |
 | Compiler  | g++ 8.5.0 (package `gcc-c++-8.5.0-28.el8_10`), GNU make 4.2.1 |
-| Vertica   | 26.2.0-2, Eon mode, 3 nodes in one subcluster, with `/opt/vertica/sdk` |
+| Vertica   | 26.2.0-2, Eon mode, 3 nodes in one subcluster; 26.2.0-3, Enterprise mode, 4 nodes; both with `/opt/vertica/sdk` |
 
 The same steps work on a single-node database. They were also run on Rocky
 Linux 9 on aarch64 with g++ 11.5 and Vertica 26.2.0-1, single node.
@@ -123,10 +123,11 @@ At the end it prints the version and the mode of every function:
     tests/sql/run_all.sh
 
 runs every integration test fenced, then unfenced, then mixed, and deploys
-fenced again at the end. On the 3-node cluster above it takes about
-12 minutes. It creates the schemas `VVTEST`, `VVSEARCH` and `VVHNSW`
-and a few small test indexes; `VVSEARCH` and `VVHNSW` are dropped at the end,
-`VVTEST` stays (`DROP SCHEMA VVTEST CASCADE;` when done). Every test ends with
+fenced again at the end. It takes about 30 minutes on the 4-node cluster above
+and on the single-node VM (the tests got longer with every milestone). Each test
+creates its own schema (`VVTEST`, `VVSEARCH`, `VVHNSW`, `VVINC`, `VVSQ8`,
+`VVRIGHTS`) and a few small test indexes and drops them at the end, except
+`VVTEST`, which stays (`DROP SCHEMA VVTEST CASCADE;` when done). Every test ends with
 a line like
 
     test_snapshot: OK
@@ -174,6 +175,15 @@ and delete the cache directory (`/tmp/vvector` by default) on every node.
 - `vsearch: no snapshot cache for index '...' in /tmp/vvector: run vload`: this
   node has no cache file yet, or another `cache_dir` was used at load time.
   `CALL vvector.load_all('<index>');` loads it on every node.
+- `ERROR 3457: Function VECTOR_L2(array[float], array[float]) does not exist` in the
+  integration tests (vvector does not need the function; the tests compare with it), or
+  `Function APPROXIMATE_PERCENTILE ... does not exist` in `scripts/benchmark.sh` and
+  `scripts/latency.sh`: the database was created without Vertica's packages. Install the two that
+  are used, as dbadmin (they create a library and functions in schema `public`):
+
+      vsql -f /opt/vertica/packages/VectorOps/ddl/install.sql
+      vsql -f /opt/vertica/packages/approximate/ddl/install.sql
+
 - A node killed by the operating system during tests (out of memory): check
   the free memory of every node first
   (`SELECT host_name, total_memory_free_bytes // 1048576 AS free_mb FROM v_monitor.host_resources;`).

@@ -38,6 +38,21 @@ void keys_4q(Metric m, const float *rows, std::uint64_t n, std::uint32_t stride,
 void keys_gather(Metric m, const float *rows, std::uint32_t stride, const std::uint32_t *pos, std::uint32_t n,
                  const float *q, float *keys);
 
+// sq8 codes (sq8.h): integer sums of code rows of `stride` bytes (padding 0) against one query's
+// codes: sum (a - b)^2 for l2, sum abs(a - b) for l1, sum a x b for dot and cosine. Integer sums
+// are exact, so every CPU and every vector width gives the same result.
+// n consecutive rows: sums[i] for the row codes + i * stride.
+void sq8_sums_1q(Metric m, const std::uint8_t *codes, std::uint64_t n, std::uint32_t stride, const std::uint8_t *q,
+                 std::uint32_t *sums);
+// n consecutive rows against 4 queries: sums[j * n + i] for query j. Each row is read once.
+void sq8_sums_4q(Metric m, const std::uint8_t *codes, std::uint64_t n, std::uint32_t stride, const std::uint8_t *const q[4],
+                 std::uint32_t *sums);
+// n rows at scattered positions: sums[i] for the row codes + pos[i] * stride (the graph search).
+void sq8_sums_gather(Metric m, const std::uint8_t *codes, std::uint32_t stride, const std::uint32_t *pos,
+                     std::uint32_t n, const std::uint8_t *q, std::uint32_t *sums);
+// One pair.
+std::uint32_t sq8_sum(Metric m, const std::uint8_t *a, const std::uint8_t *b, std::uint32_t stride);
+
 // The value the built-in function of the metric returns: VECTOR_L2, COSINE_SIMILARITY, DOT_PRODUCT,
 // or the Manhattan distance.
 inline float key_to_score(Metric m, float key)

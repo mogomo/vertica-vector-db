@@ -41,7 +41,7 @@ inline void offer_all(Heap &h, const FlatSearch &s, const RowBlock &b, std::uint
     for (std::uint64_t i = 0; i < n; ++i) {
         const float key = keys[i];
         const std::uint64_t row = first + i;
-        const std::int64_t id = b.ids[row];
+        const std::int64_t id = b.ids ? b.ids[row] : static_cast<std::int64_t>(row);
         if (h.size == h.cap && !(key < h.d[0].key || (key == h.d[0].key && id < h.d[0].id))) continue;
         if (b.skip && (b.skip[row >> 6] >> (row & 63) & 1u)) continue;
         offer(h, s, key, id);
@@ -55,10 +55,39 @@ inline std::uint64_t tile_rows(std::uint32_t stride)
     return std::max<std::uint64_t>(16, (256u * 1024u) / (std::uint64_t(stride) * 4));
 }
 
+// A block with sq8 codes: integer sums of a tile of code rows per query, turned into sq8 keys.
+void scan_codes(const FlatSearch &s, const RowBlock &b, std::uint64_t r0, std::uint64_t r1, std::uint64_t q0,
+                std::uint64_t q1, Heap *heaps, std::vector<float> &keys)
+{
+    const Sq8Codes &c = *b.codes;
+    const std::uint64_t tile = std::max<std::uint64_t>(16, (256u * 1024u) / c.stride);
+    keys.resize(tile);
+    std::vector<std::uint32_t> sums(4 * tile);
+    auto offer_codes = [&](std::uint64_t q, std::uint64_t t0, std::uint64_t n, const std::uint32_t *qs) {
+        for (std::uint64_t i = 0; i < n; ++i) keys[i] = sq8_key(s.metric, c.range, qs[i], c.sums[t0 + i], s.query_sums[q], c.dims);
+        offer_all(heaps[q - q0], s, b, t0, keys.data(), n);
+    };
+    for (std::uint64_t t0 = r0; t0 < r1; t0 += tile) {
+        const std::uint64_t n = std::min(tile, r1 - t0);
+        std::uint64_t q = q0;
+        for (; q + 4 <= q1; q += 4) {        // 4 queries per pass over the tile, as the float scan
+            const std::uint8_t *qs[4] = {s.query_codes + q * c.stride, s.query_codes + (q + 1) * c.stride,
+                                         s.query_codes + (q + 2) * c.stride, s.query_codes + (q + 3) * c.stride};
+            sq8_sums_4q(s.metric, c.row(t0), n, c.stride, qs, sums.data());
+            for (int j = 0; j < 4; ++j) offer_codes(q + j, t0, n, sums.data() + j * n);
+        }
+        for (; q < q1; ++q) {
+            sq8_sums_1q(s.metric, c.row(t0), n, c.stride, s.query_codes + q * c.stride, sums.data());
+            offer_codes(q, t0, n, sums.data());
+        }
+    }
+}
+
 // Scores rows r0 .. r1 - 1 of block b against queries q0 .. q1 - 1 and offers them to heaps[q - q0].
 void scan(const FlatSearch &s, const RowBlock &b, std::uint64_t r0, std::uint64_t r1, std::uint64_t q0,
           std::uint64_t q1, Heap *heaps, std::vector<float> &keys)
 {
+    if (b.codes) { scan_codes(s, b, r0, r1, q0, q1, heaps, keys); return; }
     const std::uint64_t tile = tile_rows(s.stride);
     keys.resize(4 * tile);
     for (std::uint64_t t0 = r0; t0 < r1; t0 += tile) {
@@ -149,6 +178,23 @@ void flat_search(const FlatSearch &s, const RowBlock *blocks, std::size_t n_bloc
         const std::uint64_t keep = std::min<std::uint64_t>(k, all.size());
         std::partial_sort(all.begin(), all.begin() + keep, all.end(), closer);
         std::copy(all.begin(), all.begin() + keep, out.begin() + q * k);
+        count[q] = static_cast<std::uint32_t>(keep);
+    }
+}
+
+void merge_block(const FlatSearch &s, const RowBlock *extra, std::vector<Neighbor> &out, std::vector<std::uint32_t> &count,
+                 const std::function<bool()> &poll)
+{
+    const std::uint64_t nq = s.n_queries, k = s.k;
+    std::vector<Neighbor> jout, merged;
+    std::vector<std::uint32_t> jcount;
+    flat_search(s, extra, 1, jout, jcount, poll);
+    for (std::uint64_t q = 0; q < nq; ++q) {
+        merged.clear();
+        std::merge(out.begin() + q * k, out.begin() + q * k + count[q], jout.begin() + q * k,
+                   jout.begin() + q * k + jcount[q], std::back_inserter(merged), closer);
+        const std::uint64_t keep = std::min<std::uint64_t>(k, merged.size());
+        std::copy(merged.begin(), merged.begin() + keep, out.begin() + q * k);
         count[q] = static_cast<std::uint32_t>(keep);
     }
 }

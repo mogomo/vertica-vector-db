@@ -19,7 +19,7 @@ constexpr char SNAPSHOT_MAGIC[8] = {'V', 'V', 'E', 'C', 'T', 'O', 'R', '1'};
 
 constexpr std::uint32_t FLAG_HNSW = 1u;          // graph section present (milestone M2)
 constexpr std::uint32_t FLAG_NORMALISED = 2u;    // vectors have unit length (cosine indexes)
-constexpr std::uint32_t FLAG_SQ8 = 4u;           // int8 codes section present (milestone M4)
+constexpr std::uint32_t FLAG_SQ8 = 4u;           // int8 codes section present (sq8.h)
 constexpr std::uint32_t FLAG_ID_INDEX = 8u;      // id_index section present; ids are then in any order
 constexpr std::uint32_t FLAG_TOMBSTONES = 16u;   // tombstones bitset present
 constexpr std::uint32_t KNOWN_FLAGS = 31u;
@@ -160,6 +160,13 @@ struct GraphSection {
     std::function<void(const VectorSet &s, std::uint8_t *section)> fill;
 };
 
+// The same for the sq8 codes (sq8.h): bytes() gives the size for n rows of row_stride floats; fill()
+// trains on the finished rows of s and writes the section. Filled before the graph.
+struct CodeSection {
+    std::function<std::uint64_t(std::uint64_t n, std::uint32_t row_stride)> bytes;
+    std::function<void(const VectorSet &s, std::uint8_t *section)> fill;
+};
+
 // Builds a full snapshot. Rows are written straight into the final buffer as they arrive; ids
 // may arrive in any order and are sorted at finish by moving the rows in place, so the builder
 // never holds a second copy of the vectors.
@@ -180,10 +187,11 @@ public:
     std::uint64_t count() const { return ids_.size(); }
     std::uint32_t dims() const { return dims_; }
 
-    // Sorts by id, writes ids, header, the graph section if given, and the checksum into the
-    // buffer and hands it over to out. Throws std::runtime_error on a repeated id or no vectors,
-    // and whatever graph->fill throws. The builder is empty afterwards.
-    void finish(std::int64_t max_ver, SnapshotBuffer &out, const GraphSection *graph = nullptr);
+    // Sorts by id, writes ids, header, the sq8 and graph sections if given, and the checksum into
+    // the buffer and hands it over to out. Throws std::runtime_error on a repeated id or no vectors,
+    // and whatever codes->fill or graph->fill throw. The builder is empty afterwards.
+    void finish(std::int64_t max_ver, SnapshotBuffer &out, const GraphSection *graph = nullptr,
+                const CodeSection *codes = nullptr);
 
 private:
     Metric metric_;

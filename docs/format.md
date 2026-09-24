@@ -71,12 +71,67 @@ In this order, each starting on the next 64-byte boundary after the one before:
    position (bit i % 64 of word i / 64); 1 = the position is deleted. Bits
    from count on are 0. A tombstoned position keeps its row, its id and its
    links in the graph: searches pass through it but never return it.
-5. `sq8` (FLAG_SQ8): int8 codes and their scale. Defined with milestone M4.
+5. `sq8` (FLAG_SQ8): one byte per element and the scale that maps it back
+   to a float, see below.
 6. `graph` (FLAG_HNSW): the HNSW links, see below.
 
 Vectors come first so the builder can write every row straight into the
 final buffer as it arrives. Rows are sorted by id at the end by moving them
 in place, so a build never holds two copies of the vectors.
+
+## sq8 section (FLAG_SQ8)
+
+Scalar quantisation (milestone M4): every element of every row is also
+stored as one byte, a code from 0 to 255. One range holds for the whole
+index: element x has the code
+
+    code = min(255, max(0, floor((x - offset) / scale + 0.5)))
+
+computed in float32, and the code stands for `offset + scale x code`. The
+`vectors` section stays: searches rank candidates by their codes, then
+compute the exact scores of the best candidates from the float rows. Offsets
+below are from the start of the sq8 section; every part starts on a 64-byte
+boundary, padding bytes are 0.
+
+sq8 header (64 bytes):
+
+| Offset | Type | Field | Meaning |
+|---:|---|---|---|
+| 0 | float32 | scale | (hi - lo) / 255, or 1 when hi = lo |
+| 4 | float32 | offset | lo |
+| 8 | uint32 | code_stride | bytes per code row: row_stride |
+| 12 | uint32 | sample | elements the range was trained on |
+| 16 | uint64 | count | positions, equal to the snapshot's count |
+| 24 | uint64[5] | reserved | 0 |
+
+Parts, in this order:
+
+1. `codes`: uint8[count x code_stride], row i = position i. Codes of the
+   elements dims to code_stride - 1 are 0 (not the code of 0.0), so the
+   padding adds nothing to any sum below.
+2. `sums`: uint32[count], the sum of the codes of each row.
+
+Training (a full build): lo and hi are the 0.001 and 0.999 quantiles of a
+sample of all elements of evenly spaced rows (in position order), about
+100,000 elements; values outside [lo, hi] get code 0 or 255. Cosine rows are
+normalised before they are coded. An incremental build keeps the base's
+scale and offset and codes the appended rows with them; a full build trains
+anew.
+
+What a search computes from the codes (a = row codes, b = query codes, both
+coded with the same range, sums over the dims elements, all in uint32, so
+the result is exact on every CPU):
+
+| Metric | Integer sum | Key (smaller is closer) |
+|---|---|---|
+| l2 | sum (a - b)^2 | scale^2 x sum |
+| l1 | sum abs(a - b) | scale x sum |
+| dot, cosine | sum a x b | -(scale^2 x sum + scale x offset x (sums[i] + sum of b) + dims x offset^2) |
+
+The key is computed in double from the exact integers, in this order, and
+rounded to float32. It is the approximate value of the metric's built-in
+(for l2 its square, for dot and cosine its negative), which is what a search
+reports without rescoring. Every sum fits: 255^2 x 32768 < 2^32.
 
 ## Graph section (FLAG_HNSW)
 
@@ -139,6 +194,9 @@ base, then:
 - sets the tombstone bit of every deleted or changed id's old position;
 - writes an id_index when an appended id is not larger than every id
   before it, or when the base had one;
+- extends the sq8 section: the base's codes and sums are copied, the
+  appended rows are coded with the base's scale and offset (the header is
+  copied unchanged, only count changes);
 - extends the graph: `levels`, `level0` and `upper_index` of the base are
   copied to the same positions, the base's `upper` blocks come first in
   `upper` (so a base position keeps its block index), the new positions get

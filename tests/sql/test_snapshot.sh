@@ -118,8 +118,12 @@ SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
 expect "an unknown index_type is refused" "index_type must be flat or hnsw, not 'ivf'" "
 SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', index_type='ivf') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
-expect "quantization sq8 says when it comes" "quantization sq8 is not implemented yet (milestone M4)" "
+expect "quantization sq8 builds a snapshot with codes (test_sq8.sh tests them)" "^chunks 1, vectors 1$" "
+SELECT 'chunks ' || COUNT(*) || ', vectors ' || MAX(vector_count) FROM (
 SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='sq8') OVER()
+FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v) b;"
+expect "an unknown quantization is refused" "vbuild: quantization must be none or sq8, not 'pq'" "
+SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', quantization='pq') OVER()
 FROM (SELECT 1 AS id, ARRAY[1.0, 2.0] AS vec) v;"
 expect "an incremental build needs its base snapshot in the node cache" "base snapshot 5 is not usable in the cache of .*refresh with mode full" "
 SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest_x', base_snapshot=5$CD) OVER()

@@ -86,7 +86,8 @@ DECLARE
     opts VARCHAR(400); want INT; got INT;
 BEGIN
     opts := (SELECT MAX('precision=' || COALESCE(precision_default, '') || ',freshness=' || COALESCE(freshness_default, '')
-                        || ',ef_search=' || COALESCE(ef_search_default::VARCHAR, '') || ',threads=' || COALESCE(threads_default::VARCHAR, ''))
+                        || ',ef_search=' || COALESCE(ef_search_default::VARCHAR, '') || ',threads=' || COALESCE(threads_default::VARCHAR, '')
+                        || ',memory_mode=' || COALESCE(memory_mode, ''))
              FROM vvector.manifest WHERE index_name = nm);
     IF opts IS NULL THEN
         RAISE EXCEPTION 'vvector.push_options: index % is not registered', nm;
@@ -395,7 +396,8 @@ END;
 $$;
 
 -- Changes the options of an index. NULL keeps a value. Build options (x_type, x_m, x_efc, x_quant) take
--- effect at the next refresh; query defaults (x_prec, x_fresh, x_ef, x_thr) at once, on every node.
+-- effect at the next refresh; query defaults (x_prec, x_fresh, x_ef, x_thr) at once, on every node;
+-- memory_mode (x_memory: ram, or compact with quantization sq8) with the next snapshot a node maps.
 -- 'default' (text) or 0 (numbers) sets a query default back to the built-in default.
 -- x_verify (verify_every, the last argument of the 14-argument form): verify the journal digest at every
 -- refresh (1, the default), every N refreshes (N), or never (0).
@@ -421,9 +423,6 @@ BEGIN
     IF x_quant IS NOT NULL AND x_quant NOT IN ('none', 'sq8') THEN
         RAISE EXCEPTION 'vvector.set_index_options: quantization must be none or sq8';
     END IF;
-    IF COALESCE(x_quant, '') = 'sq8' THEN
-        RAISE EXCEPTION 'vvector.set_index_options: quantization sq8 is not implemented yet (milestone M4)';
-    END IF;
     IF x_refresh IS NOT NULL AND x_refresh NOT IN ('auto', 'incremental', 'full') THEN
         RAISE EXCEPTION 'vvector.set_index_options: refresh_mode must be auto, incremental or full';
     END IF;
@@ -436,8 +435,9 @@ BEGIN
     IF x_memory IS NOT NULL AND x_memory NOT IN ('ram', 'compact') THEN
         RAISE EXCEPTION 'vvector.set_index_options: memory_mode must be ram or compact';
     END IF;
-    IF COALESCE(x_memory, '') = 'compact' THEN
-        RAISE EXCEPTION 'vvector.set_index_options: memory_mode compact needs quantization sq8 (milestone M4)';
+    IF COALESCE(x_memory, (SELECT MAX(memory_mode) FROM vvector.manifest WHERE index_name = nm)) = 'compact'
+       AND COALESCE(x_quant, (SELECT MAX(quantization) FROM vvector.manifest WHERE index_name = nm), 'none') <> 'sq8' THEN
+        RAISE EXCEPTION 'vvector.set_index_options: memory_mode compact needs quantization sq8';
     END IF;
     IF x_prec IS NOT NULL AND x_prec NOT IN ('fast', 'balanced', 'best', 'exact', 'default') THEN
         RAISE EXCEPTION 'vvector.set_index_options: precision_default must be fast, balanced, best, exact or default';
@@ -530,7 +530,7 @@ END;
 $$;
 
 -- Memory estimate for an index before its table is loaded. Prints one line per figure; changes nothing.
--- index_type flat or hnsw (with m = 16), quantization none or sq8 (sq8 is an estimate for milestone M4).
+-- index_type flat or hnsw (with m = 16), quantization none or sq8.
 CREATE OR REPLACE PROCEDURE vvector.sizing(n_vectors INT, n_dims INT, kind VARCHAR, quant VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     stride INT; vec_mb FLOAT; ids_mb FLOAT; graph_mb FLOAT; sq8_mb FLOAT; total_mb FLOAT; build_mb FLOAT; mem_gb FLOAT;
@@ -550,7 +550,7 @@ BEGIN
     -- HNSW with m = 16: level 0 holds 2m + 1 uint32 per vector, plus a level byte and an index entry
     -- (5 bytes); a vector has 1/(m - 1) upper blocks of m + 1 uint32 on average.
     graph_mb := CASE WHEN kind = 'hnsw' THEN n_vectors * (33 * 4 + 5 + 17 * 4 / 15.0) / 1048576.0 ELSE 0 END;
-    sq8_mb := CASE WHEN quant = 'sq8' THEN n_vectors * (stride + 8) / 1048576.0 ELSE 0 END;
+    sq8_mb := CASE WHEN quant = 'sq8' THEN n_vectors * (stride + 4) / 1048576.0 ELSE 0 END;     -- a byte per element, a sum per vector
     total_mb := vec_mb + ids_mb + graph_mb + sq8_mb;
     mem_gb := (SELECT MIN(total_memory_bytes) FROM v_monitor.host_resources) / 1073741824.0;
     -- Build: the snapshot, 4 bytes per vector to sort; HNSW adds 2 bytes per vector per build thread
@@ -564,7 +564,7 @@ BEGIN
     RAISE NOTICE 'vvector.sizing: queries read the cache file through the page cache: keep it in memory. Smallest node here: % GB of memory',
                  mem_gb::NUMERIC(18,1);
     IF total_mb / 1024.0 > 0.5 * mem_gb THEN
-        RAISE WARNING 'vvector.sizing: the index needs more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact (milestone M4) or larger nodes.';
+        RAISE WARNING 'vvector.sizing: the index needs more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact, or larger nodes.';
     END IF;
 END;
 $$;
@@ -667,9 +667,9 @@ BEGIN
     RAISE NOTICE 'vvector: index %: sizing: index % MB, all indexes % MB, build about % MB, smallest node % MB of memory (% MB free or cache), % cores',
                  nm, bytes // 1048576, all_bytes // 1048576, build // 1048576, mem // 1048576, free_mem // 1048576, cores;
     IF bytes > mem // 2 THEN
-        RAISE WARNING 'vvector: index %: the index takes more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact (milestone M4) or larger nodes.', nm;
+        RAISE WARNING 'vvector: index %: the index takes more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact, or larger nodes.', nm;
     ELSIF all_bytes > mem * 7 // 10 THEN
-        RAISE WARNING 'vvector: index %: all indexes together take % MB, more than 70%% of the memory of the smallest node: they will not stay in the page cache. Use quantization sq8 (milestone M4), fewer indexes, or larger nodes.', nm, all_bytes // 1048576;
+        RAISE WARNING 'vvector: index %: all indexes together take % MB, more than 70%% of the memory of the smallest node: they will not stay in the page cache. Use quantization sq8 with memory_mode compact, fewer indexes, or larger nodes.', nm, all_bytes // 1048576;
     END IF;
     IF fenced_mb > 0 AND build > fenced_mb * 1048576 THEN
         RAISE WARNING 'vvector: index %: a refresh needs about % MB in the fenced process, FencedUDxMemoryLimitMB is %: raise FencedUDxMemoryLimitMB (vbuild runs fenced with FENCED=yes and FENCED=mixed).', nm, build // 1048576, fenced_mb;

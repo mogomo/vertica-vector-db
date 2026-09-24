@@ -14,16 +14,17 @@
 #   --hnswlib    a clone of github.com/nmslib/hnswlib: the engine benchmark also runs hnswlib
 #
 # Measures: engine (make bench: memory bandwidth, flat search 1 query and batches, build; HNSW
-# build and search per ef_search, and hnswlib the same way when --hnswlib is given); refresh of the
-# flat index sift and the HNSW index sift_hnsw (build, load); incremental refresh against the size
+# build and search per ef_search, the same with sq8 codes, and hnswlib the same way when --hnswlib is
+# given); refresh of the flat index sift, the HNSW index sift_hnsw and the HNSW index with sq8 codes
+# sift_sq8 (build, load); incremental refresh against the size
 # of the change (a flat and an HNSW index on a copy of the first 900,000 vectors, changes of 0 to
 # 50,000 adds plus half as many deletes, then a full build for comparison); per mode: the SQL full scan of one
-# query (ORDER BY VECTOR_L2 LIMIT 10), the single-query shapes of scripts/latency.sh on both
+# query (ORDER BY VECTOR_L2 LIMIT 10), the single-query shapes of scripts/latency.sh on the three
 # indexes (vsearch and vknn), batches of queries in one statement, and recall@10 against the
-# ground truth (flat, and HNSW at every precision level). Prints the results; also saved to
-# build/benchmark-<date>.txt.
+# ground truth (flat, and HNSW with and without sq8 at every precision level). Prints the results;
+# also saved to build/benchmark-<date>.txt.
 # Needs make, make tools and a deployed library. Creates schema VVBENCH (tables sift_*) and
-# indexes sift and sift_hnsw (the incremental part makes and drops sift_inc, sift_inc_f and
+# indexes sift, sift_hnsw and sift_sq8 (the incremental part makes and drops sift_inc, sift_inc_f and
 # sift_inc_h). Takes 40 to 50 minutes on 8 cores.
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -euo pipefail
@@ -49,16 +50,17 @@ done
 [ -n "$DATA_DIR" ] || { echo "benchmark.sh: --data_dir is required" >&2; exit 2; }
 case "$SCHEMA$RUNS$BATCH" in *[!A-Za-z0-9_]*) echo "benchmark.sh: bad --schema, --runs or --batch" >&2; exit 2 ;; esac
 
-IX=sift HX=sift_hnsw
+IX=sift HX=sift_hnsw QX=sift_sq8
 part() { [[ ",$PARTS," == *",$1,"* ]]; }
 OUT="build/benchmark-$(date +%Y%m%d-%H%M%S).txt"
 if [ "$ECHO_ONLY" = yes ]; then
     echo "scripts/load_dataset.sh --dataset=sift --dir=$DATA_DIR --schema=$SCHEMA"
     echo "CALL vvector.register_index('$IX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'flat'); CALL vvector.refresh_index('$IX');"
     echo "CALL vvector.register_index('$HX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw'); CALL vvector.refresh_index('$HX');"
+    echo "CALL vvector.register_index('$QX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw'); CALL vvector.set_index_options('$QX', NULL, NULL, NULL, 'sq8', ...); CALL vvector.refresh_index('$QX');"
     echo "make bench DATA_DIR=$DATA_DIR${HNSWLIB:+ HNSWLIB_DIR=$HNSWLIB}"
     echo "incremental: $SCHEMA.sift_inc = first 900000 rows of sift_base; indexes sift_inc_f (flat), sift_inc_h (hnsw); changes of 0, 100, 1000, 10000, 50000 adds and half as many deletes; refresh_index after each; refresh_index(..., 'full')"
-    for m in ${MODES//,/ }; do echo "scripts/deploy.sh --fenced=$m; full scan; scripts/latency.sh --index=$IX and --index=$HX --schema=$SCHEMA --runs=$RUNS; batches of $BATCH; recall@10"; done
+    for m in ${MODES//,/ }; do echo "scripts/deploy.sh --fenced=$m; full scan; scripts/latency.sh --index=$IX, --index=$HX and --index=$QX --schema=$SCHEMA --runs=$RUNS; batches of $BATCH; recall@10"; done
     exit 0
 fi
 mkdir -p build
@@ -103,6 +105,17 @@ printf "%-58s %12.3f s\n" "refresh_index, 1M x 128, HNSW (all steps)" "$(awk -v 
 printf "%-58s %12d ms\n" "  vbuild statement (consolidation, graph build, chunks)" "$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = 'vvector_build' ORDER BY start_timestamp DESC LIMIT 1")"
 printf "%-58s %12d ms\n" "  vload statement (write and verify the cache file)" "$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = 'vvector_load' ORDER BY start_timestamp DESC LIMIT 1")"
 printf "%-58s %12s MB\n" "  snapshot size (graph included)" "$(sql "SELECT index_bytes // 1048576 FROM vvector.manifest WHERE index_name = '$HX'")"
+
+echo; echo "== refresh of the HNSW index with sq8 codes (quantization sq8, FENCED=yes)"
+sql "CALL vvector.unregister_index('$QX');" > /dev/null 2>&1 || true
+sql "CALL vvector.register_index('$QX', '$SCHEMA.sift_base', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw');
+     CALL vvector.set_index_options('$QX', NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);" > /dev/null 2>&1
+start=$(date +%s%N)
+sql "CALL vvector.refresh_index('$QX');" > /dev/null 2>&1
+printf "%-58s %12.3f s\n" "refresh_index, 1M x 128, HNSW with sq8 (all steps)" "$(awk -v ns=$(( $(date +%s%N) - start )) 'BEGIN {print ns / 1e9}')"
+printf "%-58s %12d ms\n" "  vbuild statement (consolidation, graph, codes, chunks)" "$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = 'vvector_build' ORDER BY start_timestamp DESC LIMIT 1")"
+printf "%-58s %12d ms\n" "  vload statement (write and verify the cache file)" "$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = 'vvector_load' ORDER BY start_timestamp DESC LIMIT 1")"
+printf "%-58s %12s MB\n" "  snapshot size (graph and codes included)" "$(sql "SELECT index_bytes // 1048576 FROM vvector.manifest WHERE index_name = '$QX'")"
 fi
 
 if part incremental; then
@@ -178,6 +191,8 @@ part search && for m in ${MODES//,/ }; do
     scripts/latency.sh --index="$IX" --schema="$SCHEMA" --runs="$RUNS" --shapes=select1,vversion,snap,delta0,threads1 2>&1 | grep -v NOTICE
     echo "HNSW index $HX (precision balanced, the default):"
     scripts/latency.sh --index="$HX" --schema="$SCHEMA" --runs="$RUNS" --shapes=snap,dual,delta0,vknn,vknnrow 2>&1 | grep -v NOTICE
+    echo "HNSW index with sq8 codes $QX (precision balanced: 2 x k rescored):"
+    scripts/latency.sh --index="$QX" --schema="$SCHEMA" --runs="$RUNS" --shapes=snap,vknn 2>&1 | grep -v NOTICE
     batch() {   # LABEL WHAT SQL
         for i in 1 2 3; do sql "SELECT /*+LABEL(${TAG}_$1_$m)*/ COUNT(*) FROM ($3) r" > /dev/null; done
         local ms
@@ -191,6 +206,10 @@ part search && for m in ${MODES//,/ }; do
         "SELECT vvector.vsearch($V USING PARAMETERS index_name='$HX', k=10, precision='fast') OVER() FROM (SELECT * FROM $SCHEMA.${HX}_snap UNION ALL $QS) x"
     batch hnswb "vsearch HNSW (balanced, the default), $BATCH queries in one statement" \
         "SELECT vvector.vsearch($V USING PARAMETERS index_name='$HX', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${HX}_snap UNION ALL $QS) x"
+    batch sq8f "vsearch HNSW sq8 (fast: codes only), $BATCH queries" \
+        "SELECT vvector.vsearch($V USING PARAMETERS index_name='$QX', k=10, precision='fast') OVER() FROM (SELECT * FROM $SCHEMA.${QX}_snap UNION ALL $QS) x"
+    batch sq8b "vsearch HNSW sq8 (balanced: 2 x k rescored), $BATCH queries" \
+        "SELECT vvector.vsearch($V USING PARAMETERS index_name='$QX', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${QX}_snap UNION ALL $QS) x"
     batch vknn "vknn HNSW (balanced), $BATCH query rows in one statement" \
         "SELECT q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='$HX', k=10) FROM $SCHEMA.sift_query q WHERE q.qid < $BATCH"
 done
@@ -205,6 +224,7 @@ recall() {   # WHAT INDEX PARAMS
 }
 recall "flat index (exact)" "$IX" ""
 for p in fast balanced best exact; do recall "HNSW index, precision $p" "$HX" ", precision='$p'"; done
+for p in fast balanced best; do recall "HNSW index with sq8, precision $p" "$QX" ", precision='$p'"; done
 fi
 scripts/deploy.sh --fenced=yes > /dev/null 2>&1
 echo; echo "saved to $OUT"

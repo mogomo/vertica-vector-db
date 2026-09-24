@@ -9,6 +9,7 @@
 #define VVECTOR_ENGINE_FLAT_H
 
 #include "snapshot.h"
+#include "sq8.h"
 
 #include <cstdint>
 #include <functional>
@@ -17,12 +18,16 @@
 namespace vvector {
 
 // Rows to search: n rows of `stride` floats, their ids, and an optional bitset of rows that are no
-// candidates (bit i % 64 of word i / 64 set: a masked or tombstoned row).
+// candidates (bit i % 64 of word i / 64 set: a masked or tombstoned row). ids null: the id of a row
+// is its row number (the candidate search of search.cpp works with positions). With codes, the rows are
+// ranked by their sq8 codes (row i of codes is row i of the block) against the query codes of the
+// search, and the keys are sq8 keys (sq8.h); the float rows are then not read.
 struct RowBlock {
     const float *rows = nullptr;
     const std::int64_t *ids = nullptr;
     std::uint64_t n = 0;
     const std::uint64_t *skip = nullptr;
+    const Sq8Codes *codes = nullptr;
 };
 
 struct Neighbor {
@@ -41,6 +46,8 @@ struct FlatSearch {
     bool has_radius = false;             // only candidates whose score is within radius:
     double radius = 0;                   //   l2, l1: score <= radius; cosine, dot: score >= radius
     int threads = 1;
+    const std::uint8_t *query_codes = nullptr;   // blocks with codes: n_queries rows of code_stride bytes
+    const std::uint32_t *query_sums = nullptr;   //   and the code sum of each query
 };
 
 // The k closest rows of every query: neighbours of query q are out[q * k] to out[q * k + count[q] - 1],
@@ -53,6 +60,11 @@ void flat_search(const FlatSearch &s, const RowBlock *blocks, std::size_t n_bloc
 
 // True if a key passes the radius of s.
 bool within_radius(const FlatSearch &s, float key);
+
+// Searches block extra exactly (flat_search with s) and merges its results into out and count, the
+// results of the same queries of s in flat_search's layout: the k closest of both, in (key, id) order.
+void merge_block(const FlatSearch &s, const RowBlock *extra, std::vector<Neighbor> &out, std::vector<std::uint32_t> &count,
+                 const std::function<bool()> &poll = std::function<bool()>());
 
 } // namespace vvector
 

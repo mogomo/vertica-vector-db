@@ -6,19 +6,20 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M3 (incremental refresh).** Two index types: `hnsw` (a
-graph index, approximate, the default) and `flat` (exact). k-nearest-neighbour
-search works for the metrics l2, cosine, dot and l1, for one query or
-thousands in one statement, with or without the rows written since the last
-refresh. A refresh adds only the changes since the last one to the index and
-rebuilds it in full only when that is needed. Exact results are tested to
-equal a full scan with Vertica's built-in functions; HNSW recall is measured on
-SIFT1M, also after 100 incremental refreshes. Tested on Vertica 26.2 on one
-node (aarch64, Rocky Linux 9, g++ 11.5) and on a 3-node Eon cluster (x86_64,
-Red Hat Enterprise Linux 8, g++ 8.5), fenced, unfenced and mixed. Not yet
-available: int8 quantisation (M4), filtered search, range search on the graph
-and vector functions (M5). Treat this as a preview: try it on your own systems
-before you rely on it.
+**Status: milestone M4 (int8 quantisation).** Two index types: `hnsw` (a
+graph index, approximate, the default) and `flat` (exact), each optionally
+with int8 codes (`sq8`) that make searches faster while the returned scores
+stay exact. k-nearest-neighbour search works for the metrics l2, cosine, dot
+and l1, for one query or thousands in one statement, with or without the rows
+written since the last refresh. A refresh adds only the changes since the
+last one to the index and rebuilds it in full only when that is needed. Exact
+results are tested to equal a full scan with Vertica's built-in functions;
+recall is measured on SIFT1M, also after 100 incremental refreshes. Tested on
+Vertica 26.2 on one node (aarch64, Rocky Linux 9, g++ 11.5), on a 3-node Eon
+cluster and on a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux
+8, g++ 8.5), fenced, unfenced and mixed. Not yet available: filtered search,
+range search on the graph and vector functions (M5). Treat this as a
+preview: try it on your own systems before you rely on it.
 
 Contents: [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
 [Prepare a table](#prepare-a-table) · [Register, refresh, schedule](#register-refresh-schedule) ·
@@ -89,8 +90,9 @@ floats, so scores agree to about 7 digits):
 
 ### Prerequisites
 
-- Vertica 26.x (tested: 26.2.0-1 single node, 26.2.0-2 Eon with 3 nodes) with
-  the C++ SDK in `/opt/vertica/sdk` (another place: `make SDK_HOME=...`).
+- Vertica 26.x (tested: 26.2.0-1 single node, 26.2.0-2 Eon with 3 nodes,
+  26.2.0-3 Enterprise mode with 4 nodes) with the C++ SDK in `/opt/vertica/sdk`
+  (another place: `make SDK_HOME=...`).
 - g++ with C++17 (tested: 11.5 on aarch64, 8.5 on x86_64) and GNU make, on a
   Vertica node: `CREATE LIBRARY` reads the .so from the initiator node's file
   system and copies it to the other nodes. No CPU flags are needed: on x86_64
@@ -100,6 +102,12 @@ floats, so scores agree to about 7 digits):
   [docs/build-x86.md](docs/build-x86.md).
 - A database user that may create a schema, a library, functions and a role
   (dbadmin, or a user with those rights).
+- For the tests and the benchmark only: Vertica's packages `VectorOps`
+  (`VECTOR_L2`, `COSINE_SIMILARITY`, `DOT_PRODUCT`: the tests compare with
+  them) and `approximate` (`APPROXIMATE_PERCENTILE`: the benchmark's medians).
+  A new database usually has them; if not, see
+  [docs/build-x86.md](docs/build-x86.md), "Problems seen". vvector itself
+  needs neither.
 
 ### Build, test, deploy
 
@@ -396,12 +404,12 @@ to later milestones are refused with a message that names the milestone.
 |---|---|---|---|
 | index_type | flat, hnsw | hnsw (as registered) | in use |
 | m, ef_construction | 2 to 256, 1 to 100000 | 16, 200 | in use (HNSW) |
-| quantization | none, sq8 | none | none only (sq8: M4) |
+| quantization | none, sq8 | none | in use: sq8 adds one byte per element; searches rank by those bytes and rescore the best candidates (see [int8 quantisation](#int8-quantisation-sq8)); a change means a full build at the next refresh |
 | refresh_mode | auto, incremental, full | auto | in use (see [refresh_index](#refresh_index)) |
 | tombstone_ratio | above 0 to 1 | 0.2 | in use: `auto` builds in full once the tombstones exceed this share of the snapshot |
 | rebuild_every | 0 (never) or more | never | in use: `auto` builds in full after this many incremental refreshes |
 | verify_every | 0 (never), 1 (every refresh) or more | 1 | in use: how often a refresh verifies the journal rows up to the boundary (see [refresh_index](#refresh_index)) |
-| memory_mode | ram, compact | ram | ram only (compact: M4) |
+| memory_mode | ram, compact | ram | in use: `compact` (needs sq8) reads ahead only the bytes, ids and graph of a snapshot, not its floats; takes effect with the next snapshot a node maps (the next refresh) |
 | precision_default | fast, balanced, best, exact | balanced | in use (HNSW); a flat index is always exact |
 | freshness_default | snapshot, exact | snapshot | in use |
 | ef_search_default | 0 to 100000 | 0 (preset) | in use (HNSW) |
@@ -435,7 +443,7 @@ may call it:
     NOTICE 2005:  vvector.sizing: 10000000 vectors of 768 dimensions (768 floats per row): vectors 29296.9 MB, ids 76.3 MB, graph 1349.8 MB, sq8 codes 0.0 MB
     NOTICE 2005:  vvector.sizing: snapshot and cache file 30722.9 MB per node; build memory about 30961.4 MB on the refreshing node (fenced: counts against FencedUDxMemoryLimitMB)
     NOTICE 2005:  vvector.sizing: queries read the cache file through the page cache: keep it in memory. Smallest node here: 34.3 GB of memory
-    WARNING 2005:  vvector.sizing: the index needs more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact (milestone M4) or larger nodes.
+    WARNING 2005:  vvector.sizing: the index needs more than half of the memory of the smallest node. Use quantization sq8 with memory_mode compact, or larger nodes.
 
 ### load_all, unregister_index
 
@@ -524,10 +532,10 @@ Parameters:
 | freshness | snapshot | snapshot, exact | `exact` applies the journal rows of the input; `snapshot` ignores them |
 | radius | off | a number | only neighbours within it, at most k: l2 and l1 `score <= radius`; cosine and dot `score >= radius` (on HNSW: see [Range search](#range-search)) |
 | threads | 0 | 0 (one per core) to 64 | threads for one statement |
-| precision | balanced | fast, balanced, best, exact | HNSW: the speed and recall trade-off, a preset of ef_search (fast: 2 x k, at least 32; balanced: 100; best: 400; exact: read every vector). A flat index is always exact |
+| precision | balanced | fast, balanced, best, exact | the speed and recall trade-off, a preset of ef_search (HNSW; fast: 2 x k, at least 32; balanced: 100; best: 400) and, with sq8, of rescore and oversampling (fast: no rescoring; balanced: 2 x k candidates rescored; best: 4 x k). exact reads every float vector. A flat index without sq8 is always exact |
 | ef_search | 0 (preset) | 0 to 100000 | HNSW: the length of the candidate list; overrides the preset of `precision`; below k it is raised to k. No effect on a flat index |
 | exact | false | true, false | `true` reads every vector of an HNSW index (the same as `precision='exact'`) |
-| rescore, oversampling | true, 1 | true or false; 1 to 100 | int8 quantisation (M4); no effect now |
+| rescore, oversampling | preset of precision | true or false; 1 to 100 | sq8 only: rank by the bytes, then compute the exact scores of the best k x oversampling candidates from the floats (`rescore=true`), or return the k best with approximate scores (`rescore=false`). No effect on an index without sq8 |
 | cache_dir | `/tmp/vvector` | absolute path | where the node cache is |
 
 Every tuning value except `index_name`, `query` and `radius` can also be set
@@ -747,9 +755,9 @@ queries, recall@10 = the share of the true 10 nearest neighbours found):
 
 | precision | ef_search | recall@10 | 1000 queries in one statement | one search in the engine |
 |---|---:|---:|---:|---:|
-| fast | 2 x k, at least 32 | 0.893 | 12 ms | 0.05 ms |
-| balanced (default) | 100 | 0.980 | 25 ms | 0.14 ms |
-| best | 400 | 0.999 | not measured | 0.44 ms |
+| fast | 2 x k, at least 32 | 0.892 | 14 ms | 0.05 ms |
+| balanced (default) | 100 | 0.980 | 28 ms | 0.14 ms |
+| best | 400 | 0.999 | not measured | 0.46 ms |
 | exact | (every vector) | 0.999 (the rest are ties) | 1.1 s (measured on the flat index) | 9 ms (1 thread) |
 
 A single statement costs about 1.5 ms more than the engine time (see
@@ -789,12 +797,85 @@ vvector ef_search = '150'`) or per index (`set_index_options`).
 |---|---|
 | the lowest latency for single queries | the `query` parameter, `FROM <index>_snap`, deploy with `FENCED=mixed`; `vknn` is a little faster still but has no stale check |
 | higher recall | `precision='best'`, or a larger `ef_search`; for all queries of an index: `set_index_options` |
-| more throughput in large batches | `precision='fast'` (recall 0.89 instead of 0.98 on SIFT1M) |
+| more throughput in large batches | `quantization='sq8'` (same recall), or `precision='fast'` (recall 0.89 instead of 0.98 on SIFT1M) |
 | exact answers on an HNSW index | `precision='exact'` or `exact=true` for that query |
 | results that include every committed change | `freshness='exact'` and `FROM <index>_delta` (per query, session or index) |
 | many queries at once | one vsearch statement with all query rows (a table), not one statement per query |
 | fewer cores for one statement | `threads=N` |
 | the same default for every user of an index | `set_index_options` |
+| faster searches, same exact scores | `quantization='sq8'` (see below) |
+
+### int8 quantisation (sq8)
+
+With `quantization='sq8'` the snapshot also stores every element of every
+vector as one byte: a code from 0 to 255 in one range for the whole index,
+trained on a sample of the vectors at a full build. A search first ranks the
+candidates by these bytes (a quarter of the memory to read, integer
+arithmetic), then computes the exact scores of the best k x oversampling
+candidates from the float vectors (rescoring) and returns the k best of them.
+The scores you get are exact; only the choice of candidates is approximate.
+
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    CALL vvector.refresh_index('docs');
+
+    NOTICE 2005:  vvector: index docs refreshed: snapshot 2016, full build (build options changed from hnsw cosine none m=16 ef_construction=200 to hnsw cosine sq8 m=16 ef_construction=200), 7 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.307 seconds; journal digest taken in 0.015 seconds
+
+The same search as before; the scores are exact (rescoring), and with
+`precision='fast'` they come from the codes alone:
+
+    SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
+                           USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3) OVER()
+    FROM app.docs_snap;
+
+     qid | id |       score       | rank
+    -----+----+-------------------+------
+       0 |  6 |  0.99886816740036 |    1
+       0 |  1 | 0.980580687522888 |    2
+       0 |  5 | 0.832050263881683 |    3
+
+    -- precision='fast':
+       0 |  6 | 0.997308850288391 |    1
+       0 |  1 | 0.980392277240753 |    2
+       0 |  5 | 0.830449938774109 |    3
+
+`vinfo` shows the codes on every node (column `quantization`: `sq8`), and
+`memory_mode` can then be set:
+
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'compact', NULL, NULL, NULL, NULL);
+    -- and back without codes needs memory_mode ram in the same call:
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, 'none', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ERROR 2005:  vvector.set_index_options: memory_mode compact needs quantization sq8
+
+Works with both index types, every metric, the journal (its rows are always
+searched exactly) and incremental refresh (which keeps the range). The
+`precision` levels on an index with sq8:
+
+| precision | codes | rescoring |
+|---|---|---|
+| fast | graph walk or scan on the codes | none: the scores are approximate |
+| balanced (default) | the same | 2 x k candidates rescored |
+| best | the same, ef_search 400 | 4 x k candidates rescored |
+| exact | not used: every float vector is read | |
+
+`rescore` and `oversampling` override the preset per query, per session or
+per index. SIFT1M (1M vectors of 128 dimensions, k = 10), engine alone:
+
+| Search | recall@10 float | recall@10 sq8 | queries/s float | queries/s sq8 |
+|---|---:|---:|---:|---:|
+| HNSW, ef_search 100, rescoring 2 x k (balanced) | 0.983 | 0.983 | 48,900 / 35,500 | 72,600 / 60,300 |
+| HNSW, ef_search 100, no rescoring | 0.983 | 0.970 | 48,900 / 35,500 | 73,500 / 61,500 |
+| flat, rescoring 2 x k | 0.999 | 0.999 | 832 / 576 | 1,190 / 708 |
+
+(queries/s: the test VM with 8 aarch64 cores / a 10-core x86_64 node, all
+threads, 10,000 queries; `make test DATA_DIR=...`.) Through SQL, recall@10 of
+1000 queries: fast 0.884, balanced 0.979, best 0.999, against 0.892, 0.980
+and 0.999 without sq8.
+
+Use it when the index is large and searches read much memory (flat indexes,
+large batches, high dimensions). The codes do not replace the float vectors,
+they come in addition: 1M x 128 grows from 631 MB to 757 MB as an HNSW
+index. With `memory_mode='compact'` a node keeps the codes, ids and graph in
+memory and reads float vectors only for rescoring (see the option table).
 
 Memory:
 
@@ -802,6 +883,7 @@ Memory:
 |---|---|
 | snapshot and cache file per node | 256 bytes + (4 x row_stride + 8) bytes per vector; row_stride = dims rounded up to a multiple of 16 |
 | HNSW graph (in the snapshot) | about (2m + 1) x 4 + 5 + (m + 1) x 4 / (m - 1) bytes per vector: 141 bytes with m = 16 |
+| sq8 codes (in the snapshot) | row_stride + 4 bytes per vector: 132 bytes with 128 dimensions |
 | a refresh (on one node) | full build: about the snapshot size + 4 bytes per vector; HNSW adds 5 + 2 x cores bytes per vector. Incremental: the new snapshot + 4 x row_stride bytes per changed row + 2 x cores bytes per vector (HNSW); the base is read from the cache file. Fenced it counts against `FencedUDxMemoryLimitMB` (-1 = no limit) |
 | a query | 4 x row_stride bytes per query and per journal row, plus 1 bit per vector when the journal has rows; HNSW: 2 bytes per vector per search thread for the visited marks, kept by the process between queries |
 
@@ -1013,6 +1095,8 @@ cache), starting with `vknn:`.
 | `vbuild: metric must be l2, cosine, dot or l1`, `index_type must be flat or hnsw`, `quantization ...`, `m must be 2 to 256`, `ef_construction must be 1 to 100000` | bad build parameter | see the parameter tables |
 | `vbuild: ... too many vectors for an HNSW graph with m = N` | the upper levels of the graph would need more than 4,294,967,294 blocks | a larger `m`, or split the index |
 | `vload: on NODE: bad snapshot graph: ... in FILE`, `vsearch: bad snapshot graph: ...` | the graph section of the snapshot or cache file is damaged (vload checks every link) | `CALL vvector.refresh_index('x')` |
+| `vload: on NODE: bad snapshot sq8 section: ... in FILE`, `vsearch: bad snapshot sq8 section: ...` | the int8 codes of the snapshot or cache file are damaged (vload checks every row) | `CALL vvector.refresh_index('x', 'full')` |
+| `vbuild: index 'x': the base snapshot has quantization sq8, not none: refresh with mode full` (or `none, not sq8`) | a hand-made incremental build with another quantization than the base (a refresh builds in full by itself when the option changed) | `CALL vvector.refresh_index('x', 'full')` |
 | `... is not implemented yet (milestone Mn)`, `... not supported yet (milestone Mn)` | a feature of a later milestone | use what the message says is available |
 | `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
 | `vload: on NODE: pieces are missing or duplicated`, `bad snapshot: checksum mismatch`, `cannot write ...` | a damaged transfer or a full disk | check disk space of cache_dir; `load_all` |
@@ -1028,6 +1112,7 @@ cache), starting with `vknn:`.
 | `vvector.load_on_nodes: index x, snapshot S: loaded on N of M nodes` | a node could not load (disk, rights) | vinfo shows the cause per node; `load_all` |
 | `vvector.push_options: index x: options written on N of M nodes` | a node could not write its cache directory | check the cache directory; `load_all` |
 | `vvector.<procedure>: index x is not registered` | a wrong index name | `SELECT index_name FROM vvector.manifest` |
+| `vvector.set_index_options: memory_mode compact needs quantization sq8` | `compact` on an index without sq8, or `quantization none` while `memory_mode` is `compact` | set sq8 first, or `memory_mode ram` in the same call |
 | `vvector.set_index_options: ...` | a value out of range or of a later milestone | see the option table |
 | `vvector.schedule_refresh: cron_expr may hold digits, spaces and * / , - only` | a bad cron expression | e.g. `'0 * * * *'` |
 | `vvector.set_journal_replica: mode must be auto, on or off` | a bad mode | `'auto'`, `'on'` or `'off'` |
@@ -1038,31 +1123,33 @@ Warnings of `status` and `sizing` are explained in their text.
 ## Performance and results
 
 Measured on the test VM: Vertica 26.2.0-1, one node, aarch64, 8 cores, 34 GB,
-g++ 11.5. Data: SIFT1M (1,000,000 vectors of 128 dimensions, 10,000 queries
-with ground truth, TEXMEX corpus), metric l2, k = 10. HNSW with m = 16,
-ef_construction = 200. Three numbers, reported separately.
+g++ 11.5 (milestone M4, 2026-09-24). Data: SIFT1M (1,000,000 vectors of 128
+dimensions, 10,000 queries with ground truth, TEXMEX corpus), metric l2,
+k = 10. HNSW with m = 16, ef_construction = 200. Three numbers, reported
+separately.
 
 **Engine alone** (`make bench DATA_DIR=...`, no Vertica, all 10,000 queries):
 
-| Measurement | Flat | HNSW |
-|---|---:|---:|
-| build of the snapshot (8 threads) | 0.08 s | 34 s |
-| snapshot size | 496 MB | 631 MB |
-| 1 query, 1 thread | 9.3 ms | 0.05 ms (fast) / 0.14 ms (balanced) |
-| 1 query, 8 threads | 2.3 ms (the machine's full memory bandwidth) | (one thread per query) |
-| queries per second, 8 threads | 990 (batch of 1000) | 125,000 (fast) / 49,000 (balanced) |
-| recall@10 | 0.999 (exact; the rest are ties in distance) | 0.903 (fast) / 0.983 (balanced) / 0.999 (best) |
+| Measurement | Flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| build of the snapshot (8 threads) | 0.09 s | 35 s | 35 s (the codes: 0.08 s) |
+| snapshot size | 496 MB | 631 MB | 757 MB |
+| 1 query, 1 thread | 9.2 ms | 0.14 ms (balanced) | 0.09 ms (balanced) |
+| 1 query, 8 threads | 2.3 ms (the machine's full memory bandwidth) | (one thread per query) | (one thread per query) |
+| queries per second, 8 threads, balanced | 950 (batch of 1000; exact) | 48,000 | 72,000 |
+| recall@10 fast / balanced / best | 0.999 (exact; the rest are ties) | 0.903 / 0.983 / 0.999 | 0.895 (no rescoring) / 0.983 / 0.999 |
 
 HNSW against hnswlib (v0.10.0-rc.2, the reference implementation), same
 machine, same data and parameters (`make bench HNSWLIB_DIR=...`):
 
-| ef_search | recall@10 vvector | recall@10 hnswlib | queries/s, 1 thread, vvector | hnswlib | queries/s, 8 threads, vvector | hnswlib |
+| ef_search | recall@10 vvector | recall@10 hnswlib | queries/s, 1 thread, vvector / with sq8 | hnswlib | queries/s, 8 threads, vvector / with sq8 | hnswlib |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 0.903 | 0.904 | 19,858 | 17,996 | 124,908 | 108,145 |
-| 100 | 0.983 | 0.983 | 8,080 | 7,239 | 49,352 | 43,029 |
-| 400 | 0.999 | 0.999 | 2,338 | 2,206 | 14,356 | 13,401 |
+| 32 | 0.903 | 0.904 | 19,188 / 28,973 | 18,019 | 125,119 / 179,532 | 106,828 |
+| 100 | 0.983 | 0.983 | 7,839 / 11,242 | 7,151 | 48,326 / 72,396 | 43,060 |
+| 400 | 0.999 | 0.999 | 2,281 / 3,384 | 2,176 | 14,137 / 20,842 | 13,221 |
 
-Equal recall, 6 to 16% more queries per second; build 34 s against 39 s.
+Equal recall; the float index 5 to 17% more queries per second than
+hnswlib, with sq8 (2 x k rescored) 55 to 68% more; build 35 s against 40 s.
 
 **One statement** (`scripts/latency.sh`, median at the client, 200 runs, `query`
 parameter):
@@ -1070,25 +1157,63 @@ parameter):
 | Statement | Fenced | Mixed (or unfenced) |
 |---|---:|---:|
 | `SELECT 1` (the floor of any statement) | 0.8 ms | 0.8 ms |
-| HNSW (precision balanced): vsearch `FROM sift_hnsw_snap` | 7.1 ms | 1.9 ms |
-| HNSW: the same over `sift_hnsw_delta`, `freshness='exact'`, empty delta | 8.0 ms | 2.8 ms |
-| HNSW: `vknn ... FROM dual` | 7.4 ms | 1.6 ms |
-| flat: vsearch `FROM sift_snap` | 12.4 ms | 5.1 ms |
-| flat: the same over `sift_delta`, empty delta | 13.6 ms | 6.2 ms |
-| SQL full scan (`ORDER BY VECTOR_L2(vec, q) LIMIT 10`) | 7673 ms | |
+| HNSW (precision balanced): vsearch `FROM sift_hnsw_snap` | 7.6 ms | 1.8 ms |
+| HNSW: the same over `sift_hnsw_delta`, `freshness='exact'`, empty delta | 8.6 ms | 2.9 ms |
+| HNSW: `vknn ... FROM dual` | 8.0 ms | 1.5 ms |
+| HNSW with sq8 (balanced): vsearch `FROM sift_sq8_snap` / `vknn` | 7.5 ms / 7.9 ms | 1.8 ms / 1.5 ms |
+| flat: vsearch `FROM sift_snap` | 11.0 ms | 5.5 ms |
+| flat: the same over `sift_delta`, empty delta | 12.2 ms | 6.7 ms |
+| SQL full scan (`ORDER BY VECTOR_L2(vec, q) LIMIT 10`) | 7797 ms | |
+
+A single search spends about 0.1 ms in the engine; the rest is the
+statement, so sq8 changes little for single searches and much for batches.
 
 **Throughput, recall and refresh** (one statement with 1000 queries):
 
 | Measurement | Fenced | Mixed |
 |---|---:|---:|
-| vsearch HNSW, precision fast | 22 ms (45,000 queries/s) | 12 ms (83,000 queries/s) |
-| vsearch HNSW, precision balanced | 35 ms (29,000 queries/s) | 25 ms (40,000 queries/s) |
-| vknn HNSW, precision fast, 1000 rows | 71 ms (14,000 queries/s) | 55 ms (18,000 queries/s) |
-| vsearch flat | 1076 ms (930 queries/s) | 1098 ms (910 queries/s) |
-| recall@10 against the ground truth: HNSW fast / balanced / best / exact; flat | 0.893 / 0.980 / 0.999 / 0.999; 0.999 | |
-| `refresh_index`, 1M vectors, full build: HNSW / flat | 46 s / 11 s | |
-| `refresh_index` after 1000 adds and 500 deletes, 900,000 vectors, incremental: HNSW / flat | 6.5 s / 4.4 s | |
-| `refresh_index` with nothing changed | 0.5 s | |
+| vsearch HNSW, precision fast | 24 ms (42,000 queries/s) | 14 ms (71,000 queries/s) |
+| vsearch HNSW, precision balanced | 38 ms (26,000 queries/s) | 28 ms (36,000 queries/s) |
+| vsearch HNSW with sq8, precision fast (codes only) | 20 ms (50,000 queries/s) | 11 ms (91,000 queries/s) |
+| vsearch HNSW with sq8, precision balanced | 32 ms (31,000 queries/s) | 20 ms (50,000 queries/s) |
+| vknn HNSW, precision balanced, 1000 rows | 158 ms (6,300 queries/s) | 149 ms (6,700 queries/s) |
+| vsearch flat | 1108 ms (900 queries/s) | 1108 ms (900 queries/s) |
+| recall@10 against the ground truth: HNSW fast / balanced / best / exact; flat | 0.892 / 0.980 / 0.999 / 0.999; 0.999 | |
+| the same with sq8: fast / balanced / best | 0.884 / 0.979 / 0.999 | |
+| `refresh_index`, 1M vectors, full build: HNSW / HNSW with sq8 / flat | 47 s / 49 s / 12 s | |
+| `refresh_index` after 1000 adds and 500 deletes, 900,000 vectors, incremental: HNSW / flat | 6.8 s / 4.9 s | |
+| `refresh_index` with nothing changed (verify_every 1 / 0) | 1.0 s / 0.6 s | |
+
+On the 4-node Enterprise test cluster (x86_64 with AVX-512, 10 cores and 78 GB
+per node, Vertica 26.2.0-3, g++ 8.5; SIFT1M as above, loaded on all 4 nodes) a
+statement costs more, the engine is slower per core and hnswlib and vvector
+are equal there: `SELECT 1` 3.4 to 3.8 ms; HNSW `_snap` 13.3 ms fenced and 6.4
+ms mixed, with sq8 14.4 and 6.1 ms; `vknn` 13.5 and 6.0 ms. One statement with
+1000 queries at precision balanced: 49 ms mixed, 34 ms with sq8. Engine, 10
+threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
+Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
+(87 s with sq8), an incremental one after 1000 adds and 500 deletes 16.6 s:
+every node stores and loads the whole snapshot (see Restrictions).
+
+**10 million vectors** (the first 10M of BIGANN / SIFT1B, 128 dimensions, with
+its ground truth for 10M; the 4-node cluster, 1000 queries):
+
+| Measurement | Flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot, cache file per node | 4.8 GB | 6.2 GB | 7.4 GB |
+| full build (`refresh_index`) | 123 s | 885 s | 939 s |
+| incremental refresh, 1000 adds and 500 deletes | 99 s | 146 s | 194 s |
+| recall@10 fast / balanced / best | 1.000 (exact) | 0.825 / 0.953 / 0.994 | 0.817 / 0.953 / 0.994 |
+| one search, mixed (client ms) | 89 ms | 6.8 ms | 6.3 ms |
+| 1000 queries in one statement, balanced, mixed | 17.6 s | 53 ms | 40 ms |
+
+At 10M a larger `ef_search` keeps the recall of 1M: 200 gives 0.983 (1000
+queries in 0.4 s). The incremental refresh is dominated by storing and loading
+the whole snapshot on every node. An exact search over the delta view read the
+10M-row journal on every node (33 ms instead of 7 ms): its rows were all loaded
+the same day, so partitioning by date could not skip any, and at 2.7 GB it is
+above the size the journal replica is made for; a journal partitioned by day
+reads only the recent partitions.
 
 On the 3-node Eon test cluster (x86_64, 2 cores and 15 GB per node, Vertica
 26.2.0-2; HNSW index of 100,000 random vectors of 128 dimensions) a statement
@@ -1192,6 +1317,16 @@ Index and search:
 - Scores are 32-bit floats: they agree with the FLOAT built-ins to about
   1e-6 relative; nearly equal scores can be ranked differently than the
   built-ins. Cosine with a zero vector gives score 0, as the built-in.
+- int8 quantisation (sq8) is lossy. With rescoring (the default of balanced
+  and best) the returned scores are exact, but a true neighbour whose codes
+  rank it outside the k x oversampling candidates is missed; with
+  `rescore=false` (and `precision='fast'`) the scores are approximate. One
+  code range holds for the whole index; it is trained at a full build and
+  kept by incremental refreshes, so vectors added later with values outside
+  it get clipped codes until the next full build. The codes come in
+  addition to the float vectors (about a quarter more bytes for float
+  data); `memory_mode compact` only changes what is read ahead, and it takes
+  effect at the next refresh.
 - Not supported: product quantisation, IVF, DiskANN, sparse vectors, several
   vectors per id, GPU, hybrid text and vector search, sharding one index over
   nodes, big-endian hosts, Windows.
@@ -1212,7 +1347,10 @@ Operations:
   (about 6.9 s for 900,000 x 128 HNSW, 5.0 s flat, on the test VM, of which
   0.4 s is the verification of the journal) besides the part that grows
   with the changes. A full build of 1M x 128 takes 11 s as a flat index and
-  46 s as an HNSW index.
+  46 s as an HNSW index. The part that grows with the index also grows with
+  the number of nodes, because every node stores and loads the whole
+  snapshot: on a 4-node cluster an incremental refresh of 900,000 x 128
+  HNSW took 15.8 s (median of 100).
 - Tombstones (the old positions of changed and deleted vectors) stay in the
   snapshot until the next full build: they take memory, and an HNSW search
   passes through them. `refresh_mode auto` rebuilds in full at
@@ -1228,13 +1366,13 @@ Operations:
 | File | What it does |
 |---|---|
 | `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed]`, `make undeploy` |
-| `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), threads, query text |
+| `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring (`search.cpp`), threads, query text |
 | `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M) to text for COPY |
-| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp` and `test_delta.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp`, and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection); `run_all.sh` runs them in every mode |
+| `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp` and `test_sq8.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M); `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

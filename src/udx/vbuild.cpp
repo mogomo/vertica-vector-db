@@ -46,7 +46,6 @@ class VBuild : public TransformFunction
             if (quant != "none" && quant != "sq8") fail("quantization must be none or sq8, not '" + quant + "'");
             if (m < 2 || m > 256) fail("m must be 2 to 256");
             if (efc < 1 || efc > 100000) fail("ef_construction must be 1 to 100000");
-            if (quant == "sq8") fail("quantization sq8 is not implemented yet (milestone M4)");
             if (base < 0) fail("base_snapshot must be a snapshot id, or 0 for a full build");
 
             vvector::HnswParams hp;
@@ -70,6 +69,9 @@ class VBuild : public TransformFunction
                 if (bs.metric != vvector::parse_metric(metric))
                     fail("index '" + name + "': the base snapshot has metric " + vvector::metric_name(bs.metric) + ", not " + metric +
                          ": refresh with mode full");
+                if (((bs.flags & vvector::FLAG_SQ8) != 0) != (quant == "sq8"))
+                    fail("index '" + name + "': the base snapshot has quantization " + ((bs.flags & vvector::FLAG_SQ8) ? "sq8" : "none") +
+                         ", not " + quant + ": refresh with mode full");
                 vvector::IncrementalBuilder builder(bs);
                 do {
                     if ((++rows & 0xFFFF) == 0 && isCanceled()) return;
@@ -100,11 +102,13 @@ class VBuild : public TransformFunction
                 } while (in.next());
                 if (builder.count() == 0) return;          // nothing to build: no rows out
                 try {
+                    const vvector::CodeSection codes = vvector::sq8_code_section();
+                    const vvector::CodeSection *with_codes = quant == "sq8" ? &codes : nullptr;
                     if (graph) {
                         const vvector::GraphSection g = vvector::hnsw_graph_section(hp, poll);
-                        builder.finish(max_ver, buffer, &g);
+                        builder.finish(max_ver, buffer, &g, with_codes);
                     } else {
-                        builder.finish(max_ver, buffer);
+                        builder.finish(max_ver, buffer, nullptr, with_codes);
                     }
                 } catch (const vvector::Cancelled &) {
                     return;

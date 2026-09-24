@@ -56,7 +56,9 @@ bool IncrementalBuilder::finish(std::int64_t max_ver, std::int64_t base_snapshot
     const float *staged = reinterpret_cast<const float *>(staged_.data());
     stats_ = DeltaStats();
 
-    if (b.flags & FLAG_SQ8) throw std::runtime_error("the base snapshot has int8 codes: not supported yet (milestone M4)");
+    Sq8Codes bc;
+    const bool codes = (b.flags & FLAG_SQ8) != 0;
+    if (codes) bc = sq8_open(b, false);
     HnswGraph bg;
     if (b.has_graph()) {
         if (!graph) throw std::runtime_error("the base snapshot is an HNSW index, the build is flat: a full build is needed");
@@ -123,7 +125,7 @@ bool IncrementalBuilder::finish(std::int64_t max_ver, std::int64_t base_snapshot
     std::memset(&h, 0, sizeof(h));
     std::memcpy(h.magic, SNAPSHOT_MAGIC, sizeof(h.magic));
     h.format_version = FORMAT_VERSION;
-    h.flags = (b.flags & (FLAG_NORMALISED | FLAG_HNSW)) | (with_id_index ? FLAG_ID_INDEX : 0) |
+    h.flags = (b.flags & (FLAG_NORMALISED | FLAG_HNSW | FLAG_SQ8)) | (with_id_index ? FLAG_ID_INDEX : 0) |
               (tombstones ? FLAG_TOMBSTONES : 0);
     h.count = n;
     h.dims = b.dims;
@@ -133,6 +135,7 @@ bool IncrementalBuilder::finish(std::int64_t max_ver, std::int64_t base_snapshot
     h.base_snapshot = base_snapshot;
     h.tombstones = tombstones;
     if (graph) h.graph_bytes = hnsw_extended_bytes(bg, new_ids.data(), new_ids.size());
+    if (codes) h.sq8_bytes = sq8_section_bytes(n, stride);
     snapshot_layout(h);
 
     SnapshotBuffer buf;
@@ -157,6 +160,7 @@ bool IncrementalBuilder::finish(std::int64_t max_ver, std::int64_t base_snapshot
     }
     if (tombstones) std::memcpy(base + h.off_tombstones, dead.data(), dead.size() * 8);
     std::memcpy(base, &h, sizeof(h));
+    if (codes) sq8_extend(bc, snapshot_open(base, h.total_bytes, false), base + h.off_sq8);
     if (graph) hnsw_extend(bg, snapshot_open(base, h.total_bytes, false), base + h.off_graph, *graph, poll);
     h.checksum = snapshot_checksum(base, h.total_bytes);
     std::memcpy(base + offsetof(SnapshotHeader, checksum), &h.checksum, sizeof(h.checksum));

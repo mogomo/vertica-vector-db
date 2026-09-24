@@ -109,6 +109,14 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
                  const std::uint64_t *skip, const RowBlock *extra, std::vector<Neighbor> &out,
                  std::vector<std::uint32_t> &count, const std::function<bool()> &poll = std::function<bool()>());
 
+// The same walk on the sq8 codes (sq8.h) of set and of the queries (s.query_codes, s.query_sums):
+// the s.k nearest allowed positions of every query by their sq8 keys, in flat_search's layout, with
+// the position in place of the id (ties by position). No journal rows and no radius: the caller
+// rescores the result (search.h).
+void hnsw_search_codes(const FlatSearch &s, const VectorSet &set, const Sq8Codes &codes, const HnswGraph &g,
+                       std::uint32_t ef, const std::uint64_t *skip, std::vector<Neighbor> &out,
+                       std::vector<std::uint32_t> &count, const std::function<bool()> &poll = std::function<bool()>());
+
 } // namespace vvector
 
 #endif

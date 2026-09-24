@@ -40,10 +40,23 @@ milliseconds (below).
   is the same on every CPU, with any number of threads, alone or in a batch.
   `tests/engine/test_kernels.cpp` pins a fingerprint of the result bits; it
   is the same with clang on macOS arm64 and g++ 11.5 on Linux aarch64.
-- The 16 lanes are four native 16-byte vectors. A single 64-byte vector type
-  is simpler to write, but g++ keeps such a variable in memory on aarch64 (the
-  hot loop stored and reloaded it through the stack): changing the type made
-  a single query 3.2 times faster with the same result bits.
+- The 16 lanes are two groups of 8, each made of native vectors: two 16-byte
+  vectors on aarch64, one 32-byte vector on x86_64. A single 64-byte vector
+  type is simpler to write, but g++ keeps such a variable in memory on aarch64
+  (the hot loop stored and reloaded it through the stack): changing the type
+  made a single query 3.2 times faster with the same result bits. Until
+  milestone M4 x86_64 also used four 16-byte vectors; GCC never widens vector
+  code, so its avx2 and avx512f copies computed 4 floats per instruction (seen
+  in the disassembly on the 4-node cluster). The width changes no result: the
+  pinned fingerprint is the same.
+- Two g++ 8.5 traps found on the way (both invisible with clang and g++ 11):
+  a `memcpy` into a 32-byte vector goes through the stack (the loads now use a
+  vector type with 4-byte alignment: one unaligned load), and a helper that
+  the compiler does not inline into a `target_clones` function is compiled
+  once for the default target (g++ 8.5 stopped inlining the 4-query kernel
+  and batches ran on SSE at half the speed; every helper is now
+  `always_inline`). Check both with `objdump -d` of the .so: the avx2 and
+  avx512f copies must call nothing and use `ymm` registers.
 - Flat search (`src/engine/flat.h`): candidates are ordered by (key, id), so
   ties go to the smaller id and the result does not depend on the order of
   the work. With few queries the rows are split over the threads and the
@@ -136,6 +149,56 @@ call (the unit vsearch makes) takes 0.13 ms at ef 100. hnswlib has no NEON
 code: on aarch64 its distances come from the compiler's vectorisation of a
 plain loop; on x86_64 it uses AVX intrinsics, so the comparison is repeated
 on the x86 cluster when it has the memory for SIFT1M.
+
+## int8 quantisation (milestone M4)
+
+`quantization='sq8'` adds one byte per element to the snapshot (docs/format.md, "sq8 section"):
+a code from 0 to 255 in one range for the whole index, `offset + scale x code`. The float vectors
+stay: they are needed for rescoring and for `precision='exact'`.
+
+- Training: the 0.001 and 0.999 quantiles of about 100,000 elements of evenly spaced rows (all
+  dimensions pooled, as Qdrant does). One global range is enough for data whose dimensions have
+  similar ranges (SIFT, normalised embeddings); per-dimension ranges would cost a float pair per
+  dimension and a multiply per element in every distance, and are not planned.
+- Codes are unsigned bytes; padding codes are 0 (not the code of 0.0), so the padding adds nothing.
+  Every row stores the sum of its codes.
+- Distances from codes are integer sums: sum (a - b)^2 for l2, sum abs(a - b) for l1, sum a x b
+  for dot and cosine, in uint32 (255^2 x 32768 fits). They are exact, so every CPU, thread count
+  and vector width gives the same candidates; the integer loops are plain C++ and the compiler
+  vectorises them as it likes. The key adds the terms of the range in double, in one fixed order,
+  so it is the approximate score itself (for dot and cosine: -(scale^2 x sum a b + scale x offset
+  x (sum a + sum b) + dims x offset^2)).
+- A search (src/engine/search.cpp): the queries are coded with the same range; the graph walk or
+  the flat scan runs on the codes and keeps k x oversampling candidates (at least k); with
+  `rescore` the exact float key of every candidate is computed from its row and the k best are
+  returned, so the scores are the float scores; without, the k best candidates are returned with
+  their approximate scores. The radius acts on the returned scores. The journal's rows are always
+  searched exactly and merged afterwards. The graph is built on the float vectors: the codes change
+  the search, not the graph.
+- Speed details, each found by measuring on the x86 cluster (g++ 8.5): the candidates carry their
+  positions (the flat scan runs on a block without ids, the graph walk reports positions), so
+  rescoring reads the row directly instead of searching the id among a million (about 20 cache
+  misses each), and it runs in parallel over the queries; before, a batch of 1000 queries was
+  slower with sq8 than without. The flat scan scores 4 queries per pass over a tile of codes, as
+  the float scan does. The integer loops use 16-bit factors, which GCC turns into pmaddwd (one
+  multiply-add of 16-bit pairs); g++ 8.5 takes that form for a dot product only when a factor is
+  signed, so the row code is shifted by 128 and the sum corrected exactly with the query's code
+  sum. With 32-bit factors it used 32-bit multiplies.
+- Presets of `precision`: fast = codes only (no rescoring), balanced = 2 x k rescored, best =
+  4 x k; each can be overridden by `rescore` and `oversampling`.
+- Incremental refresh keeps the base's range and codes the appended rows with it; a full build
+  trains anew. A change of the option is a full build (the options are part of active_options).
+- `memory_mode compact`: a query mapping asks the kernel to read ahead only what follows the float
+  rows (ids, codes, graph: the float rows are the first section) and marks the float rows
+  MADV_RANDOM; rescoring reads a few rows per query. The mode reaches the nodes in the OPTIONS
+  file and applies to the next mapping of a snapshot.
+- Tests: tests/engine/test_sq8.cpp proves that rescoring every candidate gives the float result bit
+  for bit (four metrics, flat and HNSW, journal rows, masks, radius, incremental snapshots), bounds
+  the error of the approximate scores, checks thread independence and the SIFT1M recall loss;
+  tests/sql/test_sq8.sh does the same through SQL.
+
+SIFT1M recall@10 through SQL (1000 queries, the VM): fast 0.8839, balanced 0.9797, best 0.9989;
+the float index: 0.8926, 0.9804, 0.9987. Rescoring 2 x k candidates loses 0.0007 of recall.
 
 ## vload on every node
 
@@ -641,3 +704,68 @@ change; the numbers are those of M2 within the noise.
 | HNSW `sift_hnsw_delta`, freshness exact, empty delta | 8.14 / 10.21 | 3.04 / 5.08 |
 | HNSW `vknn ... FROM dual` | 7.41 / 8.23 | 1.57 / 1.95 |
 | flat `sift_snap` | 12.66 / 13.80 | 5.08 / 5.53 |
+
+### Repeated at milestone M4 (Vertica 26.2.0-1, the VM)
+
+`scripts/benchmark.sh` (latency.sh inside it), 200 runs, client ms, median / p99. The float path is
+the same as at M3; sq8 adds an index with codes.
+
+| Shape | fenced | mixed |
+|---|---:|---:|
+| `SELECT 1` | 0.83 / 1.11 | 0.83 / 1.01 |
+| HNSW `sift_hnsw_snap` (balanced) | 7.60 / 7.94 | 1.84 / 2.21 |
+| HNSW `sift_hnsw_delta`, freshness exact, empty delta | 8.60 / 9.13 | 2.86 / 3.47 |
+| HNSW `vknn ... FROM dual` | 7.97 / 8.65 | 1.54 / 2.01 |
+| HNSW with sq8 `sift_sq8_snap` (balanced, 2 x k rescored) | 7.53 / 7.97 | 1.81 / 2.12 |
+| HNSW with sq8 `vknn` | 7.91 / 8.29 | 1.51 / 1.78 |
+| flat `sift_snap` | 10.98 / 11.50 | 5.52 / 5.80 |
+
+One search spends about 0.1 ms in the engine: sq8 saves a few hundredths of a millisecond of it, so
+a single statement costs the same. Batches show the engine: 1000 queries at balanced take 20 ms
+with sq8 against 28 ms without (mixed), 11 ms against 14 ms at fast.
+
+Engine (bench_hnsw, SIFT1M, ef 100, recall@10 0.983 in every row), queries per second on 1 / all
+threads:
+
+| | VM (8 aarch64 cores) | x86 node (10 cores, AVX-512, g++ 8.5) |
+|---|---:|---:|
+| hnswlib | 7,151 / 43,060 | 3,760 / 34,719 |
+| vvector float | 7,839 / 48,326 | 3,970 / 35,387 |
+| vvector sq8, 2 x k rescored | 11,242 / 72,396 | 7,007 / 59,583 |
+| vvector sq8, no rescoring (recall 0.970) | 11,973 / 73,536 | 7,244 / 62,248 |
+
+The 4-node cluster (Enterprise mode, SQL, client ms median): `SELECT 1` 3.8 fenced / 3.4 mixed; HNSW
+`_snap` balanced 13.3 / 6.4, with sq8 14.4 / 6.1; `vknn` 13.5 / 6.0; empty delta 17.3 / 9.2 (with the
+journal replica, made by default there). 1000 queries at balanced: 77 / 49 ms, with sq8 66 / 34 ms.
+Refresh: full HNSW 80 s (sq8 87 s; the vbuild statement 64 s of it), incremental after 1000 + 500
+changes 16.6 s (vbuild 8.4 s, vload 5.3 s: every node stores and loads the whole snapshot).
+
+The float kernels on x86: 16-byte vectors (committed M3 code) against 32-byte vectors, same node,
+SIFT1M: HNSW ef 100 3,853 against 3,953 q/s on one thread (+2.6%), 34,912 against 35,878 on ten;
+the HNSW search waits for memory, so the wider registers help little there. On this node
+vvector and hnswlib (built with -march=native, AVX-512) are equal: the build took 52 s and 51 s.
+
+### 10 million vectors (milestone M4, the 4-node cluster)
+
+The first 10M vectors of BIGANN (SIFT1B, 128 dimensions, uint8 values converted to float) with its
+ground truth for 10M (idx_10M), loaded with scripts/load_dataset.sh into one journal (all rows the
+same day), indexes flat, HNSW and HNSW with sq8 (m 16, ef_construction 200), fenced build:
+
+| | flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot | 4,959 MB | 6,308 MB | 7,567 MB |
+| full refresh (vbuild / vload) | 123 s (76 / 40) | 885 s (826 / 52) | 939 s (870 / 62) |
+| incremental, 1000 adds + 500 deletes (vbuild / vload) | 99 s (49 / 44) | 146 s (87 / 53) | 194 s (125 / 61) |
+| recall@10 fast / balanced / best / exact | 1.0000 | 0.8246 / 0.9525 / 0.9941 / 1.0000 | 0.8165 / 0.9525 / 0.9943 |
+| one search, client ms median, fenced / mixed | 91.5 / 88.7 | 14.7 / 6.8 | 14.4 / 6.3 |
+| 1000 queries, balanced, fenced / mixed | 18.3 s / 17.6 s | 156 / 53 ms | 132 / 40 ms |
+
+- ef_search 200 on the HNSW index: recall@10 0.9825. After the incremental refresh: 0.979 (balanced
+  against exact, 200 queries). A refresh with nothing changed: 5.7 s, of it 4.1 s the journal
+  verification over 10M rows.
+- The empty delta (`delta0`) costs 33.5 ms mixed against 6.8 ms for `_snap`, and 1000 journal rows
+  51.5 ms: the journal (2,713 MB) is above the replica limit (2,048 MB), and all its rows are in
+  one day's partition, so the delta scan reads the version column of all 10M rows on every node.
+  A journal with daily partitions prunes all but the recent days (the README layout).
+- Build memory and page cache were no problem with 78 GB per node: the three indexes and their
+  previous snapshots took 44 GB of cache files per node; 67 GB stayed available.

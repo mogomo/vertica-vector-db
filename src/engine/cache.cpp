@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "hnsw.h"
+#include "sq8.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -138,7 +139,7 @@ std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
 
 // ---- index options
 
-static const char *const OPTION_NAMES[] = {"precision", "freshness", "ef_search", "threads"};
+static const char *const OPTION_NAMES[] = {"precision", "freshness", "ef_search", "threads", "memory_mode"};
 
 IndexOptions parse_index_options(const std::string &text)
 {
@@ -218,12 +219,26 @@ std::map<std::string, IndexState> states;      // by <cache_dir>/<index>
 
 } // namespace
 
+// Read-ahead advice for a query mapping. compact: the float rows (the first section) are read at
+// random by rescoring only; the sections after them (ids, codes, graph) are read ahead.
+static void prewarm(void *m, std::uint64_t size, bool compact)
+{
+    SnapshotHeader h;
+    if (!compact || size < sizeof(h)) { madvise(m, size, MADV_WILLNEED); return; }
+    std::memcpy(&h, m, sizeof(h));
+    const std::uint64_t page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    const std::uint64_t rest = h.off_ids / page * page;
+    if (h.off_ids == 0 || h.off_ids >= size) { madvise(m, size, MADV_WILLNEED); return; }
+    madvise(m, rest, MADV_RANDOM);
+    madvise(static_cast<std::uint8_t *>(m) + rest, size - rest, MADV_WILLNEED);
+}
+
 MappedSnapshot::~MappedSnapshot()
 {
     if (map_ && !kept_) munmap(map_, size_);
 }
 
-void MappedSnapshot::open(const std::string &path, bool verify)
+void MappedSnapshot::open(const std::string &path, bool verify, bool compact)
 {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open", path);
@@ -237,7 +252,7 @@ void MappedSnapshot::open(const std::string &path, bool verify)
     // the file is in the page cache (vload reads all of it to verify it), and after a restart it
     // reads the file in large pieces instead of page by page as the search touches it. Pre-mapping
     // every page (MAP_POPULATE) was measured: it makes the first query of a session slower.
-    if (!verify) madvise(m, st.st_size, MADV_WILLNEED);
+    if (!verify) prewarm(m, st.st_size, compact);
     if (map_ && !kept_) munmap(map_, size_);
     kept_.reset();
     map_ = m;
@@ -248,6 +263,7 @@ void MappedSnapshot::open(const std::string &path, bool verify)
     try {
         set_ = snapshot_open(static_cast<const std::uint8_t *>(map_), size_, verify);
         if (verify && set_.has_graph()) hnsw_open(set_, true);
+        if (verify && (set_.flags & FLAG_SQ8)) sq8_open(set_, true);
     } catch (const std::runtime_error &e) {
         throw std::runtime_error(std::string(e.what()) + " in " + path);
     }
@@ -268,9 +284,16 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
             throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir + ": run vload");
         }
         const std::string path = snapshot_path(cache_dir, index, id);
+        IndexOptions options;
+        try {
+            options = read_index_options(cache_dir, index);
+        } catch (const std::runtime_error &e) {
+            throw std::runtime_error("index '" + index + "': OPTIONS file in the cache: " + e.what() + ": run vvector.load_all");
+        }
         if (!st.mapping || st.path != path || !st.mapping->is_file(path)) {
             try {
-                open(path, false);
+                const auto mode = options.find("memory_mode");
+                open(path, false, mode != options.end() && mode->second == "compact");
             } catch (const std::runtime_error &e) {
                 states.erase(key);
                 throw std::runtime_error(std::string("snapshot cache of index '") + index + "' is missing or damaged (" +
@@ -282,11 +305,7 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
             st.mapping = keep;          // the mapping it replaces is unmapped when its last query ends
             st.path = path;
         }
-        try {
-            st.options = read_index_options(cache_dir, index);
-        } catch (const std::runtime_error &e) {
-            throw std::runtime_error("index '" + index + "': OPTIONS file in the cache: " + e.what() + ": run vvector.load_all");
-        }
+        st.options = options;
         st.snapshot_id = id;
         st.checked = now;
     }

@@ -117,7 +117,7 @@ VisitedPool &visited_pool()
 struct Worker {
     std::unique_ptr<Visited> visited;
     std::vector<Cand> top, cand, sel, shrink;
-    std::vector<std::uint32_t> links, fresh;
+    std::vector<std::uint32_t> links, fresh, sums;
     std::vector<float> keys;
     explicit Worker(std::uint64_t count) : visited(visited_pool().get(count)) {}
     ~Worker() { if (visited) visited_pool().put(std::move(visited)); }
@@ -424,18 +424,46 @@ void graph_fail(const std::string &why) { throw std::runtime_error("bad snapshot
 
 // ---- search
 
+// How a search scores positions against one query: the float rows, or the sq8 codes (sq8.h).
+// one(pos) is the key of a position; fresh(w) puts the keys of the positions in w.fresh into w.keys.
+struct FloatScorer {
+    const VectorSet &set;
+    const float *q;
+    float one(std::uint32_t pos) const { return distance_key(set.metric, q, set.vector(pos), set.row_stride); }
+    void fresh(Worker &w) const { score_fresh(set, q, w); }
+};
+
+struct CodeScorer {
+    Metric metric;
+    const Sq8Codes &c;
+    const std::uint8_t *q;
+    std::uint32_t q_sum;
+    float one(std::uint32_t pos) const
+    {
+        return sq8_key(metric, c.range, sq8_sum(metric, c.row(pos), q, c.stride), c.sums[pos], q_sum, c.dims);
+    }
+    void fresh(Worker &w) const
+    {
+        const std::uint32_t n = static_cast<std::uint32_t>(w.fresh.size());
+        w.sums.resize(n);
+        w.keys.resize(n);
+        sq8_sums_gather(metric, c.codes, c.stride, w.fresh.data(), n, q, w.sums.data());
+        for (std::uint32_t i = 0; i < n; ++i) w.keys[i] = sq8_key(metric, c.range, w.sums[i], c.sums[w.fresh[i]], q_sum, c.dims);
+    }
+};
+
 // Searches one query: the up to ef nearest allowed positions end up in w.top (a heap).
-void search_one(const VectorSet &set, const HnswGraph &g, const float *q, std::uint32_t ef, const std::uint64_t *skip,
-                Worker &w)
+template <class Scorer>
+void search_one(const HnswGraph &g, const Scorer &sc, std::uint32_t ef, const std::uint64_t *skip, Worker &w)
 {
     w.top.clear();
     if (g.count == 0) return;
-    Cand cur{distance_key(set.metric, q, set.vector(g.entry_point), set.row_stride), g.entry_point};
+    Cand cur{sc.one(g.entry_point), g.entry_point};
     for (std::uint32_t level = g.max_level; level >= 1; --level) {
         for (;;) {
             const std::uint32_t *l = g.links(cur.pos, level);
             w.fresh.assign(l + 1, l + 1 + l[0]);
-            score_fresh(set, q, w);
+            sc.fresh(w);
             Cand best = cur;
             for (std::size_t i = 0; i < w.fresh.size(); ++i) {
                 const Cand x{w.keys[i], w.fresh[i]};
@@ -463,7 +491,7 @@ void search_one(const VectorSet &set, const HnswGraph &g, const float *q, std::u
         w.fresh.clear();
         for (std::uint32_t i = 1; i <= n; ++i)
             if (!seen.test_set(l[i])) w.fresh.push_back(l[i]);
-        score_fresh(set, q, w);
+        sc.fresh(w);
         for (std::size_t i = 0; i < w.fresh.size(); ++i) {
             const Cand x{w.keys[i], w.fresh[i]};
             if (x.key != x.key) continue;
@@ -690,7 +718,7 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
         Worker &w = workers[t];
         std::vector<Neighbor> &found = sorted[t];
         for (std::uint64_t q = q0; q < q1; ++q) {
-            search_one(set, g, s.queries + q * s.stride, ef, skip, w);
+            search_one(g, FloatScorer{set, s.queries + q * s.stride}, ef, skip, w);
             found.clear();
             for (const Cand &c : w.top) found.push_back(Neighbor{c.key, set.ids[c.pos]});
             std::sort(found.begin(), found.end(), closer);
@@ -705,17 +733,38 @@ void hnsw_search(const FlatSearch &s, const VectorSet &set, const HnswGraph &g, 
     }, poll);
 
     if (!extra || extra->n == 0) return;
-    std::vector<Neighbor> jout, merged;
-    std::vector<std::uint32_t> jcount;
-    flat_search(s, extra, 1, jout, jcount, poll);
-    for (std::uint64_t q = 0; q < nq; ++q) {
-        merged.clear();
-        std::merge(out.begin() + q * k, out.begin() + q * k + count[q], jout.begin() + q * k,
-                   jout.begin() + q * k + jcount[q], std::back_inserter(merged), closer);
-        const std::uint64_t keep = std::min<std::uint64_t>(k, merged.size());
-        std::copy(merged.begin(), merged.begin() + keep, out.begin() + q * k);
-        count[q] = static_cast<std::uint32_t>(keep);
-    }
+    merge_block(s, extra, out, count, poll);
+}
+
+void hnsw_search_codes(const FlatSearch &s, const VectorSet &set, const Sq8Codes &codes, const HnswGraph &g,
+                       std::uint32_t ef, const std::uint64_t *skip, std::vector<Neighbor> &out,
+                       std::vector<std::uint32_t> &count, const std::function<bool()> &poll)
+{
+    const std::uint64_t nq = s.n_queries, k = s.k;
+    out.assign(nq * k, Neighbor{0, 0});
+    count.assign(nq, 0);
+    if (nq == 0 || k == 0) return;
+    ef = std::max<std::uint32_t>(ef, s.k);
+
+    const int threads = static_cast<int>(std::min<std::uint64_t>(std::max(1, s.threads), nq));
+    std::vector<Worker> workers;
+    workers.reserve(threads);
+    for (int t = 0; t < threads; ++t) workers.emplace_back(g.count);
+    const std::uint64_t per_unit = std::max<std::uint64_t>(1, std::min<std::uint64_t>(16, nq / (4 * std::uint64_t(threads))));
+    std::vector<std::vector<Neighbor>> sorted(threads);
+    parallel_ranges(nq, per_unit, threads, [&](int t, std::uint64_t, std::uint64_t q0, std::uint64_t q1) {
+        Worker &w = workers[t];
+        std::vector<Neighbor> &found = sorted[t];
+        for (std::uint64_t q = q0; q < q1; ++q) {
+            search_one(g, CodeScorer{set.metric, codes, s.query_codes + q * codes.stride, s.query_sums[q]}, ef, skip, w);
+            found.clear();
+            for (const Cand &c : w.top) found.push_back(Neighbor{c.key, c.pos});
+            std::sort(found.begin(), found.end(), closer);
+            const std::uint64_t n = std::min<std::uint64_t>(k, found.size());
+            std::copy(found.begin(), found.begin() + n, out.begin() + q * k);
+            count[q] = static_cast<std::uint32_t>(n);
+        }
+    }, poll);
 }
 
 } // namespace vvector
