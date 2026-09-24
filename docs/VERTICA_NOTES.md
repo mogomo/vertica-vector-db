@@ -321,3 +321,24 @@ Check again on other versions.
   the input of `vsearch(...) OVER()`, are scanned on every node and sent to the initiator: about
   24 ms more per statement than the same rows from an `UNSEGMENTED ALL NODES` table (100 ids: 32.9
   against 8.7 ms, mixed). The same effect as the delta view without the journal replica.
+
+## Verified in milestone M6 (26.2.0-1 single node; 26.2.0-3 4 nodes Enterprise; 26.2.0-2 3-node Eon; 2026-09-24)
+
+- Join hints are ignored unless the query also has `/*+SYNTACTIC_JOIN*/` right after its SELECT:
+  `FROM a JOIN /*+DISTRIB(L,B)*/ b ON TRUE` alone gives "WARNING 6619: /*+syntactic_join*/ hint
+  omitted, ignoring join hints". The DISTRIB values are L (local), R (resegment), B (broadcast),
+  F (filter), A (any); another letter gives WARNING 6765 and the whole hint is ignored. On one node
+  with an UNSEGMENTED inner table, `DISTRIB(L,B)` gives "WARNING 6818: Input operations specified
+  for Hint Distrib(L,B) is not feasible and will be ignored" (there is nothing to broadcast). These
+  are warnings: the statement runs with the plan the optimizer chose.
+- On 4 nodes (Enterprise, K-safety 1) `SELECT /*+SYNTACTIC_JOIN*/ ... FROM vvector.probe p JOIN
+  /*+DISTRIB(L,B)*/ <segmented table> s ON TRUE` gives the plan "JOIN (CROSS JOIN) ... Inner
+  (BROADCAST)": every node gets every row of s. A segmented table with K-safety 1 gets two
+  projections (`_b0`, `_b1`, buddies), each holding one copy spread over the nodes. The same load
+  statement works on the 3-node Eon cluster (segmentation by shards).
+- A table cannot be resegmented in place; the snapshot table is upgraded by CREATE TABLE of a
+  segmented copy, INSERT SELECT, DROP TABLE and ALTER TABLE ... RENAME TO inside a PL/vSQL `DO`
+  block (`EXECUTE 'COMMIT'` works there). 39.6 GB of LONG VARBINARY chunks took 319 s on 4 nodes.
+  Grants given later in the install script apply to the renamed table.
+- `COUNT(*)` with a predicate on the leading sort columns costs 21 ms on a segmented table of 4
+  nodes and 3 ms on an unsegmented one (the query goes to every node).

@@ -6,13 +6,15 @@ The user's view is in the README.
 ## Pieces
 
     vector table --vbuild--> vvector.snapshot --vload--> node cache file --mmap--> vsearch
-    (customer)               (UNSEGMENTED ALL NODES)     (/tmp/vvector/<index>/)
+    (customer)               (segmented, broadcast       (/tmp/vvector/<index>/)
+                              to every node by vload)
 
 - `src/engine` is plain C++17 without Vertica includes. `src/udx` holds thin
   Vertica adapters only: they read rows and parameters, call the engine and
   write rows.
-- The snapshot table is unsegmented on all nodes. It is backed up and
-  replicated with the database. The cache file is only a copy of it.
+- The snapshot table is segmented (one copy per refresh, plus the buddy
+  copies of K-safety). It is backed up and protected with the database. The
+  cache file on every node is only a copy of it.
 - A missing or damaged cache file is never a data loss: run vload again
   (`CALL vvector.load_all('<index>')`).
 
@@ -307,15 +309,18 @@ transform functions, which can also run fenced.
 that receives input rows. Measured on Vertica 26.2 (in the earlier graph
 project this code comes from):
 
-- With `vvector.snapshot` (unsegmented) as the only input, Vertica reads the
-  replicated table on one node only. On a 3-node Eon cluster only one node ran
-  the load. On a single node this cannot be seen.
+- With `vvector.snapshot` as the only input, Vertica does not run the load on
+  every node (an unsegmented table was read on one node only: on a 3-node Eon
+  cluster only one node ran the load). On a single node this cannot be seen.
 - So the input is driven by a segmented table. `vvector.probe(k)` holds 8192
   rows, segmented by hash, so every node has some. `vvector_admin.vnode(k)
   OVER(PARTITION NODES)` returns the smallest k stored on each node. The chunks
   are cross joined to those probe rows: one probe row per node, so every node
-  gets every chunk exactly once. The join is local because the snapshot table
-  is replicated.
+  gets every chunk exactly once. The snapshot table is segmented, so the join
+  broadcasts the chunks to the probe rows: `SELECT /*+SYNTACTIC_JOIN*/ ... FROM
+  vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE` (join
+  hints are ignored without SYNTACTIC_JOIN). load_on_nodes leaves the hints
+  out on one node, where Vertica only warns that they are not feasible.
 - The mapping is computed inside the same statement, so it follows node and
   shard changes. vload returns one row per node that loaded.
 - vinfo and vconfig read `vvector.probe` for the same reason and answer once
@@ -766,6 +771,47 @@ re-read only for partitions whose storage containers changed since the last
 refresh (`v_monitor.storage_containers`); not planned now. A journal
 compaction (M7, optional) would have to write the new digest in the same
 transaction.
+
+### Segmented snapshot table (milestone M6)
+
+Until M6 `vvector.snapshot` was `UNSEGMENTED ALL NODES`: every refresh wrote the whole snapshot
+once per node, and on a 4-node cluster the part of a refresh that grows with the index was twice
+that of one node. Now the table is segmented by hash of (snapshot_id, byte_offset): a refresh
+writes one copy (two with K-safety 1), and vload broadcasts the chunks to one probe row per node
+(`JOIN /*+DISTRIB(L,B)*/` with `/*+SYNTACTIC_JOIN*/`; section "vload on every node"). Each node
+now receives the chunks over the network instead of reading its own copy; the measurements show
+that this costs nothing extra.
+
+The 4-node cluster (Enterprise mode, K-safety 1, 10 cores per node), first the chunks of one
+snapshot copied into each kind of table and loaded from it (the refresh's two statements alone):
+
+| snapshot | write, unsegmented | write, segmented | vload, unsegmented | vload, segmented | storage per node |
+|---|---:|---:|---:|---:|---|
+| SIFT1M HNSW, 630 MB (3 rounds) | 12.0 s | 6.3 s | 5.6 to 8.0 s | 5.6 to 6.4 s | 345 MB -> 170 MB |
+| BIGANN 10M HNSW, 6.3 GB (2 rounds) | 112 s | 46 s | 54 s | 39 s | 3.5 GB -> 1.7 GB |
+
+Then `refresh_index` end to end (scripts/benchmark.sh --parts=incremental, 900,000 x 128, fenced):
+
+| change | HNSW before | HNSW after | flat before | flat after |
+|---|---:|---:|---:|---:|
+| 100 adds, 50 deletes | 17.3 s | 13.6 s | 12.8 s | 11.3 s |
+| 1000 adds, 500 deletes | 16.9 s (vbuild 8.5, vload 5.4) | 12.7 s (vbuild 5.0, vload 3.9) | 12.8 s | 11.1 s |
+| 10000 adds, 5000 deletes | 18.0 s | 12.9 s | 13.8 s | 10.3 s |
+| 50000 adds, 25000 deletes | 21.6 s | 17.2 s | 14.7 s | 11.5 s |
+| full build | 66.5 s | 63.4 s | 14.6 s | 12.3 s |
+
+A refresh that changes nothing touches the table with an empty INSERT and one COUNT (about 70 ms
+together; the COUNT costs 21 ms segmented against 3 ms unsegmented). Measured
+end to end, such a refresh took 2.1 to 2.4 s before and 2.5 to 2.9 s in two runs after; a trace of
+its statements (v_monitor.query_requests of the session) puts about 40 ms of that on the snapshot
+table and shows the rest (manifest updates of 70 to 300 ms, catalog lookups, the journal
+verification, the journal replica check) varying from run to run. A second run of the whole
+benchmark after the change gave 12.2 to 13.4 s for HNSW and about 10 s for flat at every change
+size up to 10,000 adds.
+
+On one node nothing changes (a segmented table on one node is one copy either way). The upgrade
+from an unsegmented table copies it once inside `make deploy`: 39.6 GB of snapshots in 319 s on the
+4-node cluster, 2.3 GB in a 14 s deploy on the VM.
 
 ### Prewarming (milestone M3)
 

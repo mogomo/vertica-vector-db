@@ -19,18 +19,43 @@ $$;
 
 CREATE OR REPLACE LIBRARY vvector AS :libfile LANGUAGE 'C++';
 
--- Catalog. UNSEGMENTED ALL NODES: every node holds a full copy, so the
--- snapshot is backed up and replicated like any other table.
+-- Catalog.
 CREATE SCHEMA IF NOT EXISTS vvector;
 -- The functions that build and load snapshots (vbuild, vload, vconfig, vnode): role vvector_admin only.
 CREATE SCHEMA IF NOT EXISTS vvector_admin;
 
+-- Upgrade: until milestone M6 the table was UNSEGMENTED ALL NODES (a full copy on every node).
+-- A table cannot be resegmented in place, so its rows move to a segmented copy that takes its name.
+-- Run it when no refresh runs. Should it stop half way, the next install finishes it: the copy
+-- vvector.snapshot_seg is renamed when vvector.snapshot is gone.
+DO $$
+BEGIN
+    IF (SELECT COUNT(*) FROM v_catalog.projections WHERE projection_schema = 'vvector'
+          AND anchor_table_name = 'snapshot' AND NOT is_segmented) > 0 THEN
+        EXECUTE 'DROP TABLE IF EXISTS vvector.snapshot_seg';
+        EXECUTE 'CREATE TABLE vvector.snapshot_seg (index_name VARCHAR(64) NOT NULL, snapshot_id INT NOT NULL, '
+             || 'byte_offset INT NOT NULL, chunk LONG VARBINARY(8388608) NOT NULL) '
+             || 'ORDER BY index_name, snapshot_id, byte_offset SEGMENTED BY HASH(snapshot_id, byte_offset) ALL NODES';
+        EXECUTE 'INSERT INTO vvector.snapshot_seg SELECT index_name, snapshot_id, byte_offset, chunk FROM vvector.snapshot';
+        EXECUTE 'COMMIT';
+        EXECUTE 'DROP TABLE vvector.snapshot';
+    END IF;
+    IF (SELECT COUNT(*) FROM v_catalog.tables WHERE table_schema = 'vvector' AND table_name = 'snapshot') = 0
+       AND (SELECT COUNT(*) FROM v_catalog.tables WHERE table_schema = 'vvector' AND table_name = 'snapshot_seg') > 0 THEN
+        EXECUTE 'ALTER TABLE vvector.snapshot_seg RENAME TO snapshot';
+    END IF;
+END;
+$$;
+
+-- The snapshots in 8 MB chunks. Segmented: a refresh writes one copy (plus the buddy copies of
+-- K-safety), not one per node; vload broadcasts the chunks to every node (load_on_nodes). Backed up
+-- and protected by K-safety like any other table.
 CREATE TABLE IF NOT EXISTS vvector.snapshot (
     index_name   VARCHAR(64) NOT NULL,
     snapshot_id  INT NOT NULL,
     byte_offset  INT NOT NULL,               -- where the piece goes in the snapshot file
     chunk        LONG VARBINARY(8388608) NOT NULL
-) ORDER BY index_name, snapshot_id, byte_offset UNSEGMENTED ALL NODES;
+) ORDER BY index_name, snapshot_id, byte_offset SEGMENTED BY HASH(snapshot_id, byte_offset) ALL NODES;
 
 CREATE TABLE IF NOT EXISTS vvector.manifest (
     index_name        VARCHAR(64) NOT NULL PRIMARY KEY,

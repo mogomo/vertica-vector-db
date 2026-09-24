@@ -501,12 +501,21 @@ $$;
 -- vload of one snapshot on every node, and a check that every node loaded it.
 CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT) LANGUAGE PLvSQL AS $$
 DECLARE
-    want INT; got INT;
+    want INT; got INT; hint VARCHAR(40); dist VARCHAR(40);
 BEGIN
     want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    -- One probe row per node, joined to every chunk: each node's vload gets the whole snapshot. The
+    -- snapshot table is segmented (one copy written per refresh, not one per node), so on more than
+    -- one node the chunks are broadcast to the probe rows (DISTRIB(L,B); join hints need
+    -- SYNTACTIC_JOIN). On one node the hint would only give "not feasible" warnings.
+    IF want > 1 THEN
+        hint := '/*+SYNTACTIC_JOIN*/ '; dist := '/*+DISTRIB(L,B)*/ ';
+    ELSE
+        hint := ''; dist := '';
+    END IF;
     got := EXECUTE 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='
-        || QUOTE_LITERAL(nm) || ', snapshot_id=' || sid || ') OVER(PARTITION NODES) FROM (SELECT s.byte_offset, s.chunk '
-        || 'FROM vvector.snapshot s CROSS JOIN vvector.probe p WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
+        || QUOTE_LITERAL(nm) || ', snapshot_id=' || sid || ') OVER(PARTITION NODES) FROM (SELECT ' || hint || 's.byte_offset, s.chunk '
+        || 'FROM vvector.probe p JOIN ' || dist || 'vvector.snapshot s ON TRUE WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
         || ' AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ''loaded''';
     IF got IS NULL OR got < want THEN
         RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes', nm, sid, COALESCE(got, 0), want;

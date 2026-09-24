@@ -143,7 +143,7 @@ snapshots, which are in schema `vvector_admin`:
 
 | Object | What it is |
 |---|---|
-| `vvector.snapshot` | table (UNSEGMENTED ALL NODES): the index snapshots in chunks of 8 MB |
+| `vvector.snapshot` | table (segmented by snapshot_id and byte_offset): the index snapshots in chunks of 8 MB |
 | `vvector.manifest` | table: one row per index with its source, options and state |
 | `vvector.probe` | table (8192 rows, segmented): makes node-wise functions run once on every node |
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
@@ -1246,7 +1246,9 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options
   are rows of `vvector.manifest`: a backup of the database contains them.
 - **Disk space**: a refresh keeps the active and the previous snapshot in the
-  table and in every cache. Every refresh that changes the index writes a
+  table and in every cache. The table is segmented: a snapshot is stored once
+  across the cluster (with K-safety 1, twice), compressed; every node's cache
+  holds the whole snapshot. Every refresh that changes the index writes a
   whole new snapshot, also an incremental one (631 MB for 1M vectors of 128
   dimensions with HNSW; Vertica compresses it to about half). The older one is
   deleted, and its rows keep using space until Vertica's Tuple Mover purges
@@ -1267,6 +1269,12 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   creates them again (Vertica cannot drop a single function with an ARRAY
   argument); searches running at that moment fail. The first refresh of every
   index after that upgrade is a full build (the digest is new).
+  Upgrading from a version before milestone M6, where `vvector.snapshot` was
+  `UNSEGMENTED ALL NODES`: `make deploy` copies its rows once into a segmented
+  table of the same name (a table cannot be resegmented in place). Deploy when
+  no refresh runs; the copy takes about as long as writing the stored
+  snapshots once (2.3 GB: a few seconds on the test VM). The copy does not
+  touch the caches on the nodes, which stay valid.
 - **Monitoring**: the refresh labels its statements `vvector_verify` (count
   and digest of the journal recomputed), `vvector_digest` (carried forward from
   the new rows, or taken for a full build), `vvector_build` and `vvector_load`:
@@ -1296,9 +1304,15 @@ views, the manifest and the checks):
       FROM app.docs) b;
     COMMIT;
     SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
-    FROM (SELECT s.byte_offset, s.chunk FROM vvector.snapshot s CROSS JOIN vvector.probe p
+    FROM (SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE
           WHERE s.index_name = 'docs' AND s.snapshot_id = 900
             AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c;
+
+The join sends every chunk to one probe row per node. The two hints make
+Vertica broadcast the chunks (the table is segmented); without them a node
+may get only the chunks it stores, and its vload refuses the incomplete
+file. On a single node Vertica warns that the hint is not feasible and runs
+the statement as written.
 
 Take snapshot ids from `vvector.snapshot_seq` if the index is also refreshed
 by the procedures: a node refuses a snapshot id lower than the one of the
@@ -1436,14 +1450,17 @@ ms mixed, with sq8 14.4 and 6.1 ms; `vknn` 13.5 and 6.0 ms. One statement with
 1000 queries at precision balanced: 49 ms mixed, 34 ms with sq8. Engine, 10
 threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
 Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
-(87 s with sq8), an incremental one after 1000 adds and 500 deletes 16.6 s:
-every node stores and loads the whole snapshot (see Restrictions). A range
+(87 s with sq8), an incremental one of 900,000 vectors after 1000 adds and 500
+deletes 12.7 s: every node loads the whole snapshot (see Restrictions; 16.9 s
+before the snapshot table was segmented, docs/design.md). A range
 search (k 16384, the radius of the query's 10th neighbour) costs 15.6 ms
 fenced and 7.1 ms mixed; filtered searches: see
 [Filtered search](#filtered-search).
 
 **10 million vectors** (the first 10M of BIGANN / SIFT1B, 128 dimensions, with
-its ground truth for 10M; the 4-node cluster, 1000 queries):
+its ground truth for 10M; the 4-node cluster, 1000 queries; measured at
+milestone M4, before the snapshot table was segmented, which makes refreshes
+shorter):
 
 | Measurement | Flat | HNSW | HNSW with sq8 |
 |---|---:|---:|---:|
@@ -1495,6 +1512,21 @@ hnswlib comparison):
     curl -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz && tar xzf sift.tar.gz
     make && make tools && make deploy
     scripts/benchmark.sh --data_dir=$PWD/sift [--hnswlib=<a clone of github.com/nmslib/hnswlib>]
+
+**Scale tests.** `scripts/scale.sh` measures one data set end to end: loading,
+full builds of a flat, an HNSW and an HNSW index with sq8 (`vvector.sizing`
+first), vinfo on every node, recall@10 at every precision level, single
+searches and batches fenced and mixed, and an incremental refresh. It is not
+part of `make test`; `--help` lists the options. Examples:
+
+    # the first 10M vectors of BIGANN (bigann_base.bvecs, bigann_query.bvecs and gnd/ of the TEXMEX corpus)
+    scripts/scale.sh --dataset=bigann --dir=<dir> --rows=10000000 --gt=<dir>/gnd/idx_10M.ivecs
+    # generated vectors (Gaussian clusters) of 768 numbers: for memory and speed; recall against exact search
+    scripts/scale.sh --dataset=g768 --generate=768 --rows=1000000
+
+Loading alone: `scripts/load_dataset.sh` takes the same `--dir`, `--rows`,
+`--gt`, `--generate` and `--streams` options (parallel COPY streams, one per
+two cores by default).
 
 ## Restrictions and not supported
 
@@ -1619,9 +1651,9 @@ Operations:
   0.4 s is the verification of the journal) besides the part that grows
   with the changes. A full build of 1M x 128 takes 11 s as a flat index and
   46 s as an HNSW index. The part that grows with the index also grows with
-  the number of nodes, because every node stores and loads the whole
-  snapshot: on a 4-node cluster an incremental refresh of 900,000 x 128
-  HNSW took 15.8 s (median of 100).
+  the number of nodes, because every node loads the whole snapshot: on a
+  4-node cluster an incremental refresh of 900,000 x 128 HNSW takes 12.7 s
+  (16.9 s before milestone M6, when every node also stored a copy of it).
 - Tombstones (the old positions of changed and deleted vectors) stay in the
   snapshot until the next full build: they take memory, and an HNSW search
   passes through them. `refresh_mode auto` rebuilds in full at
@@ -1640,8 +1672,8 @@ Operations:
 | `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring and filters (`search.cpp`), the arithmetic of the vector functions (`vecmath.cpp`), threads, query text |
 | `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...), and one per family of vector functions (`vector_functions.cpp`, `vector_aggregates.cpp`) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
-| `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh` |
-| `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M) to text for COPY |
+| `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `scale.sh` |
+| `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M, BIGANN) to text for COPY, and generates random clustered vectors |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
 | `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`; `run_all.sh` runs them in every mode |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
