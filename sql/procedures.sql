@@ -377,7 +377,17 @@ BEGIN
     PERFORM INSERT INTO vvector.manifest (index_name, source_table, id_col, vec_col, op_col, ver_col, ver_margin, metric, index_type)
             VALUES (nm, src_table, id_column, vec_column, op_column, ver_column, m, measure, kind);
     PERFORM COMMIT;
-    PERFORM CALL vvector.make_views(nm);
+    -- The views need the manifest row. When they cannot be made (no CREATE on the schema, a table of
+    -- that name), the index is not left registered without them: a second try must not find it.
+    BEGIN
+        PERFORM CALL vvector.make_views(nm);
+    EXCEPTION WHEN OTHERS THEN
+        -- No DROP VIEW here: the object in the way may be the customer's. A view made before the
+        -- failure is replaced by the next try.
+        PERFORM DELETE FROM vvector.manifest WHERE index_name = nm;
+        PERFORM COMMIT;
+        RAISE EXCEPTION 'vvector.register_index: index %: the views could not be made (%); the index is not registered', nm, LEFT(SQLERRM, 400);
+    END;
     PERFORM CALL vvector.apply_replica(nm);
 END;
 $$;
@@ -1079,8 +1089,9 @@ BEGIN
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
 
-        -- 7. Keep the active and the previous snapshot.
-        PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id < COALESCE(prev, sid);
+        -- 7. Keep the active and the previous snapshot. Others go too: the chunks of a refresh that
+        -- failed after storing them (a node could not load it) belong to no manifest row.
+        PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id <> sid AND snapshot_id <> COALESCE(prev, sid);
         PERFORM COMMIT;
     END IF;
 

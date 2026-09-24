@@ -65,6 +65,11 @@ echo "== build and load"
 expect "vvector.snapshot is segmented (one copy per refresh, not one per node)" "^segmented$" "
 SELECT CASE WHEN COUNT(*) > 0 AND MIN(is_segmented::INT) = 1 THEN 'segmented' ELSE 'not segmented' END
 FROM v_catalog.projections WHERE projection_schema = 'vvector' AND anchor_table_name = 'snapshot';"
+expect "vvector.probe: 8192 distinct rows, segmented (an install fills it up, never drops it)" "^8192 8192 segmented$" "
+SELECT a.n || ' ' || a.d || ' ' || b.seg
+FROM (SELECT COUNT(*) AS n, COUNT(DISTINCT k) AS d FROM vvector.probe) a
+CROSS JOIN (SELECT CASE WHEN MIN(is_segmented::INT) = 1 THEN 'segmented' ELSE 'not segmented' END AS seg
+            FROM v_catalog.projections WHERE projection_schema = 'vvector' AND anchor_table_name = 'probe') b;"
 expect "vbuild into vvector.snapshot" "^chunks: [1-9]" "
 DELETE FROM vvector.snapshot WHERE index_name = 'vvtest';
 INSERT INTO vvector.snapshot

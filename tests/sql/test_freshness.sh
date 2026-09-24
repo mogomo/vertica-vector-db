@@ -9,7 +9,10 @@
 # vsearch applies the journal with freshness='exact' and ignores it by default.
 # Exactness of the scores against the built-in functions: tests/sql/test_search.sh.
 #
-#   tests/sql/test_freshness.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--echo_only]
+#   tests/sql/test_freshness.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--schedule_fires] [--echo_only]
+#
+# --schedule_fires  also waits (up to 2.5 minutes) until a schedule of every minute has run a refresh
+#                   by itself (tests/sql/run_all.sh passes it in its first mode only).
 #
 # Test data: schema VVTEST (or --schema=NAME) gets a journal table <schema>.journal;
 # it is registered as index vvfresh. The schema's journal is dropped and recreated.
@@ -26,6 +29,7 @@ DIMS=16
 SCHEMA=VVTEST
 CACHE_DIR=/tmp/vvector
 ECHO_ONLY=no
+FIRES=no
 IX=vvfresh
 
 for arg in "$@"; do
@@ -34,8 +38,9 @@ for arg in "$@"; do
         --dims=*)      DIMS="${arg#--dims=}" ;;
         --schema=*)    SCHEMA="${arg#--schema=}" ;;
         --cache_dir=*) CACHE_DIR="${arg#--cache_dir=}" ;;
+        --schedule_fires) FIRES=yes ;;
         --echo_only)   ECHO_ONLY=yes ;;
-        -h|--help)     sed -n '2,17p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "test_freshness.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -88,6 +93,15 @@ expect "register_index refuses a column that is not an array" "must be ARRAY\[FL
 expect "register_index refuses an unknown metric" "metric must be l2, cosine, dot or l1" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', NULL, NULL, 'manhattan', NULL);"
 expect "register_index refuses a column that does not exist" "column nope does not exist in $SCHEMA.journal" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'nope', NULL, NULL, 'l2', NULL);"
 expect "register_index refuses an unknown index_type" "index_type must be flat or hnsw" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'ivf');"
+expect "register_index whose views cannot be made (a table has the name) leaves no manifest row" "^refused, manifest rows: 0$" "
+CREATE TABLE $SCHEMA.vvbad_delta (a INT);
+CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', 0);
+SELECT 'refused, manifest rows: ' || COUNT(*) FROM vvector.manifest WHERE index_name = 'vvbad';"
+expect "... its message names the cause" "the views could not be made" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', 0);"
+expect "... and a second try works once the name is free" "index vvbad registered\\." "
+DROP TABLE $SCHEMA.vvbad_delta;
+CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', 0);"
+run_sql "unregister vvbad" "CALL vvector.unregister_index('vvbad');" > /dev/null
 expect "register_index refuses a version column that may be NULL" "ver_col ts must be NOT NULL" "
 DROP TABLE IF EXISTS $SCHEMA.nullver;
 CREATE TABLE $SCHEMA.nullver (id INT NOT NULL, vec ARRAY[FLOAT], ts TIMESTAMPTZ);
@@ -153,6 +167,12 @@ else
 fi
 wait_cache_check
 expect "a cache that points to an older snapshot is refused as stale" "snapshot cache stale on .*: run vload" "$SEARCH"
+# Only this node's cache was changed: on a cluster the other nodes keep the active snapshot.
+expect "vinfo shows exactly one node behind (this one), the others on the active snapshot" "^nodes behind: 1$" "
+SELECT 'nodes behind: ' || (u.up - i.ok)
+FROM (SELECT COUNT(DISTINCT node_name) AS ok FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) g
+      WHERE loaded AND snapshot_id = $SID) i
+CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
 expect "load_all repairs that too" "loaded on all nodes" "CALL vvector.load_all('$IX');"
 expect "vsearch works again after the repairs" "^rows: 5$" "$COUNT5"
 
@@ -160,6 +180,22 @@ echo "== schedule and unregister"
 expect "schedule_refresh creates schedule and trigger" "^triggers: 1$" "
 CALL vvector.schedule_refresh('$IX', '*/30 * * * *');
 SELECT 'triggers: ' || COUNT(*) FROM v_catalog.stored_proc_triggers WHERE schema_name = 'vvector' AND trigger_name ILIKE '${IX}_refresh_trigger';"
+if [ "$FIRES" = yes ]; then
+    # A schedule of every minute: the trigger runs refresh_index in a session of its own. Every
+    # refresh moves the delta boundary (delta_from), also one that keeps the snapshot.
+    before=$(run_sql "boundary before" "SELECT delta_from::VARCHAR FROM vvector.manifest WHERE index_name = '$IX';")
+    run_sql "schedule every minute" "CALL vvector.schedule_refresh('$IX', '* * * * *');" > /dev/null
+    fired=no
+    if [ "$ECHO_ONLY" = no ]; then
+        for i in $(seq 1 30); do
+            sleep 5
+            now=$(run_sql "boundary now" "SELECT delta_from::VARCHAR || '|' || CASE WHEN refresh_started_at IS NULL THEN 'free' ELSE 'marked' END
+                                          FROM vvector.manifest WHERE index_name = '$IX';")
+            if [ "${now%|*}" != "$before" ] && [ "${now#*|}" = free ]; then fired=yes; break; fi
+        done
+    fi
+    expect "the schedule ran a refresh by itself, and it removed its mark" "^fired: yes$" "SELECT 'fired: $fired';"
+fi
 expect "unregister_index removes trigger, view, snapshots and manifest row" "^left: 0 0 0 0$" "
 CALL vvector.unregister_index('$IX');
 SELECT 'left: ' || (SELECT COUNT(*) FROM v_catalog.stored_proc_triggers WHERE trigger_name ILIKE '${IX}_refresh_trigger') || ' ' ||
@@ -171,6 +207,14 @@ expect "delta view holds only the sentinel right after a refresh" "^rows 1, jour
 CALL vvector.register_index('$IX', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', 0);
 CALL vvector.refresh_index('$IX');
 SELECT 'rows ' || COUNT(*) || ', journal rows ' || COUNT(id) FROM $SCHEMA.${IX}_delta;"
+# The chunks of a refresh that failed after storing them (a node could not load it) belong to no
+# manifest row: the next refresh that makes a snapshot removes them.
+expect "a snapshot left by a failed refresh is removed by the next refresh" "^snapshots: 2, orphans: 0$" "
+INSERT INTO vvector.snapshot (index_name, snapshot_id, byte_offset, chunk) SELECT '$IX', NEXTVAL('vvector.snapshot_seq'), 0, HEX_TO_BINARY('00'); COMMIT;
+INSERT INTO $SCHEMA.journal (id, vec) SELECT id, vec FROM $SCHEMA.journal WHERE NOT del ORDER BY id LIMIT 1; COMMIT;
+CALL vvector.refresh_index('$IX');
+SELECT 'snapshots: ' || COUNT(DISTINCT snapshot_id) || ', orphans: ' || SUM(CASE WHEN OCTET_LENGTH(chunk) = 1 THEN 1 ELSE 0 END)
+FROM vvector.snapshot WHERE index_name = '$IX';"
 
 # A writer that inserted before the refresh and commits after it. Its row is not in the snapshot,
 # and its version is older than the refresh. It must still reach the delta view: refresh_index

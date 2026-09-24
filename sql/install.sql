@@ -117,15 +117,14 @@ CREATE SEQUENCE IF NOT EXISTS vvector.snapshot_seq CACHE 1;
 
 -- Rows on every node, so that functions with OVER(PARTITION NODES) run on
 -- every node. It must be segmented: Vertica reads an unsegmented table on one
--- node only. 8192 rows: every node of a large cluster gets some.
-\set ON_ERROR_STOP off
-DROP TABLE IF EXISTS vvector.probe CASCADE;
-\set ON_ERROR_STOP on
-CREATE TABLE vvector.probe (k INT NOT NULL) SEGMENTED BY HASH(k) ALL NODES;
+-- node only. 8192 rows: every node of a large cluster gets some. Made once and filled up to 8192
+-- rows: an install never drops it, so a refresh or vinfo that runs meanwhile keeps working.
+CREATE TABLE IF NOT EXISTS vvector.probe (k INT NOT NULL) SEGMENTED BY HASH(k) ALL NODES;
 INSERT INTO vvector.probe
-SELECT ROW_NUMBER() OVER()
-FROM (SELECT 1 FROM (SELECT '2000-01-01 00:00:00'::TIMESTAMP AS t UNION ALL SELECT '2000-01-01 02:16:31'::TIMESTAMP) b
-      TIMESERIES ts AS '1 second' OVER (ORDER BY t)) g;
+SELECT k FROM (SELECT ROW_NUMBER() OVER() AS k
+               FROM (SELECT 1 FROM (SELECT '2000-01-01 00:00:00'::TIMESTAMP AS t UNION ALL SELECT '2000-01-01 02:16:31'::TIMESTAMP) b
+                     TIMESERIES ts AS '1 second' OVER (ORDER BY t)) g) n
+WHERE k NOT IN (SELECT k FROM vvector.probe);
 COMMIT;
 
 -- CREATE ROLE has no IF NOT EXISTS: on a second install the errors are expected.

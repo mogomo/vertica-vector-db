@@ -1083,3 +1083,30 @@ because the cache files now go to a disk that writes at 102 MB/s instead of 192 
 I/O on node 1; it reads faster, 722 against 511 MB/s). Searches read from the page cache and do not
 change. A refresh that changes nothing: 5.6 s, of it 3.5 s the journal verification over 10M rows
 (`verify_every` 1).
+
+### A journal of one billion rows (milestone M6, the 4-node cluster)
+
+The journal grows with every change; the index holds the latest row per id. This test keeps the index
+small and the journal large: 10 million ids, each written 100 times (one version per day over 100 days,
+a delete of 1% of the ids in every tenth version), 8 elements per vector so the numbers show the
+journal's costs, not the vector build. 1,000,000,000 rows, 109 GB of storage on 4 nodes, the table
+partitioned by the day of the version as the README recommends; a flat index with margin 0.
+
+| Step | Time |
+|---|---:|
+| load, 100 INSERT ... SELECT of 10M rows each | 457 s |
+| full build: latest row of each id out of 1B rows, 10M vectors | 104 s (digest of the journal 12.4 s) |
+| read the delta after one day of changes (100,000 rows written again, 10,000 deleted) | 75 ms |
+| exact search through the delta view (110,000 journal rows beside the snapshot) | 274 ms |
+| incremental refresh of that day, journal verified (`verify_every` 1) | 31.2 s (verification 14.9 s) |
+| incremental refresh of the next day, not verified (`verify_every` 0) | 20.5 s |
+| refresh with no change, not verified | 1.6 s |
+| refresh with no change, verified | 16.2 s (verification 14.6 s) |
+| one search of the snapshot (flat, 10M vectors of 8 elements) | 44 ms |
+
+The delta view reads only the newest partition: its cost depends on the rows since the refresh, not on
+the size of the journal. The full build and the verification read every row: about 10 million rows per
+second for the consolidation and 67 million per second for the digest on this cluster. So on a large
+journal the verification is most of a refresh that changes little; `verify_every` N does it at every
+Nth refresh. For a journal that keeps growing, the consolidated journal (one row per id) is the
+compaction candidate of milestone M7.

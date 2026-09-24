@@ -124,9 +124,10 @@ floats, so scores agree to about 7 digits):
     make deploy FENCED=mixed  # vbuild, vload, vconfig, vnode fenced; vsearch, vknn, vinfo, vversion and the vector functions not fenced
     make deploy SEARCH=public # searching for every user (default: the role vvector_search)
     make undeploy             # remove the library and its functions; tables and data stay
-    tests/sql/run_all.sh      # integration tests: fenced, unfenced, mixed (creates test schemas)
+    tests/sql/run_all.sh      # integration tests: all unfenced, a short set fenced (creates test schemas)
 
-`tests/sql/run_all.sh` deploys the library again in every mode and ends with
+`tests/sql/run_all.sh --complete` runs every test in all three modes. `run_all.sh`
+deploys the library again in every mode and ends with
 the default deploy (fenced, search for the role only). After a deploy with
 `FENCED=mixed` or `SEARCH=public`, run `make deploy` with your settings again
 when the tests are done.
@@ -418,6 +419,17 @@ incremental refreshes finds as much as a new one (recall@10 0.9845 against
 Creates `vvector.docs_refresh_schedule` and `vvector.docs_refresh_trigger`
 (Vertica's CRON schedule; the trigger runs as the definer). Calling it again
 replaces the schedule.
+
+A scheduled refresh runs in a session of its own that `v_monitor.sessions`
+and `v_monitor.query_requests` do not show. To see that it ran, read the
+manifest: `refresh_note` says what the last refresh did, `delta_from` is its
+boundary (it moves at every refresh), `built_at` the time of the last new
+snapshot (a refresh that finds no change keeps the snapshot):
+
+    SELECT built_at, delta_from, refresh_note FROM vvector.manifest WHERE index_name = 'docs';
+
+Vertica starts due schedules every 30 seconds, so a schedule of every minute
+runs within 30 seconds of the minute.
 
 ### set_index_options
 
@@ -1504,6 +1516,7 @@ cache), starting with `vknn:`.
 | `vload`, `vinfo`, `vsearch`: `cache_dir '...' must be an absolute path`, `index name '...' is not valid` | bad cache_dir or index name | use `/path` and letters, digits, underscore |
 | `vsearch: index 'x': OPTIONS file in the cache DIR: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
 | `vvector.register_index: ...` (table, column, type, metric, margin, op_col needs ver_col, already registered) | a bad argument; the message names it | fix the argument |
+| `vvector.register_index: index x: the views could not be made (...); the index is not registered` | the views `<schema>.x_delta` and `x_snap` could not be created: no CREATE on the schema of the table, or another object has the name | grant CREATE, or free the name; then register again |
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
 | `vvector.refresh_index: index x: no live vector up to the delta boundary B ...; N rows of T are newer` | every live row was written after the boundary (within the margin before the refresh, or after the start of an open writer), for example the first refresh right after a load | refresh again when the margin has passed; the rows are found meanwhile with `freshness='exact'`. On one node with `CLOCK_TIMESTAMP()` versions a margin of 0 is safe |
 | `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
@@ -1831,7 +1844,7 @@ Operations:
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `demo.sh`, `scale.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M, BIGANN) to text for COPY, and generates random clustered vectors |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them in every mode |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them all unfenced and a short set fenced (`--complete`: all in every mode) |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

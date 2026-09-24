@@ -379,3 +379,16 @@ Check again on other versions.
   NULL)" plus "select ($1)::bool", 2 to 5 ms together) and every `x := (SELECT ...)` (3 to 7 ms with
   its cast). A refresh that changes nothing made 382 such requests. Several variables can be filled by
   one query: `SELECT a, b, c INTO x, y, z FROM ... WHERE ...;` works (26.2.0-1).
+- `DROP VIEW IF EXISTS s.v` when schema s does not exist: NOTICE 4185 "Nothing was dropped", no
+  error (26.2.0-1). unregister_index therefore works after the source schema was dropped.
+- A PL/vSQL block `BEGIN PERFORM CALL other(); EXCEPTION WHEN OTHERS THEN ... END;` catches an error
+  of a DDL statement inside the called procedure, and SQLERRM holds its text (26.2.0-1; unlike a
+  failing multi-node UDx query, above). register_index uses it around make_views.
+- `INSERT INTO t SELECT k FROM (...) n WHERE k NOT IN (SELECT k FROM t)` reads t before it writes:
+  run twice it adds the rows once (26.2.0-1). install.sql fills vvector.probe this way.
+- A scheduled procedure (26.2.0-1): the scheduler task wakes every 30 s (vertica.log "Task
+  'StoredProcedureScheduler' enabled" at :27 and :57) and runs a due trigger in the thread
+  ScheduledProcedureQueue; its NOTICEs are written to vertica.log. `v_monitor.query_requests` showed no
+  `CALL vvector.refresh_index(...)` for it. To see that a scheduled refresh ran, read the manifest
+  (refresh_note, delta_from) or vertica.log. `v_monitor.vs_stored_procedure_scheduler_statistics`
+  shows only the queue now (procedures executing, queued), no history.
