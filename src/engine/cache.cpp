@@ -343,6 +343,26 @@ void MappedSnapshot::open(const std::string &path, bool verify, bool compact, bo
     }
 }
 
+static std::size_t release_idle_locked(Clock::time_point now, std::int64_t idle_ms, const std::string &keep)
+{
+    std::size_t n = 0;
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->first != keep && now - it->second.checked > std::chrono::milliseconds(idle_ms)) {
+            it = states.erase(it);
+            ++n;
+        } else {
+            ++it;
+        }
+    }
+    return n;
+}
+
+std::size_t release_idle_mappings(std::int64_t idle_ms)
+{
+    std::lock_guard<std::mutex> hold(state_lock);
+    return release_idle_locked(Clock::now(), idle_ms, std::string());
+}
+
 void MappedSnapshot::open_active(const std::string &cache_dir, const std::string &index, std::int64_t at_least,
                                  bool prewarm_it)
 {
@@ -353,6 +373,7 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
     const bool fresh = st.mapping && now - st.checked < std::chrono::milliseconds(ACTIVE_CHECK_MS) &&
                        st.snapshot_id >= at_least;
     if (!fresh) {
+        release_idle_locked(now, 600000, key);
         std::int64_t id = 0;
         // The index directory, and the one its OPTIONS file names as the index's cache directory
         // (the index option cache_dir; one hop, never a chain).

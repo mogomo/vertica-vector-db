@@ -211,7 +211,8 @@ as new rows: the table is a journal.
      8 |                    | true  | 2026-09-22 11:00:00+00     vector 8 deleted
 
 - **id**: INT (64-bit), unique per vector. Business keys and payload stay in
-  your own tables; join them to the results by id.
+  your own tables; join them to the results by id. Rows with a NULL id are
+  ignored (by the refresh and by the delta view).
 - **vec**: `ARRAY[FLOAT]` (recommended), `ARRAY[INT]` or `ARRAY[NUMERIC]`.
   Every vector of one index has the same number of elements. vvector stores
   and computes in 32-bit floats.
@@ -220,7 +221,9 @@ as new rows: the table is a journal.
   version wins; with equal versions a delete wins. Use `TIMESTAMPTZ NOT NULL
   DEFAULT CLOCK_TIMESTAMP()`: the database sets the time of the write, which
   is what makes the results exact (see [Freshness](#freshness-explained)).
-  TIMESTAMP and increasing INT versions are accepted too.
+  TIMESTAMP and increasing INT versions are accepted too. The column must be
+  NOT NULL: `register_index` refuses one that is not (a row without a version
+  would be in no delta and no refresh).
 
 Recommended table, partitioned by the date of the version so new rows stay in
 their own storage and are found quickly:

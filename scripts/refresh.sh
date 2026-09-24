@@ -31,8 +31,8 @@ case "$RMODE" in ''|auto|incremental|full) ;; *) echo "refresh.sh: --mode must b
 case "$MODE" in
     refresh)  SQL="CALL vvector.refresh_index('$INDEX'${RMODE:+, '$RMODE'});" ;;
     load)     SQL="CALL vvector.load_all('$INDEX');" ;;
-    schedule) SQL="CALL vvector.schedule_refresh('$INDEX', '$CRON');" ;;
+    schedule) SQ="'"; SQL="CALL vvector.schedule_refresh('$INDEX', '${CRON//$SQ/$SQ$SQ}');" ;;
     status)   SQL="CALL vvector.status('$INDEX');" ;;
 esac
-if [ "$ECHO_ONLY" = yes ]; then echo "vsql -X -c \"$SQL\""; exit 0; fi
+if [ "$ECHO_ONLY" = yes ]; then echo "vsql -X -v ON_ERROR_STOP=1 -c \"$SQL\""; exit 0; fi
 vsql -X -v ON_ERROR_STOP=1 -c "$SQL"

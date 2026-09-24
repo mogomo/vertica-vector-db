@@ -105,6 +105,12 @@ private:
     IndexOptions options_;
 };
 
+// Gives back the kept mappings (MappedSnapshot::open_active) of indexes that had no query for
+// idle_ms milliseconds; a mapping still in use stays valid until its last user ends. open_active
+// calls it with 10 minutes, so an unregistered index or an old cache directory does not keep its
+// file mapped for the life of an unfenced process. Returns how many were given back.
+std::size_t release_idle_mappings(std::int64_t idle_ms);
+
 // Writes one snapshot file from pieces that may arrive in any order, then
 // makes it the active one. A failed or abandoned load leaves the cache as it was.
 class CacheWriter {

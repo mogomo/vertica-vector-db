@@ -229,7 +229,23 @@ when their id is allowed. Then one of two paths (src/engine/search.cpp):
   nodes but keeps only allowed ones in its result list, so it walks until it has ef of them:
   about ef x count / allowed nodes. ef is not raised further.
 
-The exact path is taken below max(10000, sqrt(64 x ef x count)) allowed rows: the two costs grow
+On an index without a graph (milestone M6) the masked path scores every row for every query (with
+sq8 codes a quarter of the bytes), the exact path copies the allowed rows once (about the cost of
+scoring them for 8 queries) and scores only those: the exact path is taken when allowed x (queries +
+8) < rows x queries (with codes: 4 x allowed x (queries + 8)). On flat SIFT1M (VM, 8 threads):
+
+| allowed | queries | masked ms | exact ms | chosen ms |
+|---|---|---|---|---|
+| 1% | 1 | 2.38 | 0.39 | 0.32 |
+| 1% | 1000 | 1,070 | 15.0 | 14.7 |
+| 10% | 1 | 2.78 | 2.74 | 2.85 |
+| 10% | 1000 | 1,117 | 121 | 121 |
+| 50% | 1 | 3.69 | 7.08 | 3.62 |
+| 50% | 1000 | 1,138 | 587 | 592 |
+
+Before, a flat index used the HNSW cut-over below and the masked path above it (80,000 rows here).
+On an HNSW index the exact path is taken below max(10000, sqrt(64 x ef x count)) allowed rows: the
+two costs grow
 as allowed and as 1 / allowed, so they meet near sqrt(c x ef x count). The plan's first rule,
 max(10 x ef, 10000), was far too low: measured on SIFT1M (VM, 8 threads, ef 100, float; recall of
 the masked graph against the exact path; tests/engine/bench_filter.cpp):
@@ -410,6 +426,12 @@ project this code comes from):
 - The snapshot and every cache file: 256 bytes plus `4 x row_stride + 8` bytes
   per vector, plus the graph: about 141 bytes per vector with m = 16 (codes
   from M4).
+- A process keeps the mapping of every index it searched (`open_active`) and
+  gives it back when the index had no query for 10 minutes (milestone M6), so
+  an unregistered index or an old cache directory does not stay mapped for
+  the life of an unfenced Vertica process. The visited arrays of graph
+  searches are pooled up to 64 arrays and 512 MB; beyond that an array is
+  freed when its search ends (a 100M index has 200 MB arrays).
 - vsearch maps the snapshot and copies nothing from it. It holds the queries
   and the live journal vectors: `4 x row_stride` bytes each, and a bitset of
   one bit per snapshot vector when the journal has rows. A graph search keeps
@@ -543,7 +565,10 @@ consolidated per id (latest row, a delete wins a tie; deletes are passed to
 vbuild with `del = true`). vbuild gets `base_snapshot` and reads the base from
 the cache of its node, verified like a vload (checksum, ids, graph links): a
 damaged base would otherwise be copied into every later snapshot with a fresh
-checksum.
+checksum. The price is a read of the whole base at every incremental refresh
+(0.1 to 0.4 s at 1M vectors, seconds at 100M); kept on purpose. Since
+milestone M6 the rows are the ones up to the new boundary only (see
+Freshness).
 
 The engine (`src/engine/delta.cpp`, `IncrementalBuilder`):
 
@@ -780,6 +805,20 @@ depot caches all of it. The limit of 2048 MB keeps the depot cost and the one-ti
 80 s at the limit, extrapolated) small; above it `status` says why there is none and how to force it.
 
 ## Refresh cost
+
+### The fixed part on a cluster (milestone M6)
+
+A refresh that changes nothing, SIFT1M HNSW on the 4-node cluster (Vertica 26.2.0-3): 2.46 s
+at the client. A trace of its statements (`v_monitor.query_requests` of the session) showed 382
+requests: PL/vSQL runs every assignment and every IF condition as a query of its own (2 to 7 ms
+each), about 25 of them to read single columns of the manifest row; the verification of the
+journal digest 228 ms, vinfo 78 ms, vnode 56 ms, three manifest UPDATEs about 60 ms each, six
+catalog lookups of column types about 23 ms each, the journal replica check about 100 ms. Now the
+manifest row and the column types are read with one `SELECT ... INTO` each, the `_snap` view is
+not made again when the snapshot did not change, statistics on the version column are taken only
+when journal rows arrived, and the replica note is written only when it changed: 2.08 to 2.11 s
+(-15%). What is left is mostly the digest verification (`verify_every`) and the procedure's own
+expression queries.
 
 SIFT1M, fenced, `refresh_index`: 9.4 s in total. The vbuild statement takes
 6.4 s, the vload statement 1.6 s (write 496 MB, verify the checksum, flip

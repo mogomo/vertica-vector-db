@@ -17,7 +17,8 @@
 set -euo pipefail
 
 INDEX= TABLE= ID= VEC= METRIC= OP=NULL VER=NULL MARGIN=NULL KIND=hnsw QUANT=none ECHO_ONLY=no
-q() { printf "'%s'" "$1"; }
+SQ="'"
+q() { printf "'%s'" "${1//$SQ/$SQ$SQ}"; }     # an SQL string literal
 for arg in "$@"; do
     case "$arg" in
         --index=*)   INDEX="${arg#*=}" ;;
@@ -38,11 +39,17 @@ done
 if [ -z "$INDEX" ] || [ -z "$TABLE" ] || [ -z "$ID" ] || [ -z "$VEC" ] || [ -z "$METRIC" ]; then
     echo "register.sh: --index, --table, --id, --vec and --metric are required" >&2; exit 2
 fi
-case "$MARGIN" in NULL|[0-9]*) ;; *) echo "register.sh: --margin must be a number" >&2; exit 2 ;; esac
+[[ "$MARGIN" =~ ^(NULL|[0-9]+)$ ]] || { echo "register.sh: --margin must be a whole number" >&2; exit 2; }
 case "$QUANT" in none|sq8) ;; *) echo "register.sh: --quantization must be none or sq8" >&2; exit 2 ;; esac
 
 SQL="CALL vvector.register_index($(q "$INDEX"), $(q "$TABLE"), $(q "$ID"), $(q "$VEC"), $OP, $VER, $(q "$METRIC"), $MARGIN, $(q "$KIND"));"
-[ "$QUANT" = sq8 ] && SQL="$SQL
-CALL vvector.set_index_options($(q "$INDEX"), NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
-if [ "$ECHO_ONLY" = yes ]; then echo "vsql -X -c \"$SQL\""; exit 0; fi
+SQL2=
+[ "$QUANT" = sq8 ] && SQL2="CALL vvector.set_index_options($(q "$INDEX"), NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
+if [ "$ECHO_ONLY" = yes ]; then
+    echo "vsql -X -v ON_ERROR_STOP=1 -c \"$SQL\""
+    [ -z "$SQL2" ] || echo "vsql -X -v ON_ERROR_STOP=1 -c \"$SQL2\""
+    exit 0
+fi
+# One statement per call: vsql -c prints the NOTICEs of the last statement only.
 vsql -X -v ON_ERROR_STOP=1 -c "$SQL"
+[ -z "$SQL2" ] || vsql -X -v ON_ERROR_STOP=1 -c "$SQL2"

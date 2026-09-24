@@ -160,6 +160,23 @@ int main()
         std::memcpy(t.buffer.data(), &h, sizeof(h));
         CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), false); }, "row_stride"));
     }
+    // A section size that would wrap the layout arithmetic around, and reserved fields.
+    {
+        TestSet u;
+        build(u, 10, 4);
+        SnapshotHeader h, bad;
+        std::memcpy(&h, u.buffer.data(), sizeof(h));
+        CHECK(!throws([&] { snapshot_open(u.buffer.data(), u.buffer.size(), false); }));
+        bad = h;
+        bad.flags |= FLAG_HNSW;
+        bad.graph_bytes = ~0ull - 1000;
+        std::memcpy(u.buffer.data(), &bad, sizeof(bad));
+        CHECK(throws([&] { snapshot_open(u.buffer.data(), u.buffer.size(), false); }, "a section is larger than the file"));
+        bad = h;
+        bad.reserved[3] = 1;
+        std::memcpy(u.buffer.data(), &bad, sizeof(bad));
+        CHECK(throws([&] { snapshot_open(u.buffer.data(), u.buffer.size(), false); }, "reserved header fields are not zero"));
+    }
 
     // Checksum of parts, in any order, equals the checksum of the file.
     {

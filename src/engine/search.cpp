@@ -51,7 +51,14 @@ void index_search(const FlatSearch &s, const VectorSet &set, const SearchPlan &p
     if (p.filtered) {
         const std::vector<std::uint32_t> live = live_allowed(set, p, skip);
         const std::uint64_t limit = p.exact_below >= 0 ? static_cast<std::uint64_t>(p.exact_below) : filter_exact_limit(p.ef, set.count);
-        if (live.size() < limit) {
+        // Without a graph the masked path scores every row for every query (codes: a quarter of the
+        // bytes), while the exact path copies the allowed rows once (about as much as scoring them for
+        // 8 queries) and scores only them. Measured on flat SIFT1M (session 12): 1000 queries, 10%
+        // allowed: 1235 ms masked, 141 ms exact; one query, 50% allowed: 3.9 ms masked, 7.1 ms exact.
+        const std::uint64_t nq = s.n_queries;
+        const bool flat_exact = !p.graph && live.size() * (nq + 8) * (p.codes ? 4 : 1) < set.count * nq;
+        const bool few = p.exact_below >= 0 ? live.size() < limit : live.size() < limit || flat_exact;
+        if (few) {
             // Few allowed rows: copied together (in parallel, into memory that is not cleared first) and
             // searched exactly with the tiled kernels, with the journal's rows beside them.
             const std::uint64_t stride = set.row_stride, n = live.size();

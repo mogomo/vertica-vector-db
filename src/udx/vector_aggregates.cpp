@@ -11,6 +11,8 @@
 #include "../engine/vecmath.h"
 
 #include <algorithm>
+#include <cstring>
+#include <string>
 
 using namespace Vertica;
 using namespace vvector_udx;
@@ -65,7 +67,9 @@ class VectorAggregate : public TransformFunction
             }
             out.next();
         } catch (std::exception &e) {
-            vt_report_error(0, "%s", e.what());
+            std::string m = e.what();
+            if (m.compare(0, std::strlen(fn), fn) != 0) m = std::string(fn) + ": " + m;
+            vt_report_error(0, "%s", m.c_str());
         }
     }
 };

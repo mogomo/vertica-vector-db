@@ -374,3 +374,8 @@ Check again on other versions.
   was gone afterwards, in the same session and in a new one). So vvector commits a change that
   depends on a multi-node load only after the load (set_index_options cache_dir) and does not rely
   on a handler around such a query.
+- PL/vSQL cost (26.2.0-3, 4 nodes, session 12; v_monitor.query_requests of one session): every
+  expression a procedure evaluates is a query of its own, also `IF why IS NULL` (as "select (why IS
+  NULL)" plus "select ($1)::bool", 2 to 5 ms together) and every `x := (SELECT ...)` (3 to 7 ms with
+  its cast). A refresh that changes nothing made 382 such requests. Several variables can be filled by
+  one query: `SELECT a, b, c INTO x, y, z FROM ... WHERE ...;` works (26.2.0-1).

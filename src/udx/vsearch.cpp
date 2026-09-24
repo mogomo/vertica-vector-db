@@ -160,7 +160,11 @@ class VSearch : public TransformFunction
                     qids.push_back(qid);
                     continue;
                 }
-                if (in.isNull(COL_ID)) continue;                     // the sentinel
+                if (in.isNull(COL_ID)) {                             // the sentinel: all NULL but snapshot_id
+                    if (!in.isNull(COL_VEC) || !in.isNull(COL_DEL) || !in.isNull(COL_VER))
+                        fail("a journal row has no id (id is NULL but not its vector, delete flag or version)");
+                    continue;
+                }
                 const vint id = in.getIntRef(COL_ID);
                 const bool has_vec = !in.isNull(COL_VEC), has_del = !in.isNull(COL_DEL);
                 if (!has_vec && !has_del) { allow_ids.push_back(id); continue; }  // allow-list member

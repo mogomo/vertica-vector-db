@@ -130,6 +130,19 @@ int main()
         CHECK(m.vectors().count == n);               // the older mapping stays valid while it is used
     }
 
+    // Kept mappings of indexes without queries are given back; one in use stays valid.
+    {
+        MappedSnapshot in_use;
+        in_use.open_active(dir, "g");
+        CHECK(release_idle_mappings(0) >= 1);
+        const std::int64_t last_id = in_use.vectors().ids[in_use.vectors().count - 1];     // still mapped: no fault
+        CHECK(in_use.vectors().count > 0 && last_id > 0);
+        CHECK(release_idle_mappings(0) == 0);
+        MappedSnapshot again;
+        again.open_active(dir, "g");
+        CHECK(again.snapshot_id() == in_use.snapshot_id());
+    }
+
     // Index options: written by vconfig, read with the snapshot.
     {
         CHECK(parse_index_options("precision=best, freshness=exact,ef_search=,threads=4").size() == 3);

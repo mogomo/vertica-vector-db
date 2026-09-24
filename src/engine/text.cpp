@@ -47,7 +47,9 @@ std::vector<float> parse_vector_text(const char *text, std::size_t len)
         char *end = nullptr;
         if (at >= s.size() || !(s[at] == '-' || s[at] == '+' || s[at] == '.' || (s[at] >= '0' && s[at] <= '9')))
             bad("expected a number", at);
-        const double v = strtod_l(begin, &end, c_locale());
+        const locale_t loc = c_locale();
+        if (loc == static_cast<locale_t>(0)) throw std::runtime_error("query vector text: cannot create the C locale");
+        const double v = strtod_l(begin, &end, loc);
         if (end == begin) bad("expected a number", at);
         const float f = static_cast<float>(v);
         if (!(std::fabs(f) <= FLT_MAX)) bad("the number is not a finite float32 value", at);

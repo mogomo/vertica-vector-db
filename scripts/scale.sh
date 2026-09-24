@@ -113,7 +113,9 @@ echo "== scale test $NAME, schema $SCHEMA, $(now) UTC, $(sql "SELECT COUNT(*) FR
 if [ ${#LOAD[@]} -gt 0 ]; then
     echo "== load"
     t0=$(date +%s%N)
-    scripts/load_dataset.sh "${LOAD[@]}" 2>&1 | grep -v NOTICE || { echo "load failed"; exit 1; }
+    out=$(scripts/load_dataset.sh "${LOAD[@]}" 2>&1); rc=$?
+    grep -v NOTICE <<< "$out" || true
+    [ "$rc" -eq 0 ] || { echo "load failed (exit status $rc)"; exit 1; }
     echo "$(now) loaded in $(secs "$t0") s"
 fi
 ROWS_IN=$(sql "SELECT COUNT(*) FROM ${T}_base") || { echo "scale.sh: ${T}_base not found"; exit 1; }
@@ -194,14 +196,19 @@ if has "$PARTS" latency || has "$PARTS" batch; then
                         sql "SELECT /*+LABEL($label)*/ COUNT(*) FROM (SELECT vvector.vsearch($V USING PARAMETERS index_name='$(ix $x)', k=10, precision='$p') OVER()
                              FROM (SELECT * FROM $SCHEMA.$(ix $x)_snap UNION ALL $QS) x) r" > /dev/null || break
                     done
-                    ms=$(sql "SELECT MEDIAN(request_duration_ms) OVER() FROM v_monitor.query_requests WHERE request_label = '$label' LIMIT 1")
+                    ok=$(sql "SELECT COUNT(*) FROM v_monitor.query_requests WHERE request_label = '$label' AND success")
+                    if [ "${ok:-0}" -lt 3 ]; then
+                        printf "%-34s %-9s FAILED (%s of 3 statements succeeded)\n" "$(ix $x)" "$p" "${ok:-0}"
+                        continue
+                    fi
+                    ms=$(sql "SELECT MEDIAN(request_duration_ms) OVER() FROM v_monitor.query_requests WHERE request_label = '$label' AND success LIMIT 1")
                     ms=${ms%.*}
                     printf "%-34s %-9s %9s ms  (%s queries/s)\n" "$(ix $x)" "$p" "$ms" "$(( NQ * 1000 / (ms > 0 ? ms : 1) ))"
                 done
             done
         fi
     done
-    scripts/deploy.sh --fenced=yes > /dev/null 2>&1
+    scripts/deploy.sh --fenced=yes > /dev/null 2>&1 || echo "WARNING: the final deploy (fenced) failed: run make deploy"
 fi
 
 if has "$PARTS" incremental; then

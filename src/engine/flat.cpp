@@ -111,6 +111,9 @@ void scan(const FlatSearch &s, const RowBlock &b, std::uint64_t r0, std::uint64_
 constexpr std::uint64_t ROW_SPLIT_HEAP_BYTES = 64u << 20;
 // Below this many multiply-adds the search runs on the calling thread only.
 constexpr std::uint64_t SERIAL_WORK = 1u << 21;
+// At most this many multiply-adds per unit of the query split (at least 4 queries): the calling
+// thread polls for a cancel between its units, which would otherwise take minutes at 100M rows.
+constexpr std::uint64_t QUERY_UNIT_WORK = 1ull << 33;
 
 } // namespace
 
@@ -138,6 +141,8 @@ void flat_search(const FlatSearch &s, const RowBlock *blocks, std::size_t n_bloc
         for (std::uint64_t q = 0; q < nq; ++q) heaps[q] = Heap{out.data() + q * k, 0, static_cast<std::uint32_t>(k)};
         std::uint64_t per_unit = nq;
         if (threads > 1) per_unit = std::min<std::uint64_t>(64, std::max<std::uint64_t>(4, (nq + 2 * threads - 1) / (2 * threads)));
+        const std::uint64_t per_query = std::max<std::uint64_t>(1, total_rows * s.stride);
+        per_unit = std::min<std::uint64_t>(per_unit, std::max<std::uint64_t>(4, QUERY_UNIT_WORK / per_query));
         per_unit = (per_unit + 3) / 4 * 4;
         parallel_ranges(nq, per_unit, threads, [&](int t, std::uint64_t, std::uint64_t q0, std::uint64_t q1) {
             for (std::size_t b = 0; b < n_blocks; ++b)

@@ -174,6 +174,10 @@ expect "a query vector of another length is refused" "index 'vvtest' has $DIMS d
 SELECT vvector.vsearch(1, ARRAY[1.0, 2.0], NULL::INT, NULL::ARRAY[FLOAT], NULL::BOOLEAN, NULL::INT, NULL::INT
                        USING PARAMETERS index_name='vvtest'$CD) OVER() FROM dual;"
 
+expect "a journal row without an id is refused (only the sentinel row has none)" "a journal row has no id" "
+SELECT vvector.vsearch(NULL::INT, NULL::ARRAY[FLOAT], NULL::INT, ARRAY[1.0, 2.0], FALSE, NULL::INT, NULL::INT
+                       USING PARAMETERS index_name='vvtest'$CD) OVER() FROM dual;"
+
 expect "session parameter cache_dir is used" "no snapshot cache for index 'vvtest' in /tmp/vvector_not_there" "
 ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/tmp/vvector_not_there';
 SELECT vvector.vsearch($Q, NULL::INT USING PARAMETERS index_name='vvtest') OVER() FROM dual;"

@@ -88,6 +88,10 @@ expect "register_index refuses a column that is not an array" "must be ARRAY\[FL
 expect "register_index refuses an unknown metric" "metric must be l2, cosine, dot or l1" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', NULL, NULL, 'manhattan', NULL);"
 expect "register_index refuses a column that does not exist" "column nope does not exist in $SCHEMA.journal" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'nope', NULL, NULL, 'l2', NULL);"
 expect "register_index refuses an unknown index_type" "index_type must be flat or hnsw" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'ivf');"
+expect "register_index refuses a version column that may be NULL" "ver_col ts must be NOT NULL" "
+DROP TABLE IF EXISTS $SCHEMA.nullver;
+CREATE TABLE $SCHEMA.nullver (id INT NOT NULL, vec ARRAY[FLOAT], ts TIMESTAMPTZ);
+CALL vvector.register_index('vvbad', '$SCHEMA.nullver', 'id', 'vec', NULL, 'ts', 'l2', NULL);"
 expect "a query before the first refresh says what to do" "run vload" "$SEARCH"
 expect "refresh_index" "index $IX refreshed: snapshot [0-9]" "CALL vvector.refresh_index('$IX');"
 built_equals_live "the snapshot holds every vector of the journal"

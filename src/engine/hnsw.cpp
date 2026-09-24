@@ -75,6 +75,7 @@ public:
         return false;
     }
     void prefetch(std::uint32_t pos) const { __builtin_prefetch(marks_.data() + pos); }
+    std::uint64_t bytes() const { return marks_.size() * sizeof(std::uint16_t); }
 
 private:
     std::vector<std::uint16_t> marks_;
@@ -82,7 +83,9 @@ private:
 };
 
 // Visited arrays kept by the process between searches (2 bytes per vector each): a new array of a
-// large index would pay a page fault per 4 KB on every call.
+// large index would pay a page fault per 4 KB on every call. At most 64 arrays and 512 MB are kept
+// (a 100M index has 200 MB arrays: a build on 64 threads must not pin 12.8 GB for the life of an
+// unfenced process); beyond that an array is freed when its search ends.
 class VisitedPool {
 public:
     std::unique_ptr<Visited> get(std::uint64_t n)
@@ -90,7 +93,7 @@ public:
         std::unique_ptr<Visited> v;
         {
             std::lock_guard<std::mutex> hold(lock_);
-            if (!free_.empty()) { v = std::move(free_.back()); free_.pop_back(); }
+            if (!free_.empty()) { v = std::move(free_.back()); free_.pop_back(); kept_ -= v->bytes(); }
         }
         if (!v) v.reset(new Visited());
         v->reserve(n);
@@ -99,12 +102,16 @@ public:
     void put(std::unique_ptr<Visited> v)
     {
         std::lock_guard<std::mutex> hold(lock_);
-        if (free_.size() < 64) free_.push_back(std::move(v));
+        if (free_.size() < 64 && kept_ + v->bytes() <= (512ull << 20)) {
+            kept_ += v->bytes();
+            free_.push_back(std::move(v));
+        }
     }
 
 private:
     std::mutex lock_;
     std::vector<std::unique_ptr<Visited>> free_;
+    std::uint64_t kept_ = 0;        // bytes of the arrays in free_
 };
 
 VisitedPool &visited_pool()
@@ -658,7 +665,13 @@ void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *sectio
     std::memcpy(section + layout.upper, base.upper, base.upper_blocks * (std::uint64_t(p.m) + 1) * 4);
 
     Builder b(s, section, layout, p);
-    b.start_from(base.entry_point, base.max_level);
+    // A tombstoned entry point costs every search a hop through a dead node: a live node of the same
+    // top level takes its place when there is one (the top level itself cannot change).
+    std::uint32_t entry = base.entry_point;
+    if (s.dead(entry))
+        for (std::uint64_t i = 0; i < n0; ++i)
+            if (base.levels[i] == base.max_level && !s.dead(i)) { entry = static_cast<std::uint32_t>(i); break; }
+    b.start_from(entry, base.max_level);
     const int threads = std::max(1, std::min<int>(p.threads, static_cast<int>(std::min<std::uint64_t>(std::max<std::uint64_t>(n - n0, 1), 64))));
     std::vector<Worker> workers;
     workers.reserve(threads);

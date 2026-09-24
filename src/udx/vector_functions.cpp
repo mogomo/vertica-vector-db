@@ -13,6 +13,7 @@
 #include "../engine/vecmath.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 using namespace Vertica;
@@ -157,7 +158,10 @@ class VectorFunction : public ScalarFunction
                 out.next();
             } while (in.next());
         } catch (std::exception &e) {
-            vt_report_error(0, "%s", e.what());
+            // Messages of the SDK do not name the function; ours start with its name already.
+            std::string m = e.what();
+            if (m.compare(0, std::strlen(fn), fn) != 0) m = std::string(fn) + ": " + m;
+            vt_report_error(0, "%s", m.c_str());
         }
     }
 

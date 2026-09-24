@@ -247,6 +247,11 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
     if (!(h.flags & FLAG_HNSW) && h.graph_bytes) fail("graph_bytes without the graph section");
     if (!(h.flags & FLAG_TOMBSTONES) && h.tombstones) fail("tombstones without the tombstones section");
     if (h.tombstones > h.count) fail("more tombstones than vectors");
+    // Before the layout arithmetic: huge section sizes must not wrap it around.
+    if (h.sq8_bytes > size || h.graph_bytes > size) fail("a section is larger than the file");
+    bool reserved_zero = h.reserved0 == 0;
+    for (const std::uint64_t r : h.reserved) reserved_zero = reserved_zero && r == 0;
+    if (!reserved_zero) fail("reserved header fields are not zero");
 
     // The offsets must be exactly what the layout rule gives for these counts.
     SnapshotHeader expect = h;

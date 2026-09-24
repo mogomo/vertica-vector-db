@@ -22,7 +22,8 @@
 #   dual       the same FROM dual (no view, no stale check)
 #   literal    the query as an ARRAY literal row instead of the query parameter
 #   delta0     query parameter FROM <index>_delta with freshness exact, the delta holds the sentinel
-#   delta1000  the same with 1000 journal rows (inserted before, deleted after)
+#   delta1000  the same with 1000 journal rows (written into the index's journal before and deleted
+#              physically after, also when the script is stopped; a refresh in between sees them)
 #   threads1, threads2, threads4   the snap shape with threads=1, 2, 4: the engine's share
 #   vknn       vknn with the query parameter FROM dual: no OVER(), no view, no stale check
 #   vknnrow    vknn on the query row of the query table (qid = 0), beside its qid
@@ -56,6 +57,7 @@ case "$INDEX$SCHEMA$RUNS${QUERIES//./}" in *[!A-Za-z0-9_]*) echo "latency.sh: na
 
 TAG="vvlat$(date +%s)"
 SRC=$(vsql -X -A -t -c "SELECT source_table FROM vvector.manifest WHERE index_name = '$INDEX'" 2>/dev/null || true)
+[ -n "$SRC" ] || [ "$ECHO_ONLY" = yes ] || { echo "latency.sh: index $INDEX is not registered" >&2; exit 2; }
 [ -n "$QUERIES" ] || QUERIES="$SCHEMA.$(sed -E 's/.*\.//; s/_base$//' <<< "$SRC")_query"
 
 setup_tiny() {
@@ -141,7 +143,11 @@ fi
 printf "%-10s %10s %10s %10s %10s   %s\n" shape client_p50 client_p99 server_p50 server_p99 "(ms, $RUNS runs, vsearch $FENCING)"
 for s in ${SHAPES//,/ }; do
     if [ "$s" = delta1000 ]; then
+        # Writes 1000 rows into the index's journal and deletes them physically afterwards, also when
+        # the script is stopped (the trap). A refresh in between would take them in; the next refresh
+        # after the DELETE then verifies the journal and builds in full.
         JT=$(vsql -X -A -t -c "SELECT source_table FROM vvector.manifest WHERE index_name = '$INDEX'")
+        trap 'vsql -X -q -c "DELETE FROM $JT WHERE id >= 2000000000; COMMIT;" > /dev/null' EXIT
         vsql -X -q -v ON_ERROR_STOP=1 -c "INSERT INTO $JT (id, vec) SELECT 2000000000 + qid, qvec FROM $QUERIES WHERE qid < 1000; COMMIT;" > /dev/null
     fi
     stmt=$(statement "$s")
@@ -153,6 +159,6 @@ for s in ${SHAPES//,/ }; do
                                       FROM (SELECT EXTRACT(EPOCH FROM end_timestamp - start_timestamp) * 1000 AS ms,
                                                    ROW_NUMBER() OVER(ORDER BY start_timestamp) AS n
                                             FROM v_monitor.query_requests WHERE request_label = '${TAG}_$s' AND success) r WHERE n > 5")
-    [ "$s" = delta1000 ] && vsql -X -q -c "DELETE FROM $JT WHERE id >= 2000000000; COMMIT;" > /dev/null
+    if [ "$s" = delta1000 ]; then vsql -X -q -c "DELETE FROM $JT WHERE id >= 2000000000; COMMIT;" > /dev/null; trap - EXIT; fi
     printf "%-10s %10s %10s %10s %10s\n" "$s" $client $server
 done

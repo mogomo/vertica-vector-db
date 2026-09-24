@@ -28,7 +28,9 @@
 --   <index>_delta  (only with a version column) the journal rows that may be newer than the active
 --                  snapshot, plus the sentinel row, so its result is never empty. The boundary is a
 --                  literal, so Vertica can prune partitions and storage containers.
-CREATE OR REPLACE PROCEDURE vvector.make_views(nm VARCHAR) LANGUAGE PLvSQL AS $$
+-- with_snap false: the _snap view is left as it is (a refresh that kept its snapshot: only the delta
+-- boundary moved; a CREATE OR REPLACE VIEW is a catalog commit on every node).
+CREATE OR REPLACE PROCEDURE vvector.make_views_core(nm VARCHAR, with_snap BOOLEAN) LANGUAGE PLvSQL AS $$
 DECLARE
     tab VARCHAR(256); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128);
     op_type VARCHAR(128); ver_type VARCHAR(128); vc_type VARCHAR(128);
@@ -36,35 +38,31 @@ DECLARE
     del_expr VARCHAR(400); ver_expr VARCHAR(400); sentinel VARCHAR(1000);
     stmt VARCHAR(8000); sid_text VARCHAR(32);
 BEGIN
-    tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
+    SELECT source_table, SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), id_col, vec_col, op_col, ver_col,
+           active_snapshot, delta_from
+      INTO tab, sch, tbl, idc, vc, op, ver, sid, v_from
+      FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.make_views: index % is not registered', nm;
     END IF;
-    sch := SPLIT_PART(tab, '.', 1);
-    tbl := SPLIT_PART(tab, '.', 2);
-    idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
-    vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
-    op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
-    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
-    sid := (SELECT active_snapshot FROM vvector.manifest WHERE index_name = nm);
-    v_from := (SELECT m.delta_from FROM vvector.manifest m WHERE m.index_name = nm);
     sid_text := COALESCE(sid::VARCHAR, 'NULL::INT');
     sentinel := 'SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, NULL::INT AS id, NULL::ARRAY[FLOAT] AS vec, '
              || 'NULL::BOOLEAN AS del, NULL::INT AS ver, ' || sid_text || ' AS snapshot_id';
 
-    EXECUTE 'CREATE OR REPLACE VIEW ' || sch || '.' || nm || '_snap AS ' || sentinel;
+    IF with_snap THEN
+        EXECUTE 'CREATE OR REPLACE VIEW ' || sch || '.' || nm || '_snap AS ' || sentinel;
+    END IF;
     IF ver IS NULL THEN
         RETURN;
     END IF;
 
     stmt := 'CREATE OR REPLACE VIEW ' || sch || '.' || nm || '_delta AS ';
     IF v_from IS NOT NULL THEN
-        op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
-        ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                     AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
-        vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vc));
+        SELECT MAX(CASE WHEN LOWER(column_name) = LOWER(op) THEN data_type END),
+               MAX(CASE WHEN LOWER(column_name) = LOWER(ver) THEN data_type END),
+               MAX(CASE WHEN LOWER(column_name) = LOWER(vc) THEN data_type END)
+          INTO op_type, ver_type, vc_type
+          FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch) AND LOWER(table_name) = LOWER(tbl);
         del_expr := CASE WHEN op IS NULL THEN 'FALSE'
                          WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)'
                          ELSE '(COALESCE(' || op || ', 1) < 0)' END;
@@ -73,9 +71,15 @@ BEGIN
         stmt := stmt || 'SELECT NULL::INT AS qid, NULL::ARRAY[FLOAT] AS qvec, ' || idc || '::INT AS id, '
              || CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END || ' AS vec, ' || del_expr || ' AS del, '
              || ver_expr || ' AS ver, ' || sid_text || ' AS snapshot_id FROM ' || tab || ' WHERE ' || ver || ' > ' || v_from
-             || ' UNION ALL ';
+             || ' AND ' || idc || ' IS NOT NULL UNION ALL ';
     END IF;
     EXECUTE stmt || sentinel;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.make_views(nm VARCHAR) LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.make_views_core(nm, TRUE);
 END;
 $$;
 
@@ -123,25 +127,23 @@ $$;
 -- one replica. A failure (for example no right to create a projection on the table) is not an error:
 -- replica_note says what happened and gives the statements for a DBA.
 -- The outcome goes to manifest replica_note: NOTICEs of a nested CALL do not reach the caller.
-CREATE OR REPLACE PROCEDURE vvector.apply_replica(nm VARCHAR) LANGUAGE PLvSQL AS $$
+-- x_stats false: statistics on the version column are not taken again for a replica that is kept (the
+-- refresh passes false when no journal row arrived since the last one: they cannot have changed).
+CREATE OR REPLACE PROCEDURE vvector.apply_replica_core(nm VARCHAR, x_stats BOOLEAN) LANGUAGE PLvSQL AS $$
 DECLARE
+    old_proj VARCHAR(256); old_note VARCHAR(1000);
     tab VARCHAR(256); sch VARCHAR(128); tbl VARCHAR(128); idc VARCHAR(128); vc VARCHAR(128); op VARCHAR(128); ver VARCHAR(128);
     rmode VARCHAR(16); proj VARCHAR(256); other VARCHAR(256); foreign_proj VARCHAR(256); note VARCHAR(1000);
     nodes INT; journal_mb INT; free_mb INT; limit_mb INT; keep BOOLEAN; users INT; ddl VARCHAR(2000); r VARCHAR(1000);
     writers INT;
 BEGIN
-    tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
+    SELECT source_table, SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), id_col, vec_col, op_col, ver_col,
+           COALESCE(journal_replica, 'auto'), replica_projection, replica_projection, replica_note
+      INTO tab, sch, tbl, idc, vc, op, ver, rmode, proj, old_proj, old_note
+      FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.apply_replica: index % is not registered', nm;
     END IF;
-    sch := SPLIT_PART(tab, '.', 1);
-    tbl := SPLIT_PART(tab, '.', 2);
-    idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
-    vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
-    op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
-    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
-    rmode := (SELECT COALESCE(MAX(journal_replica), 'auto') FROM vvector.manifest WHERE index_name = nm);
-    proj := (SELECT MAX(replica_projection) FROM vvector.manifest WHERE index_name = nm);
 
     nodes := (SELECT COUNT(*) FROM v_catalog.nodes);
     -- One copy of the journal: the largest segmented projection of the table, summed over the nodes.
@@ -221,15 +223,15 @@ BEGIN
                      || QUOTE_LITERAL(tab) || '); SELECT ANALYZE_STATISTICS(' || QUOTE_LITERAL(tab || '.' || ver) || ');';
             END;
         END IF;
-        IF proj IS NOT NULL THEN
+        IF proj IS NOT NULL AND (x_stats OR note NOT LIKE 'kept %') THEN
             BEGIN
                 r := EXECUTE 'SELECT ANALYZE_STATISTICS(' || QUOTE_LITERAL(tab || '.' || ver) || ')';
             EXCEPTION WHEN OTHERS THEN
                 note := note || '; statistics on ' || ver || ' failed (' || LEFT(SQLERRM, 200) || '): the planner may not use it';
             END;
-            IF nodes = 1 THEN
-                note := note || '; a single node gains nothing from it';
-            END IF;
+        END IF;
+        IF proj IS NOT NULL AND nodes = 1 THEN
+            note := note || '; a single node gains nothing from it';
         END IF;
     ELSIF proj IS NOT NULL THEN
         users := (SELECT COUNT(*) FROM vvector.manifest WHERE LOWER(replica_projection) = LOWER(proj) AND index_name <> nm);
@@ -243,8 +245,17 @@ BEGIN
         END IF;
         proj := NULL;
     END IF;
-    PERFORM UPDATE vvector.manifest SET replica_projection = proj, replica_note = note WHERE index_name = nm;
-    PERFORM COMMIT;
+    -- Written only when it changed: an UPDATE of the manifest is a commit on every node.
+    IF COALESCE(proj, '') <> COALESCE(old_proj, '') OR COALESCE(note, '') <> COALESCE(old_note, '') THEN
+        PERFORM UPDATE vvector.manifest SET replica_projection = proj, replica_note = note WHERE index_name = nm;
+        PERFORM COMMIT;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE vvector.apply_replica(nm VARCHAR) LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.apply_replica_core(nm, TRUE);
 END;
 $$;
 
@@ -325,6 +336,11 @@ BEGIN
     END IF;
     IF ver_column IS NOT NULL AND ver_type IS NULL THEN
         RAISE EXCEPTION 'vvector.register_index: column % does not exist in %', ver_column, src_table;
+    END IF;
+    -- A row without a version would be in no delta, no digest and no refresh.
+    IF ver_column IS NOT NULL AND (SELECT COUNT(*) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
+                                   AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver_column) AND is_nullable) > 0 THEN
+        RAISE EXCEPTION 'vvector.register_index: ver_col % must be NOT NULL: a row without a version would be in no delta and no refresh', ver_column;
     END IF;
     IF NOT id_type ILIKE 'int%' THEN
         RAISE EXCEPTION 'vvector.register_index: id_col % must be INT, not %', id_column, id_type;
@@ -770,63 +786,44 @@ DECLARE
     prev INT; sid INT; chunks INT; max_ver INT; v_from VARCHAR(64); prev_from VARCHAR(64);
     source VARCHAR(4000); del_expr VARCHAR(400); v_expr VARCHAR(400);
     t0 TIMESTAMPTZ; cut TIMESTAMPTZ; secs FLOAT; n_vec INT; n_dims INT; fmt INT; n_bytes INT; n_graph INT; n_tomb INT;
-    rmode VARCHAR(16); ratio FLOAT; every INT; since INT; opts VARCHAR(200); prev_opts VARCHAR(200); prev_fmt INT;
+    rmode VARCHAR(16); ratio FLOAT; every INT; since INT; opts VARCHAR(200); prev_opts VARCHAR(200); prev_fmt INT; earlier INT;
     prev_vec INT; prev_tomb INT; prev_max INT; rows_then INT; rows_now INT; rows_next INT; want INT; got INT; counts VARCHAR(200);
     digest_then VARCHAR(64); digest_now VARCHAR(64); digest_next VARCHAR(64); h_expr VARCHAR(600);
     v_every INT; v_since INT; verify BOOLEAN; t_scan TIMESTAMPTZ; scan_secs FLOAT; j_note VARCHAR(300);
     why VARCHAR(600); r_note VARCHAR(2400); build_opts VARCHAR(1600); w_since TIMESTAMPTZ; lag_note VARCHAR(600); young INT;
-    cd VARCHAR(1100); build_est INT; free_mem INT; bin_note VARCHAR(300); cores INT;
+    cd VARCHAR(1100); build_est INT; free_mem INT; bin_note VARCHAR(300); cores INT; grew BOOLEAN;
 BEGIN
-    tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
+    -- The manifest row in one query: PL/vSQL runs every assignment as a query of its own (2 to 7 ms
+    -- each on a cluster), so the row is read once, not column by column. Digests are compared as
+    -- text: PL/vSQL declares no NUMERIC(38,0).
+    SELECT source_table, id_col, vec_col, op_col, ver_col, metric, index_type, COALESCE(quantization, 'none'),
+           COALESCE(hnsw_m, 16), COALESCE(hnsw_ef_construction, 200), ver_margin, active_snapshot, delta_from,
+           COALESCE(x_mode, refresh_mode, 'auto'), COALESCE(tombstone_ratio, 0.2), rebuild_every, COALESCE(incremental_count, 0),
+           active_options, format_version, COALESCE(vector_count, 0), COALESCE(tombstones, 0), boundary_rows,
+           boundary_digest::VARCHAR, active_max_ver, COALESCE(verify_every, 1), COALESCE(refreshes_since_verify, 0),
+           CASE WHEN cache_dir IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(cache_dir) END,
+           SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2)
+      INTO tab, idc, vc, op, ver, measure, kind, quant, hm, hefc, margin, prev, prev_from, rmode, ratio, every, since,
+           prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl
+      FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
     END IF;
     IF x_mode IS NOT NULL AND x_mode NOT IN ('auto', 'incremental', 'full') THEN
         RAISE EXCEPTION 'vvector.refresh_index: mode must be auto, incremental or full';
     END IF;
-    sch := SPLIT_PART(tab, '.', 1);
-    tbl := SPLIT_PART(tab, '.', 2);
-    idc := (SELECT id_col FROM vvector.manifest WHERE index_name = nm);
-    vc := (SELECT vec_col FROM vvector.manifest WHERE index_name = nm);
-    op := (SELECT op_col FROM vvector.manifest WHERE index_name = nm);
-    ver := (SELECT ver_col FROM vvector.manifest WHERE index_name = nm);
-    measure := (SELECT m.metric FROM vvector.manifest m WHERE m.index_name = nm);
-    kind := (SELECT m.index_type FROM vvector.manifest m WHERE m.index_name = nm);
-    quant := (SELECT COALESCE(m.quantization, 'none') FROM vvector.manifest m WHERE m.index_name = nm);
-    hm := (SELECT COALESCE(m.hnsw_m, 16) FROM vvector.manifest m WHERE m.index_name = nm);
-    hefc := (SELECT COALESCE(m.hnsw_ef_construction, 200) FROM vvector.manifest m WHERE m.index_name = nm);
-    margin := (SELECT ver_margin FROM vvector.manifest WHERE index_name = nm);
-    prev := (SELECT active_snapshot FROM vvector.manifest WHERE index_name = nm);
-    prev_from := (SELECT m.delta_from FROM vvector.manifest m WHERE m.index_name = nm);
-    rmode := (SELECT COALESCE(x_mode, MAX(m.refresh_mode), 'auto') FROM vvector.manifest m WHERE m.index_name = nm);
-    ratio := (SELECT COALESCE(MAX(m.tombstone_ratio), 0.2) FROM vvector.manifest m WHERE m.index_name = nm);
-    every := (SELECT MAX(m.rebuild_every) FROM vvector.manifest m WHERE m.index_name = nm);
-    since := (SELECT COALESCE(MAX(m.incremental_count), 0) FROM vvector.manifest m WHERE m.index_name = nm);
-    prev_opts := (SELECT MAX(m.active_options) FROM vvector.manifest m WHERE m.index_name = nm);
-    prev_fmt := (SELECT MAX(m.format_version) FROM vvector.manifest m WHERE m.index_name = nm);
-    prev_vec := (SELECT COALESCE(MAX(m.vector_count), 0) FROM vvector.manifest m WHERE m.index_name = nm);
-    prev_tomb := (SELECT COALESCE(MAX(m.tombstones), 0) FROM vvector.manifest m WHERE m.index_name = nm);
-    rows_then := (SELECT MAX(m.boundary_rows) FROM vvector.manifest m WHERE m.index_name = nm);
-    digest_then := (SELECT MAX(m.boundary_digest)::VARCHAR FROM vvector.manifest m WHERE m.index_name = nm);   -- digests are compared as text: PL/vSQL declares no NUMERIC(38,0)
-    prev_max := (SELECT MAX(m.active_max_ver) FROM vvector.manifest m WHERE m.index_name = nm);
-    v_every := (SELECT COALESCE(MAX(m.verify_every), 1) FROM vvector.manifest m WHERE m.index_name = nm);
-    v_since := (SELECT COALESCE(MAX(m.refreshes_since_verify), 0) FROM vvector.manifest m WHERE m.index_name = nm);
     fmt := (SELECT format_version FROM (SELECT vvector.vversion() OVER()) v);
-    -- The index option cache_dir, passed to every function call of the refresh.
-    cd := (SELECT CASE WHEN MAX(m.cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(m.cache_dir)) END
-           FROM vvector.manifest m WHERE m.index_name = nm);
     -- The options a snapshot is built with. A snapshot can only be continued with the same ones.
     opts := kind || ' ' || measure || ' ' || quant || CASE WHEN kind = 'hnsw' THEN ' m=' || hm || ' ef_construction=' || hefc ELSE '' END;
-    vc_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(vc));
+    -- The types of the three journal columns in one query.
+    SELECT MAX(CASE WHEN LOWER(column_name) = LOWER(vc) THEN data_type END),
+           MAX(CASE WHEN LOWER(column_name) = LOWER(op) THEN data_type END),
+           MAX(CASE WHEN LOWER(column_name) = LOWER(ver) THEN data_type END)
+      INTO vc_type, op_type, ver_type
+      FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch) AND LOWER(table_name) = LOWER(tbl);
     v_expr := CASE WHEN vc_type ILIKE 'array[float8%' THEN vc ELSE vc || '::ARRAY[FLOAT]' END;
-    IF op IS NULL THEN
-        del_expr := 'FALSE';
-    ELSE
-        op_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                    AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(op));
-        del_expr := CASE WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)' ELSE '(COALESCE(' || op || ', 1) < 0)' END;
-    END IF;
+    del_expr := CASE WHEN op IS NULL THEN 'FALSE' WHEN op_type ILIKE 'bool%' THEN 'COALESCE(' || op || ', FALSE)'
+                     ELSE '(COALESCE(' || op || ', 1) < 0)' END;
 
     t0 := (SELECT CLOCK_TIMESTAMP());
 
@@ -847,8 +844,6 @@ BEGIN
     max_ver := 0;
     v_from := NULL;
     IF ver IS NOT NULL THEN
-        ver_type := (SELECT MAX(data_type) FROM v_catalog.columns WHERE LOWER(table_schema) = LOWER(sch)
-                     AND LOWER(table_name) = LOWER(tbl) AND LOWER(column_name) = LOWER(ver));
         IF ver_type ILIKE 'int%' THEN
             max_ver := EXECUTE 'SELECT MAX(' || ver || ')::INT FROM ' || tab
                 || CASE WHEN prev_from IS NULL OR prev_max IS NULL THEN '' ELSE ' WHERE ' || ver || ' > ' || prev_from END;
@@ -877,6 +872,15 @@ BEGIN
             END IF;
         END IF;
         max_ver := COALESCE(max_ver, 0);
+        -- The boundary never moves back: a writer whose lock request is older than the previous
+        -- boundary (or a larger margin) would otherwise make the next digest count against rows the
+        -- last refresh never counted. The rows between the two were in the last snapshot already.
+        IF prev_from IS NOT NULL THEN
+            earlier := EXECUTE 'SELECT (' || v_from || ' < ' || prev_from || ')::INT';
+            IF earlier = 1 THEN
+                v_from := prev_from;
+            END IF;
+        END IF;
     END IF;
 
     -- 2. Full or incremental. why = the reason for a full build.
@@ -1040,7 +1044,7 @@ BEGIN
                        boundary_digest = digest_next::NUMERIC(38,0), refreshes_since_verify = CASE WHEN verify THEN 0 ELSE v_since + 1 END, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = LEFT(r_note, 1000)
                 WHERE index_name = nm;
         PERFORM COMMIT;
-        PERFORM CALL vvector.make_views(nm);
+        PERFORM CALL vvector.make_views_core(nm, FALSE);
     ELSE
         -- 5. Load on every node, with the index defaults. Until the manifest and the views change,
         --    queries keep using the previous snapshot's views.
@@ -1082,7 +1086,9 @@ BEGIN
 
     -- 8. Journal replica: made, kept (with fresh statistics) or dropped as the journal grows.
     IF ver IS NOT NULL THEN
-        PERFORM CALL vvector.apply_replica(nm);
+        -- Statistics on the version column again only when journal rows arrived since the last refresh.
+        grew := rows_next IS NULL OR rows_then IS NULL OR rows_next <> rows_then;
+        PERFORM CALL vvector.apply_replica_core(nm, grew);
     END IF;
 END;
 $$;
@@ -1158,21 +1164,27 @@ $$;
 -- refresh_index(index_name [, mode]): mode auto, incremental or full; NULL or left out = the index's
 -- refresh_mode (set_index_options). Prints what was done and why.
 CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN;
 BEGIN
     PERFORM CALL vvector.refresh_index_core(nm, x_mode);
-    RAISE NOTICE 'vvector: index % %', nm, (SELECT MAX(refresh_note) FROM vvector.manifest WHERE index_name = nm);
-    IF (SELECT COUNT(ver_col) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
-        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
+    SELECT refresh_note, replica_note, ver_col IS NOT NULL INTO note, rnote, journal FROM vvector.manifest WHERE index_name = nm;
+    RAISE NOTICE 'vvector: index % %', nm, note;
+    IF journal THEN
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, rnote;
     END IF;
 END;
 $$;
 
 CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN;
 BEGIN
     PERFORM CALL vvector.refresh_index_core(nm, NULL);
-    RAISE NOTICE 'vvector: index % %', nm, (SELECT MAX(refresh_note) FROM vvector.manifest WHERE index_name = nm);
-    IF (SELECT COUNT(ver_col) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
-        RAISE NOTICE 'vvector: index %: journal replica: %', nm, (SELECT MAX(replica_note) FROM vvector.manifest WHERE index_name = nm);
+    SELECT refresh_note, replica_note, ver_col IS NOT NULL INTO note, rnote, journal FROM vvector.manifest WHERE index_name = nm;
+    RAISE NOTICE 'vvector: index % %', nm, note;
+    IF journal THEN
+        RAISE NOTICE 'vvector: index %: journal replica: %', nm, rnote;
     END IF;
 END;
 $$;
@@ -1235,8 +1247,10 @@ DROP PROCEDURE IF EXISTS vvector.make_delta_view(VARCHAR);
 -- vvector_search); that reached the procedures too.
 -- Only sizing (an estimate from its arguments and the node memory) stays open to everyone.
 REVOKE EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.make_views_core(VARCHAR, BOOLEAN) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.apply_replica_core(VARCHAR, BOOLEAN) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM PUBLIC;
@@ -1258,8 +1272,10 @@ REVOKE EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) FROM PUBLIC;
 -- The same for the role vvector_search, which install.sql gives every function of the schema (and
 -- on a second install every procedure, too). A NOTICE when there is nothing to revoke.
 REVOKE EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.make_views_core(VARCHAR, BOOLEAN) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.apply_replica_core(VARCHAR, BOOLEAN) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) FROM vvector_search;
@@ -1294,8 +1310,10 @@ GRANT EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.sizing(INT, INT, VARCHAR, VARCHAR) TO PUBLIC;
 -- The procedures above call these; Vertica checks the caller's right on every nested CALL.
 GRANT EXECUTE ON PROCEDURE vvector.make_views(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.make_views_core(VARCHAR, BOOLEAN) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.push_options(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.apply_replica_core(VARCHAR, BOOLEAN) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) TO vvector_admin;
