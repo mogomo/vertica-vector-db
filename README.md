@@ -509,6 +509,16 @@ The same from the shell:
     scripts/refresh.sh --index=docs --status               # status
     scripts/refresh.sh --index=docs --load_only            # load_all
 
+`scripts/demo.sh` walks through everything on a table of its own (schema
+VVDEMO, removed at the end unless `--keep`): it loads generated vectors
+(100,000 x 128 by default) or SIFT1M (`--dir=<directory with sift_base.fvecs>`),
+registers and builds an HNSW index, searches one query with vvector and with
+the built-in full scan, measures the recall of the three precision levels,
+adds and deletes a vector without a refresh and shows the difference between
+`freshness='snapshot'` and `'exact'`, refreshes incrementally and shows every
+node's cache. On the test VM with SIFT1M: one query 17 ms against 6.2 s for
+the full scan, recall@10 0.93 / 0.99 / 0.999 (fast / balanced / best).
+
 ### The manifest
 
 `SELECT * FROM vvector.manifest;` shows one row per index: the source

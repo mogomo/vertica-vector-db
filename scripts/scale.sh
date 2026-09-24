@@ -3,7 +3,7 @@
 #
 #   scripts/scale.sh --dataset=NAME [--schema=VVSCALE] [--dir=DIR [--rows=N] [--gt=FILE] | --generate=DIMS --rows=N]
 #                    [--streams=N] [--indexes=flat,hnsw,sq8] [--metric=l2] [--parts=...] [--queries=1000]
-#                    [--runs=200] [--modes=yes,mixed] [--echo_only]
+#                    [--runs=200] [--modes=yes,mixed] [--cache_dir=DIR] [--echo_only]
 #
 #   --dataset   the tables <schema>.<NAME>_base, _query and _gt of scripts/load_dataset.sh
 #   --dir, --rows, --gt, --generate, --streams
@@ -20,9 +20,12 @@
 #               latency      scripts/latency.sh shapes snap, dual, delta0, vknn per index and mode
 #               batch        --queries queries in one statement per index and precision, per mode
 #               incremental  up to 1000 adds (the first query vectors as new ids) and 500 deletes, one
-#                            refresh_index per index, then one refresh with nothing changed
+#                            refresh_index per index, then one refresh with nothing changed; the
+#                            rows are removed from the journal again at the end
 #   --modes     deploy modes of the latency and batch parts (scripts/deploy.sh --fenced=...); the
 #               library is deployed fenced again at the end
+#   --cache_dir the index option cache_dir of the indexes (set_index_options): where every node keeps
+#               their cache files; a directory of the database user on a disk with room for them
 #
 # Prints the results, also saved to build/scale-<NAME>-<date>.txt. Not part of make test: a 100M-row
 # run takes hours. Check the memory first: a full build holds the whole snapshot (vvector.sizing).
@@ -32,7 +35,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 NAME= SCHEMA=VVSCALE DIR= ROWS= GT= GEN= STREAMS= INDEXES=flat,hnsw,sq8 METRIC=l2
-PARTS=build,recall,latency,batch,incremental QUERIES=1000 RUNS=200 MODES=yes,mixed ECHO_ONLY=no
+PARTS=build,recall,latency,batch,incremental QUERIES=1000 RUNS=200 MODES=yes,mixed ECHO_ONLY=no CDIR=
 for arg in "$@"; do
     case "$arg" in
         --dataset=*)  NAME="${arg#*=}" ;;
@@ -48,8 +51,9 @@ for arg in "$@"; do
         --queries=*)  QUERIES="${arg#*=}" ;;
         --runs=*)     RUNS="${arg#*=}" ;;
         --modes=*)    MODES="${arg#*=}" ;;
+        --cache_dir=*) CDIR="${arg#*=}" ;;
         --echo_only)  ECHO_ONLY=yes ;;
-        -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "scale.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -62,6 +66,8 @@ for x in ${INDEXES//,/ }; do case "$x" in flat|hnsw|sq8) ;; *) die "--indexes: f
 for x in ${PARTS//,/ }; do case "$x" in build|recall|latency|batch|incremental) ;; *) die "--parts: build, recall, latency, batch, incremental" ;; esac; done
 for x in ${MODES//,/ }; do case "$x" in yes|no|mixed) ;; *) die "--modes: yes, no, mixed" ;; esac; done
 [ "$QUERIES" -ge 1 ] || die "--queries must be at least 1"
+[ -z "$CDIR" ] || [[ "$CDIR" =~ ^(/[A-Za-z0-9._-]+)+/?$ ]] || die "--cache_dir must be an absolute path of letters, digits and / . _ -"
+CD_OPT="NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '$CDIR'"
 
 T="$SCHEMA.$NAME" V="qid, qvec, id, vec, del, ver, snapshot_id" TAG="vvscale$(date +%s)"
 has() { case ",$1," in *",$2,"*) return 0 ;; esac; return 1; }
@@ -78,6 +84,7 @@ if [ "$ECHO_ONLY" = yes ]; then
         kind=hnsw; [ "$x" = flat ] && kind=flat
         echo "CALL vvector.register_index('$(ix $x)', '${T}_base', 'id', 'vec', 'del', 'ts', '$METRIC', 0, '$kind');"
         [ "$x" = sq8 ] && echo "CALL vvector.set_index_options('$(ix $x)', NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
+        [ -z "$CDIR" ] || echo "CALL vvector.set_index_options('$(ix $x)', $CD_OPT);"
         has "$PARTS" build && echo "CALL vvector.refresh_index('$(ix $x)', 'full');"
     done
     has "$PARTS" latency && echo "scripts/latency.sh --index=<each index> --schema=$SCHEMA --runs=$RUNS --shapes=snap,dual,delta0,vknn   (modes $MODES)"
@@ -97,7 +104,7 @@ last() {   # LABEL [SINCE]: the duration of the latest statement with that label
     ms=$(sql "SELECT request_duration_ms FROM v_monitor.query_requests WHERE request_label = '$1'${2:+ AND start_timestamp >= '$2'} ORDER BY start_timestamp DESC LIMIT 1")
     echo "${ms:--}"
 }
-mem() { echo "$(now) free memory per node (GB, without the page cache): $(sql "SELECT (total_memory_free_bytes / 1073741824.0)::NUMERIC(6,1) FROM v_monitor.host_resources ORDER BY host_name" | tr '\n' ' ')"; }
+mem() { echo "$(now) memory per node (GB, free / free with the page cache): $(sql "SELECT (total_memory_free_bytes / 1073741824.0)::NUMERIC(6,1) || ' / ' || ((total_memory_free_bytes + total_memory_cache_bytes) / 1073741824.0)::NUMERIC(6,1) FROM v_monitor.host_resources ORDER BY host_name" | tr '\n' ' ')"; }
 refresh_timed() {   # INDEX [MODE]
     local t0 out since
     since=$(sql "SELECT CLOCK_TIMESTAMP()")
@@ -137,6 +144,7 @@ if has "$PARTS" build; then
         sql "CALL vvector.unregister_index('$(ix $x)');" > /dev/null 2>&1 || true
         sql "CALL vvector.register_index('$(ix $x)', '${T}_base', 'id', 'vec', 'del', 'ts', '$METRIC', 0, '$kind');" > /dev/null 2>&1 || { echo "register_index $(ix $x) failed"; exit 1; }
         [ "$quant" = sq8 ] && { sql "CALL vvector.set_index_options('$(ix $x)', NULL, NULL, NULL, 'sq8', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);" > /dev/null 2>&1 || { echo "set_index_options $(ix $x) failed"; exit 1; }; }
+        [ -z "$CDIR" ] || { sql "CALL vvector.set_index_options('$(ix $x)', $CD_OPT);" > /dev/null 2>&1 || { echo "cache_dir $CDIR for $(ix $x) failed"; exit 1; }; }
         refresh_timed "$(ix $x)" full || exit 1
         mem
     done
@@ -145,7 +153,7 @@ if has "$PARTS" build; then
                 index_bytes // 1048576 AS index_mb, build_seconds FROM vvector.manifest
          WHERE index_name LIKE '${NAME}\\_%' ORDER BY 1" | column -t -s'|'
     echo "-- vinfo on every node"
-    sql "SELECT node_name, index_name, snapshot_id, vector_count, index_type, quantization, loaded
+    sql "SELECT node_name, index_name, snapshot_id, vector_count, index_type, quantization, loaded, resident_mb, cache_file
          FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) i
          WHERE index_name LIKE '${NAME}\\_%' ORDER BY 2, 1" | column -t -s'|'
 fi
@@ -221,5 +229,10 @@ if has "$PARTS" incremental; then
     echo "-- nothing changed"
     for x in ${INDEXES//,/ }; do refresh_timed "$(ix $x)"; done
     mem
+    # The journal as loaded again: the added rows would be found by the queries they were copied from
+    # and spoil the recall of the next run against the ground truth. (The indexes of this run then
+    # differ from the journal; the next scale.sh run builds them again.)
+    sql "DELETE FROM ${T}_base WHERE id > $top OR (del AND id >= $gone AND id < $gone + 500); COMMIT;" > /dev/null &&
+        echo "$(now) the rows added for this part were removed from ${T}_base again"
 fi
 echo; echo "== done $(now) UTC; report: $OUT"
