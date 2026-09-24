@@ -254,6 +254,23 @@ passing them to vsearch (about 0.12 microseconds per row mixed, twice that fence
 allowed ids in the snapshot with one galloping pass over the sorted ids (`VectorSet::find_sorted`)
 instead of one binary search per id saved 3 ms at 100,000 ids.
 
+On the 4-node cluster (Enterprise mode, SIFT1M index sift_hnsw loaded on every node, one query,
+client median over 200 runs; scripts/latency.sh shapes filter* and filter*seg) the source of the
+allow-list rows decides the cost. vsearch runs on the initiator (`OVER()`); rows of a segmented
+table are scanned on every node and sent there, which costs about 24 ms whatever their number:
+
+| statement | fenced, unsegmented | fenced, segmented | mixed, unsegmented | mixed, segmented |
+|---|---:|---:|---:|---:|
+| no filter (`_snap`) | 15.0 ms | 15.0 ms | 6.8 ms | 6.8 ms |
+| 100 allowed ids | 17.4 ms | 40.5 ms | 8.7 ms | 32.9 ms |
+| 10,000 allowed ids | 31.3 ms | 55.5 ms | 14.2 ms | 43.3 ms |
+| 100,000 allowed ids | 76.7 ms | 95.3 ms | 41.2 ms | 68.9 ms |
+
+On the VM (one node) both tables cost the same (mixed 2.7 / 4.4 / 15.1 ms). This is the delta
+view's gather again (lever 3); the remedy is the same, a table or projection of the filter columns
+that is `UNSEGMENTED ALL NODES` (README "Filtered search"). Per allowed id the x86 nodes need
+about 0.35 microseconds mixed, three times the VM.
+
 **Range search on HNSW.** Before M5 the graph search kept ef = max(ef_search, k) candidates and
 cut them by the radius: to get "everything within r" one set k large and paid a walk with a
 candidate list of k. Now, with a radius, the walk starts with the preset ef (fast: 32) and makes
@@ -272,7 +289,8 @@ distance (so the mean number within the radius is larger than r):
 
 On the x86 cluster nodes: 1,752 / 964 / 552 queries per second against 426 / 425 / 423. Through SQL
 the range statement (k 16384, a radius holding the query's 10 nearest) costs what a plain search
-costs: 7.3 ms fenced, 1.9 ms mixed.
+costs: 7.3 ms fenced, 1.9 ms mixed on the VM; 15.6 and 7.1 ms on the 4-node cluster (plain search
+12.8 and 5.9 ms in the same run).
 
 A first version doubled the list while the whole list was within the radius: recall on random l1
 data fell to 0.93 (the answers sat at the end of the list, where the walk is least complete), and

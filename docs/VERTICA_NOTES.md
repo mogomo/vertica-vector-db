@@ -317,3 +317,7 @@ Check again on other versions.
   `aggregateArrs`) on the first call. Aggregates always run inside the server:
   `CREATE AGGREGATE FUNCTION ... FENCED` is a syntax error (ERROR 4856). The database had to be
   restarted. vector_sum and vector_avg are therefore transform functions (fenced like vsearch).
+- (26.2.0-3, 4 nodes, Enterprise mode) Allow-list rows from a segmented table, `UNION ALL`ed into
+  the input of `vsearch(...) OVER()`, are scanned on every node and sent to the initiator: about
+  24 ms more per statement than the same rows from an `UNSEGMENTED ALL NODES` table (100 ids: 32.9
+  against 8.7 ms, mixed). The same effect as the delta view without the journal replica.

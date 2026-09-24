@@ -791,6 +791,23 @@ answers 75,700 queries per second in a batch (0.25 ms for a single query);
 The allow-list is part of the statement's input, so a list of millions of
 ids costs the time Vertica needs to send them.
 
+On a cluster, vsearch runs on the node that received the statement, and
+allow-list rows from a segmented table must first be gathered from every
+node. On the 4-node test cluster that costs about 24 ms whatever the list
+size (one search, mixed, client median):
+
+| allowed ids | from an UNSEGMENTED ALL NODES table | from a segmented table |
+|---|---:|---:|
+| no filter | 6.8 ms | 6.8 ms |
+| 100 | 8.7 ms | 32.9 ms |
+| 10,000 | 14.2 ms | 43.3 ms |
+| 100,000 | 41.2 ms | 68.9 ms |
+
+So keep the filter columns a search uses (id plus the category, tenant or
+language) in a small table that is `UNSEGMENTED ALL NODES`, or give such a
+table an unsegmented projection. Every node then has a full copy, and the
+rows are read where vsearch runs. On one node it makes no difference.
+
 For a filter that keeps most rows, searching without it and filtering the
 results can be simpler; see [Recipes](#recipes).
 
@@ -1420,7 +1437,10 @@ ms mixed, with sq8 14.4 and 6.1 ms; `vknn` 13.5 and 6.0 ms. One statement with
 threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
 Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
 (87 s with sq8), an incremental one after 1000 adds and 500 deletes 16.6 s:
-every node stores and loads the whole snapshot (see Restrictions).
+every node stores and loads the whole snapshot (see Restrictions). A range
+search (k 16384, the radius of the query's 10th neighbour) costs 15.6 ms
+fenced and 7.1 ms mixed; filtered searches: see
+[Filtered search](#filtered-search).
 
 **10 million vectors** (the first 10M of BIGANN / SIFT1B, 128 dimensions, with
 its ground truth for 10M; the 4-node cluster, 1000 queries):
@@ -1545,7 +1565,10 @@ Index and search:
   exact-search limit the graph walk passes through the vectors outside the
   list; with a very selective filter just above that limit the walk is slow
   (it visits about ef_search x vectors / allowed nodes). `vknn` has no
-  allow-list.
+  allow-list. On a multi-node cluster, allow-list rows from a segmented
+  table are gathered from every node: about 24 ms more per statement on the
+  4-node test cluster; read them from an `UNSEGMENTED ALL NODES` table
+  ([Filtered search](#filtered-search)).
 - `vector_sum` and `vector_avg` are transform functions, not aggregates
   (Vertica 26.2 aggregates cannot take an ARRAY argument): use them with
   `OVER()` or `OVER(PARTITION BY ...)` and only partition columns beside

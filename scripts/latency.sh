@@ -27,9 +27,11 @@
 #   vknn       vknn with the query parameter FROM dual: no OVER(), no view, no stale check
 #   vknnrow    vknn on the query row of the query table (qid = 0), beside its qid
 #   filter100, filter10k, filter100k   the snap shape with an allow-list of 100, 10,000 or 100,000
-#              ids (rows of SCHEMA.vvlat_allow; filtered search)
+#              ids (rows of SCHEMA.vvlat_allow, UNSEGMENTED ALL NODES; filtered search)
+#   filter100seg, filter10kseg, filter100kseg   the same ids from a segmented table (vvlat_allow_seg):
+#              on a cluster the rows are gathered from every node
 #   range10    the snap shape with k 16384 and the radius of the query's 10th neighbour (range search)
-# Creates index vvlat_tiny and table vvlat_allow in SCHEMA (kept for later runs).
+# Creates index vvlat_tiny and tables vvlat_allow, vvlat_allow_seg in SCHEMA (kept for later runs).
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -euo pipefail
 
@@ -45,7 +47,7 @@ for arg in "$@"; do
         --queries=*) QUERIES="${arg#*=}" ;;
         --first_call) FIRST=yes ;;
         --echo_only) ECHO_ONLY=yes ;;
-        -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,35p' "$0"; exit 0 ;;
         *) echo "latency.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -67,12 +69,21 @@ SQL
 }
 
 # Every 10th id of the index (100,000 of SIFT1M's 1,000,000); the filter shapes take subsets.
+# vvlat_allow is UNSEGMENTED ALL NODES (read on the initiator); vvlat_allow_seg holds the same rows
+# segmented by id, as a filter on a large table would be.
 setup_allow() {
     vsql -X -q -v ON_ERROR_STOP=1 <<SQL > /dev/null
 DROP TABLE IF EXISTS $SCHEMA.vvlat_allow;
-CREATE TABLE $SCHEMA.vvlat_allow AS
+DROP TABLE IF EXISTS $SCHEMA.vvlat_allow_seg;
+CREATE TABLE $SCHEMA.vvlat_allow (id INT NOT NULL, size INT NOT NULL) ORDER BY size, id UNSEGMENTED ALL NODES;
+CREATE TABLE $SCHEMA.vvlat_allow_seg (id INT NOT NULL, size INT NOT NULL) ORDER BY size, id SEGMENTED BY HASH(id) ALL NODES;
+INSERT INTO $SCHEMA.vvlat_allow
 SELECT id, CASE WHEN n % 1000 = 0 THEN 100 WHEN n % 10 = 0 THEN 10000 ELSE 100000 END AS size
 FROM (SELECT id, ROW_NUMBER() OVER(ORDER BY id) - 1 AS n FROM (SELECT DISTINCT id FROM $SRC) d) i WHERE n < 100000;
+INSERT INTO $SCHEMA.vvlat_allow_seg SELECT id, size FROM $SCHEMA.vvlat_allow;
+COMMIT;
+SELECT ANALYZE_STATISTICS('$SCHEMA.vvlat_allow');
+SELECT ANALYZE_STATISTICS('$SCHEMA.vvlat_allow_seg');
 SQL
 }
 
@@ -91,9 +102,11 @@ statement() {   # SHAPE -> one SQL statement
                    echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, freshness='exact') OVER() FROM $SCHEMA.${INDEX}_delta;" ;;
         vknn)      echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vknn(NULL::ARRAY[FLOAT] USING PARAMETERS index_name='$INDEX', query='$Q', k=10) FROM dual;" ;;
         vknnrow)   echo "SELECT /*+LABEL(${TAG}_$1)*/ q.qid, vvector.vknn(q.qvec USING PARAMETERS index_name='$INDEX', k=10) FROM $QUERIES q WHERE q.qid = 0;" ;;
-        filter100|filter10k|filter100k)
-                   local size=${1#filter}; size=${size/k/000}
-                   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${INDEX}_snap UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM $SCHEMA.vvlat_allow WHERE size <= $size) x;" ;;
+        filter100|filter10k|filter100k|filter100seg|filter10kseg|filter100kseg)
+                   local size=${1#filter} table=vvlat_allow
+                   [ "${size%seg}" != "$size" ] && { size=${size%seg}; table=vvlat_allow_seg; }
+                   size=${size/k/000}
+                   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10) OVER() FROM (SELECT * FROM $SCHEMA.${INDEX}_snap UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM $SCHEMA.$table WHERE size <= $size) x;" ;;
         range10)   echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=16384, radius=$RADIUS) OVER() FROM $SCHEMA.${INDEX}_snap;" ;;
         threads*)  echo "SELECT /*+LABEL(${TAG}_$1)*/ vvector.vsearch($V USING PARAMETERS index_name='$INDEX', query='$Q', k=10, threads=${1#threads}) OVER() FROM $SCHEMA.${INDEX}_snap;" ;;
     esac
