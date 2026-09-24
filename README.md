@@ -63,7 +63,7 @@ On a Vertica node, with the environment variables of `vsql` set (see
              INSERT INTO app.docs (id, vec) VALUES (3, ARRAY[0.0, 1.0, 0.0]);
              INSERT INTO app.docs (id, vec) VALUES (4, ARRAY[0.0, 0.0, 1.0]);
              INSERT INTO app.docs (id, vec) VALUES (5, ARRAY[0.5, 0.5, 0.0]); COMMIT;"
-    vsql -c "CALL vvector.register_index('docs', 'app.docs', 'id', 'vec', 'del', 'ts', 'cosine', NULL);"
+    vsql -c "CALL vvector.register_index('docs', 'app.docs', 'id', 'vec', 'del', 'ts', 'cosine', 0);"
     vsql -c "CALL vvector.refresh_index('docs');"
     vsql -c "SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id
                     USING PARAMETERS index_name='docs', query='[1, 0.2, 0]', k=3) OVER()
@@ -76,7 +76,11 @@ On a Vertica node, with the environment variables of `vsql` set (see
        0 |  5 | 0.832050263881683 |    3
 
 `register_index` creates an HNSW index unless you ask for `flat` (see
-[Index types and tuning](#index-types-and-tuning)). The same query with the
+[Index types and tuning](#index-types-and-tuning)). The last argument, the
+margin, is 0 here so that the refresh builds the rows written just before it;
+that is safe on one node with `CLOCK_TIMESTAMP()` versions. With the default
+(NULL = 60 s) a refresh builds the rows older than 60 seconds and serves the
+newer ones through the delta (see [Freshness explained](#freshness-explained)). The same query with the
 built-in function returns the same ids and scores (vvector computes in 32-bit
 floats, so scores agree to about 7 digits):
 
@@ -243,7 +247,7 @@ All procedures need the role `vvector_admin`, except `sizing` (everyone);
 ### register_index
 
     CALL vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin [, index_type]);
-    CALL vvector.register_index('docs', 'app.docs', 'id', 'vec', 'del', 'ts', 'cosine', NULL);
+    CALL vvector.register_index('docs', 'app.docs', 'id', 'vec', 'del', 'ts', 'cosine', 0);
 
 | Argument | Meaning |
 |---|---|
@@ -253,7 +257,7 @@ All procedures need the role `vvector_admin`, except `sizing` (everyone);
 | op_col | delete flag (BOOLEAN or INT), or NULL when rows are only added; needs ver_col |
 | ver_col | version (TIMESTAMPTZ, TIMESTAMP or INT), or NULL for a static index |
 | metric | `l2` (VECTOR_L2), `cosine` (COSINE_SIMILARITY), `dot` (DOT_PRODUCT) or `l1` (Manhattan distance); fixed for the life of the index |
-| margin | overlap of the delta: seconds for a timestamp version (NULL = 60); units of the column for an INT version (required) |
+| margin | how far the delta boundary stays behind the refresh: seconds for a timestamp version (NULL = 60; 0 is safe on one node with `CLOCK_TIMESTAMP()` versions, a cluster needs a few seconds for clock differences), units of the column for an INT version (required). A refresh builds the rows up to the boundary; newer rows stay in the delta until the next refresh (see [Freshness explained](#freshness-explained)) |
 | index_type | `hnsw` (default: a graph index, fast and approximate) or `flat` (exact, reads every vector); see [Index types and tuning](#index-types-and-tuning) |
 
 It creates the views `<schema>.<index>_snap` and, with a version column,
@@ -291,13 +295,20 @@ One refresh of an index runs at a time. A second `refresh_index` of the same
 index (by hand, or by the schedule) while one runs stops at once with an
 error that says since when and by whom the index is being refreshed:
 
-    ERROR 2005:  vvector.refresh_index: index docs is being refreshed since 2026-09-23 16:56:19 UTC (by dbadmin, session v_vdb_node0001-1391:0x241bd). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored 6 hours after its start, or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'docs'; COMMIT;
+    ERROR 2005:  vvector.refresh_index: index docs is being refreshed since 2026-09-23 16:56:19 UTC (by dbadmin, session v_vdb_node0001-1391:0x241bd). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored as soon as its session is gone (seen by a superuser, or by the same user), else 6 hours after its start (6, or 4 times the last build time), or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'docs'; COMMIT;
 
 The refresh marks the manifest row (`refresh_started_at`,
 `refresh_started_by`) and removes the mark when it ends, also when it fails.
-If its session is killed or its node goes down, the mark stays: it is ignored
-6 hours after it was set, or a `vvector_admin` removes it with the statement
-the message gives
+If its session is killed or its node goes down, the mark stays. The next
+refresh ignores it at once when the session is gone from
+`v_monitor.sessions` and the caller can see that: a superuser sees every
+session, another user only its own. A refresh started by
+[schedule_refresh](#schedule_refresh) runs in a session that
+`v_monitor.sessions` does not show; its mark reads "scheduled, internal
+session ..." and counts by its age only. A mark is always ignored after 6
+hours, or after 4 times the index's last build time when that is longer (a
+3-hour build keeps its mark for 12 hours). A `vvector_admin` can remove a
+mark with the statement the message gives
 (`UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'docs'; COMMIT;`).
 `status` shows a running refresh.
 
@@ -668,22 +679,17 @@ After the refresh above, vector 6 is added and vector 2 is deleted:
     INSERT INTO app.docs (id, del) VALUES (2, TRUE);
     COMMIT;
 
-The delta view now holds these rows, the sentinel, and here also the five
-rows of the quick start: they were written less than a minute before the
-refresh, inside the margin (see [Freshness](#freshness-explained)). They are in
-the snapshot too; applying them again changes nothing.
+The delta view now holds these two rows and the sentinel (the row that
+carries the snapshot id). The five rows of the quick start are in the
+snapshot: the refresh built every row up to its boundary, and with margin 0
+that is every row written before it (see [Freshness](#freshness-explained)).
 
     SELECT id, del, ver IS NOT NULL AS has_ver, snapshot_id FROM app.docs_delta ORDER BY id;
 
      id | del | has_ver | snapshot_id
     ----+-----+---------+-------------
         |     | f       |         959
-      1 | f   | t       |         959
-      2 | f   | t       |         959
       2 | t   | t       |         959
-      3 | f   | t       |         959
-      4 | f   | t       |         959
-      5 | f   | t       |         959
       6 | f   | t       |         959
 
 With `freshness='exact'`, id 6 is found and id 2 is gone; with the default
@@ -1084,10 +1090,20 @@ estimates an index before you load it.
   snapshot (the latest row per id wins, a delete removes the id).
 - The boundary is taken before the refresh reads the table: the earlier of
   "now" and the start of the oldest open transaction that writes to the
-  table, minus the margin (default 60 s). Rows just before the boundary are
-  in the snapshot and in the delta; applying them twice gives the same
-  result. That is why `status` may count rows in the delta right after a
-  refresh.
+  table, minus the margin (default 60 s). The refresh builds the rows up to
+  the boundary; the delta view returns the rows after it; the two never
+  overlap. So the rows of the last margin seconds before a refresh stay in
+  the delta (`status` counts them) and a query with `freshness='snapshot'`
+  sees them after the next refresh. A refresh that finds no live vector up
+  to the boundary, such as the first refresh right after a load, stops with
+  an error that says so: refresh again when the margin has passed.
+- An open transaction that writes to the table holds the boundary back:
+  everything written after its start stays in the delta until it ends. When
+  it is older than ten times the margin (at least 60 s), the refresh note
+  says so ("the boundary lags N minutes behind ...").
+- Why the snapshot takes nothing after the boundary: the journal digest
+  (see [refresh_index](#refresh_index)) covers the rows up to the boundary, so a physical DELETE or UPDATE
+  of any row in the snapshot is found at the next refresh.
 - Every query over the delta pays for its rows: about 1.7 ms per 1000 rows
   of 128 numbers on one node. `status` warns above 100,000 rows or when
   reading the delta is slow; refresh more often then. On a cluster the delta
@@ -1242,7 +1258,12 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   `ALTER SESSION SET UDPARAMETER FOR vvector cache_dir = '/data/vvector';`
   (the refresh and every query must use the same one), or `cache_dir=` per
   call. `/tmp` may be cleaned at reboot: that is safe (`load_all` restores
-  it), but a node answers "run vload" until then.
+  it), but a node answers "run vload" until then. Use a directory on a data
+  disk that belongs to the database's operating system user (vload creates
+  it with mode 0700 if it is missing): a search reads only cache files and
+  index directories of that user, and treats any other as "no cache" (the
+  search functions are PUBLIC and any user can set cache_dir, so a file
+  someone else wrote is never read).
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options
   are rows of `vvector.manifest`: a backup of the database contains them.
 - **Disk space**: a refresh keeps the active and the previous snapshot in the
@@ -1358,8 +1379,9 @@ cache), starting with `vknn:`.
 | `vsearch: index 'x': OPTIONS file in the cache: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
 | `vvector.register_index: ...` (table, column, type, metric, margin, op_col needs ver_col, already registered) | a bad argument; the message names it | fix the argument |
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
+| `vvector.refresh_index: index x: no live vector up to the delta boundary B ...; N rows of T are newer` | every live row was written after the boundary (within the margin before the refresh, or after the start of an open writer), for example the first refresh right after a load | refresh again when the margin has passed; the rows are found meanwhile with `freshness='exact'`. On one node with `CLOCK_TIMESTAMP()` versions a margin of 0 is safe |
 | `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
-| `vvector.refresh_index: index x is being refreshed since T UTC (by USER, session S). Two refreshes of one index cannot run at the same time ...` | another refresh of the index runs (by hand or by the schedule), or one was killed and left its mark | wait until it ends; if none runs, `UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'x'; COMMIT;` (or wait until 6 hours after T) |
+| `vvector.refresh_index: index x is being refreshed since T UTC (by USER, session S). Two refreshes of one index cannot run at the same time ...` | another refresh of the index runs (by hand or by the schedule), or one was killed and left its mark (a superuser, or the same user, gets past a killed one at once) | wait until it ends; if none runs, `UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'x'; COMMIT;` (or wait for the hours the message names) |
 | `Permission denied for schema vvector_admin` | a build or load function called without the role `vvector_admin` | `GRANT vvector_admin TO someone;` and enable it (default role or `SET ROLE`) |
 | `Function vvector.refresh_index(unknown) does not exist, or permission is denied ...` (any procedure) | the caller lacks the role `vvector_admin`, or has it but not enabled in the session | grant it and enable it (default role or `SET ROLE vvector_admin`) |
 | `Only a Super User can drop triggers` (from `schedule_refresh`) | `schedule_refresh` was called by a user who is not a superuser | a superuser runs `schedule_refresh` |
@@ -1638,8 +1660,10 @@ Operations:
 - A new index default is seen by queries within 200 ms; a new snapshot at once.
 - Two refreshes of one index at the same time are refused: the second one
   gets an error. A refresh whose session was killed leaves its mark in the
-  manifest; the next refresh ignores it after 6 hours (or remove it by hand,
-  see [refresh_index](#refresh_index)).
+  manifest; the next refresh ignores it at once when it can see that the
+  session is gone (a superuser, or the same user), else after 6 hours or 4
+  times the last build time; the mark of a scheduled refresh counts by age
+  only (or remove it by hand, see [refresh_index](#refresh_index)).
 - Cache files stay on the nodes after `unregister_index`.
 - A refresh builds on one node; its memory is the build memory above.
 - A node that missed a refresh answers "snapshot cache stale ... run vload"

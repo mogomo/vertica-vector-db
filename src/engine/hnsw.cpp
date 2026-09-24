@@ -116,7 +116,8 @@ VisitedPool &visited_pool()
 // Per-thread working memory of a build or a search.
 struct Worker {
     std::unique_ptr<Visited> visited;
-    std::vector<Cand> top, cand, sel, shrink;
+    std::vector<Cand> top, cand, shrink;
+    std::vector<std::vector<Cand>> sel_by_level;     // a build's selected neighbours of each level
     std::vector<std::uint32_t> links, fresh, sums;
     std::vector<float> keys;
     explicit Worker(std::uint64_t count) : visited(visited_pool().get(count)) {}
@@ -154,6 +155,11 @@ public:
 
     // Inserts position p (Algorithm 1 of the paper, as hnswlib's addPoint). Tombstoned positions
     // (incremental builds) are passed through but never chosen as neighbours, as in hnswlib.
+    // Two phases: first the searches of every level, top down, then the links, bottom up. While p
+    // searches, no node links to p, so no other thread can reach it; once p is linked on a level,
+    // its lists on the levels below are complete. (hnswlib links each level right after its search:
+    // a thread that reaches p on a level before p's lower levels are linked then only links to p and
+    // other such late nodes there.)
     void insert(std::uint32_t p, Worker &w)
     {
         const std::uint32_t level = levels_[p];
@@ -171,13 +177,16 @@ public:
         const float *q = s_.vector(p);
         Cand cur{distance_key(s_.metric, q, s_.vector(start), s_.row_stride), start};
         for (int l = top_level; l > static_cast<int>(level); --l) cur = greedy(q, cur, static_cast<std::uint32_t>(l), w);
-        for (int l = std::min(static_cast<int>(level), top_level); l >= 0; --l) {
-            search_layer(q, cur, static_cast<std::uint32_t>(l), w, true);
+        const int low_top = std::min(static_cast<int>(level), top_level);
+        if (w.sel_by_level.size() < static_cast<std::size_t>(low_top) + 1) w.sel_by_level.resize(low_top + 1);
+        for (int l = low_top; l >= 0; --l) {
+            std::vector<Cand> &sel = w.sel_by_level[l];
+            search_layer(q, cur, static_cast<std::uint32_t>(l), w, true, p);
             std::sort(w.top.begin(), w.top.end(), nearer);
-            select(w.top, m_, w.sel);
-            if (!w.sel.empty()) cur = w.sel.front();     // empty only when every node found is tombstoned
-            connect(p, static_cast<std::uint32_t>(l), w);
+            select(w.top, m_, sel);
+            if (!sel.empty()) cur = sel.front();         // empty only when every node found is tombstoned
         }
+        for (int l = 0; l <= low_top; ++l) connect(p, static_cast<std::uint32_t>(l), w.sel_by_level[l], w);
         if (static_cast<int>(level) > top_level) {
             entry_ = p;
             max_level_ = static_cast<int>(level);
@@ -307,14 +316,17 @@ private:
     }
 
     // Beam search of one level from ep with ef_construction: w.top holds the nearest found; with
-    // live_only, tombstoned nodes are passed through but not kept in w.top.
-    void search_layer(const float *q, Cand ep, std::uint32_t level, Worker &w, bool live_only)
+    // live_only, tombstoned nodes are passed through but not kept in w.top. self (the position being
+    // inserted) is never kept: a defence, the two-phase insert makes it unreachable anyway.
+    void search_layer(const float *q, Cand ep, std::uint32_t level, Worker &w, bool live_only,
+                      std::uint32_t self = HNSW_NO_UPPER)
     {
         Visited &seen = *w.visited;
         seen.next();
+        if (self != HNSW_NO_UPPER) seen.test_set(self);
         seen.test_set(ep.pos);
         w.top.clear();
-        if (!(live_only && s_.dead(ep.pos))) w.top.push_back(ep);
+        if (!(live_only && s_.dead(ep.pos)) && ep.pos != self) w.top.push_back(ep);
         w.cand.assign(1, ep);
         while (!w.cand.empty()) {
             const Cand c = w.cand.front();
@@ -361,26 +373,30 @@ private:
         }
     }
 
-    // Links p to the selected neighbours w.sel on a level, and each of them back to p. A full list
-    // is shrunk with the heuristic.
-    void connect(std::uint32_t p, std::uint32_t level, Worker &w)
+    // Links p to the selected neighbours sel on a level, and each of them back to p. A full list
+    // is shrunk with the heuristic. sel never holds p, and no list holds a position twice.
+    void connect(std::uint32_t p, std::uint32_t level, const std::vector<Cand> &sel, Worker &w)
     {
         const std::uint32_t cap = level == 0 ? m0_ : m_;
         {
-            // Other threads can reach p through its upper levels before p's insert gets down to this
-            // level, and link themselves to p here already: those links are kept, not overwritten.
+            // With the two-phase insert no other thread can link to p before this, so p's list is
+            // empty here. Links found anyway are kept, not overwritten (a defence).
             std::lock_guard<std::mutex> hold(lock_of(p));
             std::uint32_t *l = links(p, level);
             const std::uint32_t had = l[0];
             if (had == 0) {
-                l[0] = static_cast<std::uint32_t>(w.sel.size());
-                for (std::size_t i = 0; i < w.sel.size(); ++i) l[1 + i] = w.sel[i].pos;
+                std::uint32_t n = 0;
+                for (const Cand &c : sel)
+                    if (c.pos != p) l[1 + n++] = c.pos;
+                l[0] = n;
             } else {
-                w.shrink.assign(w.sel.begin(), w.sel.end());
+                w.shrink.clear();
+                for (const Cand &c : sel)
+                    if (c.pos != p) w.shrink.push_back(c);
                 for (std::uint32_t i = 0; i < had; ++i) {
                     const std::uint32_t x = l[1 + i];
-                    bool dup = false;
-                    for (const Cand &c : w.sel) dup |= c.pos == x;
+                    bool dup = x == p;
+                    for (const Cand &c : sel) dup |= c.pos == x;
                     if (!dup) w.shrink.push_back(Cand{key(p, x), x});
                 }
                 std::sort(w.shrink.begin(), w.shrink.end(), nearer);
@@ -390,10 +406,14 @@ private:
                 for (std::size_t i = 0; i < w.cand.size(); ++i) l[1 + i] = w.cand[i].pos;
             }
         }
-        for (const Cand &nb : w.sel) {
+        for (const Cand &nb : sel) {
+            if (nb.pos == p) continue;
             std::lock_guard<std::mutex> hold(lock_of(nb.pos));
             std::uint32_t *l = links(nb.pos, level);
             const std::uint32_t n = l[0];
+            bool linked = false;
+            for (std::uint32_t i = 1; i <= n; ++i) linked |= l[i] == p;
+            if (linked) continue;
             if (n < cap) {
                 l[1 + n] = p;
                 l[0] = n + 1;
@@ -713,6 +733,11 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
             if (x[0] > (lv == 0 ? g.m0 : g.m)) graph_fail("a link list is too long");
             for (std::uint32_t j = 1; j <= x[0]; ++j)
                 if (x[j] >= g.count || x[j] == i || g.levels[x[j]] < lv) graph_fail("a link points to a wrong position");
+            // Lists are short (at most 2m) and in cache: a pairwise check is cheaper than a lookup table.
+            std::uint32_t dup = 0;
+            for (std::uint32_t j = 2; j <= x[0]; ++j)
+                for (std::uint32_t k = 1; k < j; ++k) dup |= x[k] == x[j];
+            if (dup) graph_fail("a link list holds a position twice");
         }
     }
     if (blocks != g.upper_blocks) graph_fail("upper_blocks does not match the levels");

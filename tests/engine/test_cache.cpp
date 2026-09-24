@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace vvector;
@@ -83,6 +84,30 @@ int main()
     // Only directories with an ACTIVE file are listed.
     std::system(("mkdir -p " + dir + "/not_an_index").c_str());
     CHECK(list_cached_indexes(dir) == std::vector<std::string>({"g"}));
+
+    // Only regular files of this process's user are mapped: a search checks the header of a cache
+    // file, not every link, so it must never map a file someone else could have written.
+    {
+        MappedSnapshot m;
+        CHECK(throws([&] { m.open(dir + "/g", false); }, "not a regular file"));
+        const std::string fifo = dir + "/g/99.vv";
+        CHECK(mkfifo(fifo.c_str(), 0600) == 0);
+        CHECK(throws([&] { m.open(fifo, false); }, "not a regular file"));      // and does not block
+        ::unlink(fifo.c_str());
+        if (geteuid() == 0) {
+            const std::string other = dir + "/other";
+            std::system(("mkdir -p " + other + "/h && cp " + snapshot_path(dir, "g", 3) + " " + other + "/h/1.vv && echo 1 > " + other + "/h/ACTIVE").c_str());
+            CHECK(!throws([&] { m.open(other + "/h/1.vv", false); }));
+            CHECK(chown((other + "/h/1.vv").c_str(), 65534, 65534) == 0);
+            CHECK(throws([&] { m.open(other + "/h/1.vv", false); }, "not owned by the database's operating system user"));
+            CHECK(list_cached_indexes(other) == std::vector<std::string>({"h"}));
+            CHECK(chown((other + "/h").c_str(), 65534, 65534) == 0);
+            CHECK(list_cached_indexes(other).empty());
+            CHECK(throws([&] { m.open_active(other, "h"); }, "the directory is not owned by the database's operating system user"));
+        } else {
+            std::printf("  owner checks: skipped (they need root to make a file of another user)\n");
+        }
+    }
 
     // What ACTIVE says is trusted for ACTIVE_CHECK_MS, unless the caller needs a newer snapshot.
     {

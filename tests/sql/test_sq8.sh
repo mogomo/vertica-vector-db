@@ -81,12 +81,12 @@ SELECT 'journal ' || (SELECT COUNT(*) FROM $SCHEMA.journal) || ', queries ' || (
 for m in l2 cos dot l1; do
     metric=$m; [ "$m" = cos ] && metric=cosine
     expect "register vq_$m ($metric, hnsw), quantization sq8, refresh" "index vq_$m refreshed" "
-CALL vvector.register_index('vq_$m', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', '$metric', NULL, 'hnsw');
+CALL vvector.register_index('vq_$m', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', '$metric', 0, 'hnsw');
 CALL vvector.set_index_options('vq_$m', $SQ8);
 CALL vvector.refresh_index('vq_$m');"
 done
 expect "register vqf_l2 (l2, flat), quantization sq8, refresh" "index vqf_l2 refreshed" "
-CALL vvector.register_index('vqf_l2', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'flat');
+CALL vvector.register_index('vqf_l2', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'l2', 0, 'flat');
 CALL vvector.set_index_options('vqf_l2', $SQ8);
 CALL vvector.refresh_index('vqf_l2');"
 expect "manifest and vinfo on every node: sq8" "^sq8 on [1-9][0-9]* of [1-9][0-9]* nodes, same: t$" "

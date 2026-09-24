@@ -342,3 +342,12 @@ Check again on other versions.
   Grants given later in the install script apply to the renamed table.
 - `COUNT(*)` with a predicate on the leading sort columns costs 21 ms on a segmented table of 4
   nodes and 3 ms on an unsegmented one (the query goes to every node).
+- `v_monitor.sessions` (26.2.0-1, session 12): a superuser sees every session; a user without
+  superuser rights sees only its own sessions (two of its own, none of dbadmin's). A procedure run
+  by a schedule trigger (`CREATE TRIGGER ... ON SCHEDULE ... EXECUTE PROCEDURE p() AS DEFINER`) has a
+  session id in `v_monitor.current_session` (for example `v_vdb_node0001-1785267:0x1392e`), but that
+  session is never in `v_monitor.sessions`: not for the procedure itself (it counted 0 sessions
+  there) and not for a superuser polling every 5 s while the procedure slept 40 s. So the liveness
+  of a scheduled refresh cannot be read from `v_monitor.sessions`. A trigger with `CRON '* * * * *'`
+  fired at second 27 of every minute here. `CREATE OR REPLACE PROCEDURE` of a procedure a trigger
+  uses fails with "ROLLBACK 3128: DROP failed due to dependencies": drop the trigger first.

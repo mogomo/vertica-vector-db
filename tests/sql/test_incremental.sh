@@ -21,7 +21,13 @@
 #   bad mode is refused;
 # - one refresh at a time: a second refresh of an index that is being refreshed stops with an error
 #   (a real second refresh while the first waits for a lock, and a mark set by hand); status shows
-#   the running refresh; a mark older than 6 hours is ignored; a refresh that fails removes its mark.
+#   the running refresh; a mark whose session is gone is ignored at once; the mark of a scheduled
+#   refresh is ignored after 6 hours, or 4 times the last build time when that is longer; a refresh
+#   that fails removes its mark;
+# - rows after the boundary (an INT version column, margin 10): they are served by the delta, not built
+#   into the snapshot; a first refresh with no row up to the boundary stops with a message that says
+#   so; a physical DELETE of such a row before the next refresh never reaches the snapshot; a
+#   physical UPDATE of one is built with its new vector; neither needs a full build.
 # With --sift=SCHEMA (sift_base and sift_query of scripts/load_dataset.sh in that schema) also the
 # acceptance test of milestone M3: an HNSW index on 900,000 SIFT1M vectors, then 100 refreshes of
 # 1000 adds and 500 deletes each, tombstone_ratio 0.03 (a full build must fire on the way); at the
@@ -30,7 +36,7 @@
 # 2 GB of disk for the journal copy.
 #
 # Test data: schema VVINC (or --schema=NAME), dropped and recreated. Indexes vif_l2, vif_cos (flat),
-# vih_l2, vih_cos (hnsw), vi_static, vi_tiny, vi_empty, vi_sift.
+# vih_l2, vih_cos (hnsw), vi_static, vi_tiny, vi_empty, vi_int, vi_sift.
 #
 # Connection: vsql reads VSQL_HOST, VSQL_PORT, VSQL_USER, VSQL_PASSWORD, VSQL_DATABASE from the environment.
 set -uo pipefail
@@ -63,7 +69,7 @@ IX_PREFIX=vif_
 
 INDEXES="vif_l2 vif_cos vih_l2 vih_cos"
 unregister_all() {
-    run_sql "unregister" "$(for i in $INDEXES vi_static vi_tiny vi_empty vi_sift; do echo "CALL vvector.unregister_index('$i');"; done)" > /dev/null
+    run_sql "unregister" "$(for i in $INDEXES vi_static vi_tiny vi_empty vi_int vi_sift; do echo "CALL vvector.unregister_index('$i');"; done)" > /dev/null
 }
 value() {   # SQL -> its single value
     if [ "$ECHO_ONLY" = yes ]; then echo 1; return; fi
@@ -285,6 +291,42 @@ expect "the tiny index: manifest counts and status" "^vector_count 5, tombstones
 SELECT 'vector_count ' || vector_count || ', tombstones ' || tombstones || ', note: ' || LEFT(refresh_note, 9) FROM vvector.manifest WHERE index_name = 'vi_tiny';"
 expect "status of the tiny index" "5 live vectors, 1 tombstones" "CALL vvector.status('vi_tiny');"
 
+echo "== rows after the boundary: served by the delta, never built before they are below it"
+# INT versions: the boundary is the highest version minus the margin (10), so a new row with a
+# higher version moves it without waiting.
+q_int() {  # QUERY_VECTOR FRESHNESS: the nearest id through the view of that freshness
+    local view=vi_int_snap; [ "$2" = exact ] && view=vi_int_delta
+    echo "SELECT id FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='vi_int',
+          query='$1', k=1, freshness='$2', precision='exact') OVER() FROM $SCHEMA.$view) s;"
+}
+expect "a first refresh with no row up to the boundary: refused with the reason" \
+    "index vi_int: no live vector up to the delta boundary -5 .*; 5 rows of $SCHEMA.ints are newer: queries with freshness='exact' find them" "
+CREATE TABLE $SCHEMA.ints (id INT NOT NULL, vec ARRAY[FLOAT], del BOOLEAN NOT NULL DEFAULT FALSE, v INT NOT NULL);
+INSERT INTO $SCHEMA.ints (id, vec, v) SELECT id, ARRAY[id::FLOAT, 1.0, 0.0], id FROM ($(row_numbers 5)) g;
+COMMIT;
+CALL vvector.register_index('vi_int', '$SCHEMA.ints', 'id', 'vec', 'del', 'v', 'l2', 10, 'flat');
+CALL vvector.refresh_index('vi_int');"
+expect "rows below the boundary are built, the rows inside the margin are not" "index vi_int $FULL (first build), 5 vectors of 3 dimensions" "
+INSERT INTO $SCHEMA.ints (id, vec, v) VALUES (6, ARRAY[6.0, 1.0, 0.0], 20);
+INSERT INTO $SCHEMA.ints (id, vec, v) VALUES (7, ARRAY[7.0, 1.0, 0.0], 21);
+INSERT INTO $SCHEMA.ints (id, vec, v) VALUES (8, ARRAY[8.0, 1.0, 0.0], 22);
+COMMIT;
+CALL vvector.refresh_index('vi_int');"
+expect "a row inside the margin: not in the snapshot" "^5$" "$(q_int '[7, 1, 0]' snapshot)"
+expect "... but found through the delta" "^7$" "$(q_int '[7, 1, 0]' exact)"
+expect "a physical DELETE of that row, then a refresh: incremental, the row was never built" \
+    "index vi_int $INCR (2 vectors appended, 0 tombstoned), 7 vectors of 3 dimensions.*; journal verified" "
+DELETE FROM $SCHEMA.ints WHERE id = 7; COMMIT;
+INSERT INTO $SCHEMA.ints (id, vec, v) VALUES (9, ARRAY[9.0, 1.0, 0.0], 40); COMMIT;
+CALL vvector.refresh_index('vi_int');"
+expect "the deleted row is in no search" "^6$" "$(q_int '[7, 1, 0]' exact)"
+expect "a physical UPDATE of a row inside the margin, then a refresh: built with the new vector" \
+    "index vi_int $INCR (1 vectors appended, 0 tombstoned), 8 vectors of 3 dimensions.*; journal verified" "
+UPDATE $SCHEMA.ints SET vec = ARRAY[50.0, 1.0, 0.0] WHERE id = 9; COMMIT;
+INSERT INTO $SCHEMA.ints (id, vec, v) VALUES (10, ARRAY[10.0, 1.0, 0.0], 60); COMMIT;
+CALL vvector.refresh_index('vi_int');"
+expect "the snapshot holds the updated vector" "^9$" "$(q_int '[50, 1, 0]' snapshot)"
+
 echo "== one refresh at a time"
 # A real second refresh: the first holds its mark while it waits for a lock on vvector.snapshot (the
 # INSERT of its chunks), which another session keeps for a few seconds.
@@ -315,13 +357,25 @@ if [ "$ECHO_ONLY" = no ]; then
 fi
 expect "the mark is gone after the refresh" "^mark: 0$" "
 SELECT 'mark: ' || COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = 'vif_cos';"
-expect "a mark set by hand: refused, with the statement that removes it" "UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'vif_cos'" "
-UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '5 hours', refresh_started_by = 'someone, session x'
+expect "a mark whose session is gone: ignored at once (a superuser sees every session)" "index vif_cos refreshed" "
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '1 minute', refresh_started_by = 'someone, session x'
+    WHERE index_name = 'vif_cos'; COMMIT;
+CALL vvector.refresh_index('vif_cos');"
+# A refresh run by a schedule trigger has a session that v_monitor.sessions never shows: its mark
+# is judged by its age only.
+expect "a mark of a scheduled refresh: refused, with the statement that removes it" "UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'vif_cos'" "
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '5 hours', refresh_started_by = 'someone, scheduled, internal session x'
     WHERE index_name = 'vif_cos'; COMMIT;
 CALL vvector.refresh_index('vif_cos');"
 expect "a mark older than 6 hours is ignored" "index vif_cos refreshed" "
-UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '7 hours' WHERE index_name = 'vif_cos'; COMMIT;
+UPDATE vvector.manifest SET refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '7 hours', refresh_started_by = 'someone, scheduled, internal session x'
+    WHERE index_name = 'vif_cos'; COMMIT;
 CALL vvector.refresh_index('vif_cos');"
+expect "... unless the index builds long: the limit is 4 times the last build time" "ignored as soon as its session is gone .*, else 12 hours after its start" "
+UPDATE vvector.manifest SET build_seconds = 10800, refresh_started_at = CLOCK_TIMESTAMP() - INTERVAL '7 hours',
+       refresh_started_by = 'someone, scheduled, internal session x' WHERE index_name = 'vif_cos'; COMMIT;
+CALL vvector.refresh_index('vif_cos');"
+run_sql "remove the mark" "UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'vif_cos'; COMMIT;" > /dev/null
 expect "a refresh that fails reports its error" "vvector.refresh_index: index vi_empty: table $SCHEMA.empty has no vectors" "
 CREATE TABLE $SCHEMA.empty (id INT NOT NULL, vec ARRAY[FLOAT], del BOOLEAN NOT NULL DEFAULT FALSE, ts TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP());
 CALL vvector.register_index('vi_empty', '$SCHEMA.empty', 'id', 'vec', 'del', 'ts', 'l2', 0, 'flat');
@@ -341,8 +395,8 @@ INSERT INTO $SCHEMA.sift (id, vec, ts) SELECT id, vec, CLOCK_TIMESTAMP() - INTER
 CREATE TABLE $SCHEMA.sift_rounds (round INT, seconds FLOAT, client_ms INT, note VARCHAR(1000));
 COMMIT;
 SELECT 'journal ' || COUNT(*) FROM $SCHEMA.sift;"
-    expect "register (HNSW, l2, tombstone_ratio 0.03) and the full build" "index $IX $FULL (first build)" "
-CALL vvector.register_index('$IX', '$SCHEMA.sift', 'id', 'vec', 'del', 'ts', 'l2', NULL, 'hnsw');
+    expect "register (HNSW, l2, margin 0, tombstone_ratio 0.03) and the full build" "index $IX $FULL (first build)" "
+CALL vvector.register_index('$IX', '$SCHEMA.sift', 'id', 'vec', 'del', 'ts', 'l2', 0, 'hnsw');
 CALL vvector.set_index_options('$IX', NULL, NULL, NULL, NULL, NULL, 0.03, NULL, NULL, NULL, NULL, NULL, NULL);
 CALL vvector.refresh_index('$IX');"
     errors=0

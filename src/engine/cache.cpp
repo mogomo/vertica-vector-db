@@ -3,6 +3,7 @@
 #include "sq8.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -58,10 +59,18 @@ void sync_dir(const std::string &dir)
     if (!ok) fail("cannot sync directory", dir);
 }
 
+// The suffix of a temp file: unique per process and call (two sessions of one unfenced process can
+// write the same file at the same time).
+std::string temp_suffix()
+{
+    static std::atomic<unsigned> calls{0};
+    return ".tmp." + std::to_string(getpid()) + "." + std::to_string(++calls);
+}
+
 // Writes a small text file atomically: temp file, then rename.
 void write_atomically(const std::string &path, const std::string &content)
 {
-    const std::string tmp = path + ".tmp." + std::to_string(getpid());
+    const std::string tmp = path + temp_suffix();
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) fail("cannot create", tmp);
     const bool ok = ::write(fd, content.data(), content.size()) == static_cast<ssize_t>(content.size()) &&
@@ -73,15 +82,18 @@ void write_atomically(const std::string &path, const std::string &content)
     }
 }
 
-// The whole content of a small file, or false.
+// The whole content of a small regular file, or false. O_NONBLOCK: a FIFO in its place must not
+// block the query.
 bool read_small_file(const std::string &path, std::string &out)
 {
-    std::FILE *f = std::fopen(path.c_str(), "r");
-    if (!f) return false;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return false;
+    struct stat st;
     char buf[4096];
-    const std::size_t n = std::fread(buf, 1, sizeof(buf), f);
-    std::fclose(f);
-    out.assign(buf, n);
+    const ssize_t n = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) ? ::read(fd, buf, sizeof(buf)) : -1;
+    ::close(fd);
+    if (n < 0) return false;
+    out.assign(buf, static_cast<std::size_t>(n));
     return true;
 }
 
@@ -89,6 +101,15 @@ bool is_file(const std::string &path)
 {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// True if path exists and belongs to the user of this process (the database's operating system
+// user). vload makes every cache directory and file itself; a search maps a cache file without
+// checking all of it, so it must never map a file that someone else could have written.
+bool owned(const std::string &path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && st.st_uid == geteuid();
 }
 
 } // namespace
@@ -131,7 +152,8 @@ std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
     DIR *d = opendir(cache_dir.c_str());
     if (!d) return indexes;
     while (dirent *e = readdir(d))
-        if (valid_index_name(e->d_name) && is_file(cache_dir + "/" + e->d_name + "/ACTIVE")) indexes.push_back(e->d_name);
+        if (valid_index_name(e->d_name) && owned(cache_dir + "/" + e->d_name) && is_file(cache_dir + "/" + e->d_name + "/ACTIVE"))
+            indexes.push_back(e->d_name);
     closedir(d);
     std::sort(indexes.begin(), indexes.end());
     return indexes;
@@ -240,10 +262,12 @@ MappedSnapshot::~MappedSnapshot()
 
 void MappedSnapshot::open(const std::string &path, bool verify, bool compact)
 {
-    int fd = ::open(path.c_str(), O_RDONLY);
+    int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) fail("cannot open", path);
     struct stat st;
     if (fstat(fd, &st) != 0) { ::close(fd); fail("cannot stat", path); }
+    if (!S_ISREG(st.st_mode)) { ::close(fd); fail("not a regular file:", path, false); }
+    if (st.st_uid != geteuid()) { ::close(fd); fail("not owned by the database's operating system user (vload writes every cache file):", path, false); }
     if (st.st_size == 0) { ::close(fd); fail("empty snapshot file", path, false); }
     void *m = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
@@ -279,6 +303,12 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
                        st.snapshot_id >= at_least;
     if (!fresh) {
         std::int64_t id = 0;
+        struct stat dir_st;
+        if (stat(key.c_str(), &dir_st) == 0 && dir_st.st_uid != geteuid()) {
+            states.erase(key);
+            throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir +
+                                     ": the directory is not owned by the database's operating system user");
+        }
         if (!read_active(cache_dir, index, id)) {
             states.erase(key);
             throw std::runtime_error("no snapshot cache for index '" + index + "' in " + cache_dir + ": run vload");
@@ -345,7 +375,7 @@ void CacheWriter::begin(const std::string &cache_dir, const std::string &index, 
     make_dir(dir_);
     snapshot_id_ = snapshot_id;
     final_path_ = snapshot_path(cache_dir, index, snapshot_id);
-    tmp_path_ = final_path_ + ".tmp." + std::to_string(getpid());
+    tmp_path_ = final_path_ + temp_suffix();
     fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd_ < 0) fail("cannot create", tmp_path_);
 }

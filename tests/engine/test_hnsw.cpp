@@ -21,8 +21,9 @@
 using namespace vvector;
 
 // count vectors of dims elements in [-1, 1), ids 7, 12, 17, ...; clustered = every 10 rows share
-// a centre (gives ties and near duplicates); same = every row equal.
-enum class Shape { Random, Clustered, Same };
+// a centre (gives ties and near duplicates); same = every row equal; dups = clusters of 50 rows, half
+// of them equal to the centre, half within 1e-4 of it (the parallel insert race, review item 1).
+enum class Shape { Random, Clustered, Same, Dups };
 
 static void build_graph(TestSet &t, std::uint64_t count, std::uint32_t dims, Metric metric, std::uint32_t m,
                         std::uint32_t efc, int threads, Shape shape = Shape::Random, std::uint64_t seed = 3)
@@ -32,7 +33,12 @@ static void build_graph(TestSet &t, std::uint64_t count, std::uint32_t dims, Met
     for (std::uint64_t i = 0; i < count; ++i) {
         if (shape == Shape::Random) test_vector(i, dims, seed, true, v.data());
         else if (shape == Shape::Same) test_vector(0, dims, seed, true, v.data());
-        else {
+        else if (shape == Shape::Dups) {
+            test_vector(i / 50, dims, seed, true, c.data());
+            test_vector(i, dims, seed + 1, true, v.data());
+            const float spread = i % 2 == 0 ? 0.0f : 1e-4f;
+            for (std::uint32_t d = 0; d < dims; ++d) v[d] = c[d] + spread * v[d];
+        } else {
             test_vector(i / 10, dims, seed, true, c.data());
             test_vector(i, dims, seed + 1, true, v.data());
             for (std::uint32_t d = 0; d < dims; ++d) v[d] = c[d] + 0.01f * v[d];
@@ -85,6 +91,44 @@ static std::uint64_t reachable(const HnswGraph &g)
             if (!seen[l[i]]) { seen[l[i]] = 1; ++n; todo.push_back(l[i]); }
     }
     return n;
+}
+
+// No link list on any level holds its own node or one position twice. hnsw_open(verify) checks
+// the same, but this reports what it found.
+static std::uint64_t bad_links(const HnswGraph &g)
+{
+    std::uint64_t bad = 0;
+    for (std::uint32_t p = 0; p < g.count; ++p)
+        for (std::uint32_t lv = 0; lv <= g.levels[p]; ++lv) {
+            const std::uint32_t *l = g.links(p, lv);
+            for (std::uint32_t i = 1; i <= l[0]; ++i) {
+                bad += l[i] == p;
+                for (std::uint32_t j = 1; j < i; ++j) bad += l[j] == l[i];
+            }
+        }
+    return bad;
+}
+
+// Parallel builds of many equal and near-equal vectors (review item 1 of session 11: a node could
+// find itself through a neighbour that another thread had linked to it, and link to itself). Every
+// build must give a clean graph: no self link, no duplicate link, every node reachable.
+static void test_parallel_duplicates()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int round = 0; round < 5; ++round) {
+        TestSet t;
+        build_graph(t, 200000, 16, Metric::L2, 8, 32, 8, Shape::Dups, 40 + round);
+        const HnswGraph g = hnsw_open(t.set, false);
+        const std::uint64_t bad = bad_links(g), reached = reachable(g);
+        if (bad != 0 || reached != t.set.count)
+            std::printf("  duplicates round %d: %llu bad links, %llu of %llu reachable\n", round,
+                        (unsigned long long)bad, (unsigned long long)reached, (unsigned long long)t.set.count);
+        CHECK(bad == 0);
+        CHECK(reached == t.set.count);
+        CHECK(!throws([&] { hnsw_open(t.set, true); }));
+    }
+    std::printf("  5 parallel builds of 200000 x 16 with duplicates: %.1f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 // ef = count on a connected graph visits every node: the result is the exact one.
@@ -159,6 +203,10 @@ static void test_layout_and_validity()
     restore();
     link[0] = 13;                                       // longer than m0
     CHECK(throws([&] { open_copy(true); }, "too long"));
+    restore();
+    CHECK(link[0] >= 2);
+    link[2] = link[1];                                  // one position twice in a list
+    CHECK(throws([&] { open_copy(true); }, "holds a position twice"));
     restore();
     h->entry_point = 3000;
     CHECK(throws([&] { open_copy(false); }, "entry point"));
@@ -395,6 +443,7 @@ int main(int argc, char **argv)
     exact_at_full_ef("l2 all equal", Metric::L2, Shape::Same);
     test_masks_journal_radius();
     test_threads_and_determinism();
+    test_parallel_duplicates();
     test_sift(dir);
     return finish("test_hnsw");
 }

@@ -453,6 +453,66 @@ static void test_sift(const std::string &dir)
     }
 }
 
+// Vector i of clusters of 50: even i equal to the centre of its cluster, odd i within 1e-4 of it.
+static std::vector<float> dup_vector(std::int64_t i, std::uint32_t dims, std::uint64_t seed)
+{
+    std::vector<float> c(dims), v(dims);
+    test_vector(static_cast<std::uint64_t>(i / 50), dims, seed, true, c.data());
+    test_vector(static_cast<std::uint64_t>(i), dims, seed + 1, true, v.data());
+    const float spread = i % 2 == 0 ? 0.0f : 1e-4f;
+    for (std::uint32_t d = 0; d < dims; ++d) v[d] = c[d] + spread * v[d];
+    return v;
+}
+
+// Parallel inserts of equal and near-equal vectors into an extended graph with tombstones (review
+// item 1 of session 11, the incremental path): every round must pass the full verification (no self
+// link, no position twice in a list) and keep every live node reachable.
+static void test_parallel_duplicates()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint32_t dims = 16;
+    HnswParams hp;
+    hp.m = 8;
+    hp.ef_construction = 32;
+    hp.threads = 8;
+    Live live;
+    for (std::int64_t i = 0; i < 100000; ++i) live[i] = dup_vector(i, dims, 5);
+    TestSet cur;
+    full_build(cur, live, Metric::L2, &hp);
+    Rng rng(17);
+    std::int64_t next_id = 100000;
+    for (int round = 1; round <= 3; ++round) {
+        std::vector<Change> ch;
+        std::set<std::int64_t> touched;
+        for (int i = 0; i < 5000; ++i) {                             // deletes
+            const std::int64_t id = rng.below(next_id);
+            if (live.count(id) && touched.insert(id).second) ch.push_back(Change{id, true, {}});
+        }
+        for (int i = 0; i < 30000; ++i) {                            // new ids in the old clusters
+            const std::int64_t id = next_id++;
+            ch.push_back(Change{id, false, dup_vector(id % 100000, dims, 5)});
+        }
+        for (const Change &c : ch) {
+            if (c.del) live.erase(c.id);
+            else live[c.id] = c.vec;
+        }
+        TestSet next;
+        bool ok = false;
+        const bool threw = throws([&] { ok = incremental(next, cur, ch, &hp, 200 + round); });
+        CHECK(!threw && ok);
+        if (threw || !ok) return;
+        std::uint64_t reached = 0, alive = 0;
+        reachable_live(next.set, hnsw_open(next.set, true), reached, alive);
+        if (reached != alive || alive != live.size())
+            std::printf("  duplicates round %d: %llu of %llu live reachable, %llu live expected\n", round,
+                        (unsigned long long)reached, (unsigned long long)alive, (unsigned long long)live.size());
+        CHECK(reached == alive && alive == live.size());
+        take(cur, next);
+    }
+    std::printf("  3 incremental rounds of 30000 duplicates on 8 threads: %.1f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 int main(int argc, char **argv)
 {
     std::string dir;
@@ -464,6 +524,7 @@ int main(int argc, char **argv)
     rounds("hnsw l2", Metric::L2, true);
     rounds("hnsw cosine", Metric::Cosine, true);
     rounds("hnsw dot", Metric::Dot, true);
+    test_parallel_duplicates();
     test_sift(dir);
     return finish("test_delta");
 }

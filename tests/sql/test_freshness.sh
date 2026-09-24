@@ -81,7 +81,7 @@ INSERT INTO $SCHEMA.journal (id, vec, ts) SELECT id, $VEC, CLOCK_TIMESTAMP() - I
 COMMIT;
 SELECT 'journal rows: ' || COUNT(*) FROM $SCHEMA.journal;"
 
-expect "register_index" "index $IX registered" "CALL vvector.register_index('$IX', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', NULL);"
+expect "register_index (margin 0: every refresh below builds every row written before it)" "index $IX registered" "CALL vvector.register_index('$IX', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', 0);"
 expect "register_index refuses a second registration" "already registered" "CALL vvector.register_index('$IX', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', NULL);"
 expect "register_index refuses a bad identifier" "plain identifiers" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id; DROP TABLE x', 'vec', NULL, NULL, 'l2', NULL);"
 expect "register_index refuses a column that is not an array" "must be ARRAY\[FLOAT\], ARRAY\[INT\] or ARRAY\[NUMERIC\]" "CALL vvector.register_index('vvbad', '$SCHEMA.journal', 'id', 'ts', NULL, NULL, 'l2', NULL);"
@@ -185,6 +185,22 @@ SELECT 'visible during the open transaction: ' || COUNT(*) FROM $SCHEMA.${IX}_de
 [ "$ECHO_ONLY" = yes ] || wait $WRITER
 expect "after the late commit the row is in the delta view, without another refresh" "^visible after the commit: 1$" "
 SELECT 'visible after the commit: ' || COUNT(*) FROM $SCHEMA.${IX}_delta WHERE id = 900777777;"
+
+echo "== the default margin (60 s): rows of the last minute before a refresh stay in the delta"
+ALT=$(printf '5.0, -5.0, %.0s' $(seq 1 $((DIMS / 2)))); ALT="ARRAY[${ALT%, }]"
+ALT_Q=$(printf '5, -5, %.0s' $(seq 1 $((DIMS / 2)))); ALT_Q="[${ALT_Q%, }]"
+nearest_m() {  # VIEW FRESHNESS: the nearest id to ALT through that view of index ${IX}_m
+    echo "SELECT id FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='${IX}_m',
+          query='$ALT_Q', k=1, freshness='$2', precision='exact') OVER() FROM $SCHEMA.${IX}_m_$1) s;"
+}
+expect "register with the default margin and refresh right after a new row" "index ${IX}_m refreshed: snapshot [0-9]*, full build (first build)" "
+CALL vvector.unregister_index('${IX}_m');
+INSERT INTO $SCHEMA.journal (id, vec) VALUES (900999999, $ALT); COMMIT;
+CALL vvector.register_index('${IX}_m', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', 'cosine', NULL, 'flat');
+CALL vvector.refresh_index('${IX}_m');"
+expect "the new row is not in the snapshot: its nearest there is another id" "^ok$" "SELECT CASE WHEN id <> 900999999 THEN 'ok' ELSE 'the row is in the snapshot' END FROM ($(nearest_m snap snapshot | sed 's/;$//')) x;"
+expect "... and found through the delta with freshness='exact'" "^900999999$" "$(nearest_m delta exact)"
+run_sql "unregister ${IX}_m" "CALL vvector.unregister_index('${IX}_m'); DELETE FROM $SCHEMA.journal WHERE id = 900999999; COMMIT;" > /dev/null
 
 echo "== journal replica (an unsegmented projection of the journal, so the delta is read on one node)"
 REP="${IX}_journal_rep"

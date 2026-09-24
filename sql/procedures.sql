@@ -720,7 +720,7 @@ DECLARE
     prev_vec INT; prev_tomb INT; prev_max INT; rows_then INT; rows_now INT; rows_next INT; want INT; got INT; counts VARCHAR(200);
     digest_then VARCHAR(64); digest_now VARCHAR(64); digest_next VARCHAR(64); h_expr VARCHAR(600);
     v_every INT; v_since INT; verify BOOLEAN; t_scan TIMESTAMPTZ; scan_secs FLOAT; j_note VARCHAR(300);
-    why VARCHAR(600); r_note VARCHAR(1000); build_opts VARCHAR(400);
+    why VARCHAR(600); r_note VARCHAR(2400); build_opts VARCHAR(400); w_since TIMESTAMPTZ; lag_note VARCHAR(600); young INT;
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
@@ -781,7 +781,8 @@ BEGIN
     --    The margin only has to cover clock differences between nodes and versions taken at statement
     --    start (SYSDATE) instead of at write time (CLOCK_TIMESTAMP).
     --    INT version: highest version minus the margin; the margin has to cover open writers.
-    --    Rows that are in both the snapshot and the delta are harmless.
+    --    The snapshot holds exactly the rows up to the boundary (the rows the digest below covers);
+    --    the rows after it are served by the delta view until the next refresh.
     --    The highest version (the watermark in the manifest and the snapshot header; for an INT version
     --    also the boundary) is read from the rows after the previous boundary only: the rows before it
     --    were there at the last refresh, which recorded their highest version.
@@ -799,12 +800,16 @@ BEGIN
             max_ver := EXECUTE 'SELECT MAX((EXTRACT(EPOCH FROM ' || ver || ') * 1000000)::INT) FROM ' || tab
                 || CASE WHEN prev_from IS NULL OR prev_max IS NULL THEN '' ELSE ' WHERE ' || ver || ' > ' || prev_from END;
             max_ver := GREATEST(COALESCE(max_ver, 0), COALESCE(prev_max, 0));
-            cut := (SELECT LEAST(CLOCK_TIMESTAMP(), COALESCE(MIN(request_timestamp), CLOCK_TIMESTAMP()))
-                    FROM v_monitor.locks
-                    WHERE LOWER(object_name) = LOWER('Table:' || tab)
-                      AND (lock_mode ILIKE '%I%' OR lock_mode = 'X')
-                      AND transaction_id <> (SELECT transaction_id FROM v_monitor.current_session));
-            cut := (SELECT cut - (margin // 1000000) * INTERVAL '1 second');
+            w_since := (SELECT MIN(request_timestamp) FROM v_monitor.locks
+                        WHERE LOWER(object_name) = LOWER('Table:' || tab)
+                          AND (lock_mode ILIKE '%I%' OR lock_mode = 'X')
+                          AND transaction_id <> (SELECT transaction_id FROM v_monitor.current_session));
+            cut := (SELECT LEAST(CLOCK_TIMESTAMP(), COALESCE(w_since, CLOCK_TIMESTAMP())) - (margin // 1000000) * INTERVAL '1 second');
+            -- An open writer holds the boundary back: everything after its start stays in the delta.
+            IF w_since IS NOT NULL AND DATEDIFF('second', w_since, CLOCK_TIMESTAMP()) > GREATEST(10 * (margin // 1000000), 60) THEN
+                lag_note := 'the boundary lags ' || DATEDIFF('minute', w_since, CLOCK_TIMESTAMP()) || ' minutes behind: a transaction has been writing to '
+                         || tab || ' since ' || TO_CHAR(w_since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC (v_monitor.locks); its rows and all later rows stay in the delta until it ends';
+            END IF;
             IF ver_type ILIKE 'timestamptz%' OR ver_type ILIKE '%with time zone%' THEN
                 v_from := (SELECT 'TIMESTAMPTZ ''' || TO_CHAR(cut AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00''');
             ELSE
@@ -912,16 +917,18 @@ BEGIN
     --    with the same version: the delete wins. Without a version column every id must appear once
     --    (vbuild refuses a repeated id).
     --    Incremental: the latest row of every id after the previous boundary, deletes included.
+    --    Both read the rows up to the new boundary only: the snapshot holds exactly the rows the digest
+    --    covers, so a physical DELETE or UPDATE of any row in it is found by the next verification.
     IF why IS NULL THEN
         source := 'SELECT id, vec, del FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
                || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC, ' || del_expr || ' DESC) AS rn FROM ' || tab
-               || ' WHERE ' || idc || ' IS NOT NULL AND ' || ver || ' > ' || prev_from || ') j WHERE rn = 1';
+               || ' WHERE ' || idc || ' IS NOT NULL AND ' || ver || ' > ' || prev_from || ' AND ' || ver || ' <= ' || v_from || ') j WHERE rn = 1';
     ELSIF ver IS NULL THEN
         source := 'SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, FALSE AS del FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL';
     ELSE
         source := 'SELECT id, vec, FALSE AS del FROM (SELECT ' || idc || '::INT AS id, ' || v_expr || ' AS vec, ' || del_expr || ' AS del, '
                || 'ROW_NUMBER() OVER(PARTITION BY ' || idc || ' ORDER BY ' || ver || ' DESC, ' || del_expr || ' DESC) AS rn FROM ' || tab
-               || ' WHERE ' || idc || ' IS NOT NULL) j WHERE rn = 1 AND NOT del';
+               || ' WHERE ' || idc || ' IS NOT NULL AND ' || ver || ' <= ' || v_from || ') j WHERE rn = 1 AND NOT del';
     END IF;
 
     -- 4. Build and store the chunks. vbuild sorts by id itself: no ORDER BY, no sort of the table.
@@ -936,6 +943,13 @@ BEGIN
          || ') OVER() FROM (' || source || ') e) b';
     PERFORM COMMIT;
     chunks := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+    IF chunks = 0 AND why IS NOT NULL AND ver IS NOT NULL THEN
+        young := EXECUTE 'SELECT COUNT(*) FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL AND ' || ver || ' > ' || v_from;
+        IF young > 0 THEN
+            RAISE EXCEPTION 'vvector.refresh_index: index %: no live vector up to the delta boundary % (the margin before now or before the oldest open writer); % rows of % are newer: queries with freshness=''exact'' find them through the delta view. Refresh again when the margin has passed, or register the index with a smaller margin',
+                            nm, v_from, young, tab;
+        END IF;
+    END IF;
     IF chunks = 0 AND why IS NOT NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index %: table % has no vectors, nothing to build', nm, tab;
     END IF;
@@ -945,9 +959,9 @@ BEGIN
         -- boundary. Only the boundary moves; nothing is loaded.
         secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
         r_note := 'refreshed: snapshot ' || prev || ' kept, no vector changed since it was built; the delta starts at the new boundary; '
-               || secs || ' seconds' || COALESCE('; ' || j_note, '');
+               || secs || ' seconds' || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '');
         PERFORM UPDATE vvector.manifest SET active_max_ver = max_ver, delta_from = v_from, boundary_rows = rows_next,
-                       boundary_digest = digest_next::NUMERIC(38,0), refreshes_since_verify = CASE WHEN verify THEN 0 ELSE v_since + 1 END, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = r_note
+                       boundary_digest = digest_next::NUMERIC(38,0), refreshes_since_verify = CASE WHEN verify THEN 0 ELSE v_since + 1 END, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = LEFT(r_note, 1000)
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
@@ -973,13 +987,13 @@ BEGIN
             r_note := 'refreshed: snapshot ' || sid || ', full build (' || why || '), ';
         END IF;
         r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
-               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds' || COALESCE('; ' || j_note, '');
+               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds' || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '');
         PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
                        base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
                        graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
                        active_options = opts, incremental_count = CASE WHEN why IS NULL THEN since + 1 ELSE 0 END,
                        boundary_rows = rows_next, boundary_digest = digest_next::NUMERIC(38,0),
-                       refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = r_note
+                       refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = LEFT(r_note, 1000)
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
@@ -1001,11 +1015,15 @@ $$;
 -- conditional UPDATE: the UPDATE of a second refresh waits for the lock on the manifest, then finds
 -- the mark and changes nothing, and that refresh stops with an error. The mark is removed when the
 -- refresh ends, also when it fails. A mark left behind by a refresh that could not remove it (its
--- session was killed, its node went down) is ignored after 6 hours, or removed by hand (the error
--- message gives the statement).
+-- session was killed, its node went down) is ignored at once when its session is gone from
+-- v_monitor.sessions, which a superuser sees completely and another user for its own sessions only
+-- (so that check covers the marks of the caller's own sessions). A refresh run by a schedule trigger
+-- has a session that v_monitor.sessions never shows (VERTICA_NOTES): its mark says "scheduled" and is
+-- never judged by its session. Otherwise a mark is ignored after 6 hours or 4 times the index's last
+-- build time, whichever is longer, or removed by hand (the error message gives the statement).
 CREATE OR REPLACE PROCEDURE vvector.refresh_index_core(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    me VARCHAR(200); t_start TIMESTAMPTZ; holder VARCHAR(200); since TIMESTAMPTZ;
+    me VARCHAR(200); t_start TIMESTAMPTZ; holder VARCHAR(200); since TIMESTAMPTZ; gone BOOLEAN; keep_s INT; my_session VARCHAR(200);
 BEGIN
     IF (SELECT COUNT(*) FROM vvector.manifest WHERE index_name = nm) = 0 THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
@@ -1013,16 +1031,32 @@ BEGIN
     IF x_mode IS NOT NULL AND x_mode NOT IN ('auto', 'incremental', 'full') THEN
         RAISE EXCEPTION 'vvector.refresh_index: mode must be auto, incremental or full';
     END IF;
-    me := (SELECT CURRENT_USER() || ', session ' || session_id FROM v_monitor.current_session);
+    my_session := (SELECT session_id FROM v_monitor.current_session);
+    IF (SELECT COUNT(*) FROM v_monitor.sessions WHERE session_id = my_session) > 0 THEN
+        me := CURRENT_USER() || ', session ' || my_session;
+    ELSE
+        me := CURRENT_USER() || ', scheduled, internal session ' || my_session;
+    END IF;
     t_start := (SELECT CLOCK_TIMESTAMP());
+    holder := (SELECT MAX(refresh_started_by) FROM vvector.manifest WHERE index_name = nm AND refresh_started_at IS NOT NULL);
+    gone := FALSE;
+    IF holder IS NOT NULL AND POSITION(', session ' IN holder) > 0 THEN
+        IF (SELECT COUNT(*) FROM v_catalog.users WHERE user_name = CURRENT_USER() AND is_super_user) > 0
+           OR SPLIT_PART(holder, ', session ', 1) = CURRENT_USER() THEN
+            gone := (SELECT COUNT(*) FROM v_monitor.sessions WHERE session_id = SPLIT_PART(holder, ', session ', 2)) = 0;
+        END IF;
+    END IF;
+    keep_s := (SELECT GREATEST(21600, 4 * COALESCE(MAX(build_seconds), 0))::INT FROM vvector.manifest WHERE index_name = nm);
     PERFORM UPDATE vvector.manifest SET refresh_started_at = t_start, refresh_started_by = me
-            WHERE index_name = nm AND (refresh_started_at IS NULL OR refresh_started_at < t_start - INTERVAL '6 hours');
+            WHERE index_name = nm AND (refresh_started_at IS NULL OR refresh_started_at < t_start - keep_s * INTERVAL '1 second'
+                                       OR (gone AND refresh_started_by = holder));
     PERFORM COMMIT;
     since := (SELECT MAX(refresh_started_at) FROM vvector.manifest WHERE index_name = nm);
     holder := (SELECT MAX(refresh_started_by) FROM vvector.manifest WHERE index_name = nm);
     IF since IS NULL OR since <> t_start OR COALESCE(holder, '') <> me THEN
-        RAISE EXCEPTION 'vvector.refresh_index: index % is being refreshed since % (by %). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored 6 hours after its start, or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = ''%''; COMMIT;',
-                        nm, COALESCE(TO_CHAR(since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC', '?'), COALESCE(holder, '?'), nm;
+        RAISE EXCEPTION 'vvector.refresh_index: index % is being refreshed since % (by %). Two refreshes of one index cannot run at the same time: wait until it ends. If it no longer runs (its session was killed or its node went down), the mark is ignored as soon as its session is gone (seen by a superuser, or by the same user), else % hours after its start (6, or 4 times the last build time), or a vvector_admin removes it: UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = ''%''; COMMIT;',
+                        nm, COALESCE(TO_CHAR(since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC', '?'), COALESCE(holder, '?'),
+                        ROUND(keep_s / 3600.0)::INT, nm;
     END IF;
     BEGIN
         PERFORM CALL vvector.refresh_index_run(nm, x_mode);

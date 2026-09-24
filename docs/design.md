@@ -95,11 +95,23 @@ follow hnswlib, the code is our own.
 - Parallel build: a thread takes the next 64 positions at a time. Link lists
   are protected by 65536 striped mutexes (never two held at once); the global
   mutex is held only by an insert whose node becomes the new entry point.
-  Another thread can reach a node through its upper levels before that
-  node's insert gets down to a lower level and link itself to it there;
-  those links are merged when the insert writes the node's list, not
-  overwritten (a first version lost them: 0.5% of the nodes of a 4-thread
-  build had no incoming link).
+- Two phases per insert (milestone M6): first the searches of every level of
+  the new node, top down, keeping the selected neighbours of each level; then
+  the links, bottom up. hnswlib links each level right after its search, so
+  another thread can reach the new node on an upper level while its lower
+  levels are still empty, start its own lower-level search there and end up
+  linked only to the new node and other such late nodes (a first version of
+  ours even lost those links: 0.5% of the nodes of a 4-thread build had no
+  incoming link). With two phases nothing links to a node while it searches,
+  so it can never find itself, and when a level is linked the levels below
+  are complete. Recall and build time on SIFT1M are the same as before
+  (recall@10 at ef 100 0.9829 against 0.9827 to 0.9830, 33.9 s on the VM).
+  Defences on top: a search never keeps the node being inserted, a back link
+  is not added twice, and the full check of a graph (vload, the base of an
+  incremental build) refuses a self link and a position listed twice (+35 ms
+  per million vectors). `test_hnsw` and `test_delta` build 200,000 vectors in
+  clusters of equal and near-equal ones on 8 threads, full and incremental
+  with tombstones, and check every list.
 - Reachability repair: the heuristic can prune the last link to a node; such
   a node can never be found (hnswlib has the same effect, mostly with small m
   or many equal vectors). After the inserts, one thread walks level 0 from
@@ -353,6 +365,15 @@ project this code comes from):
   (address space only: the pages are file cache of the operating system).
   Fenced, it lives in the session's fenced process.
 - Directories are created with mode 0700, files with 0600.
+- A query maps a cache file after checking its header only (a full check of a
+  large file per new mapping is impossible), so its safety rests on "vload
+  wrote this file". The search functions are PUBLIC and cache_dir can be set
+  by any user, so the mapping refuses a file that is not a regular file or
+  not owned by the database's operating system user, and an index directory
+  owned by someone else counts as no cache (vinfo does not list it). Opens are
+  non-blocking (a FIFO in place of a file cannot hang a query). Temp files
+  are named `<file>.tmp.<pid>.<n>`: two sessions of one unfenced process that
+  write the same OPTIONS file at once no longer share a temp file.
 
 ## Memory
 
@@ -412,8 +433,18 @@ unique, it can change, and it cannot be part of a projection.
 - vsearch with `freshness='exact'`: ids that appear in the delta are masked
   in the snapshot; their latest delta row, if it is not a delete, is searched
   exactly next to the snapshot; the two are merged into one top-k. Applying
-  is idempotent, so rows inside the margin (in the snapshot and in the delta)
-  are harmless. `freshness='snapshot'` (the default) ignores journal rows.
+  is idempotent. `freshness='snapshot'` (the default) ignores journal rows.
+- The build reads the journal rows up to the boundary only (milestone M6), so
+  the snapshot and the delta never overlap and the snapshot holds exactly the
+  rows the journal digest covers. Before, rows inside the margin went into
+  the snapshot too; a physical DELETE or UPDATE of such a row before the next
+  refresh was then seen by no verification (the digest covers the rows up to
+  the boundary) and stayed in the index until a full build. The price: a
+  snapshot-only query does not see the rows of the last margin seconds before
+  the refresh (60 s by default), and a refresh that finds no live vector up
+  to the boundary (the first refresh right after a load) stops with a message
+  that says so. An open writer holds the boundary back; when it is older than
+  ten times the margin (at least 60 s), the refresh note says so.
   `tests/sql/test_search.sh` checks the result against the full scan of the
   live rows after 1000 adds, 1000 deletes and 500 replacements.
 - Stale cache: if the node's active snapshot is older than the snapshot id on
@@ -423,6 +454,17 @@ unique, it can change, and it cannot be part of a projection.
   nodes, index defaults on all nodes, update manifest and views, delete older
   snapshots. An incremental refresh (next section) keeps the order; only the
   build reads less.
+- One refresh per index at a time: a refresh marks the manifest row with one
+  conditional UPDATE (`refresh_started_at`, `refresh_started_by` = user and
+  session) and removes the mark at the end, also on error. A mark whose
+  session is gone from `v_monitor.sessions` is ignored at once (milestone M6),
+  so a killed refresh no longer blocks the index for hours. A superuser sees
+  every session there, another user only its own, so the check covers what
+  the caller can see. A refresh run by a schedule trigger runs in a session
+  that `v_monitor.sessions` never shows (VERTICA_NOTES): its mark says
+  "scheduled" and is judged by its age only. The age limit is 6 hours or 4
+  times the index's last build time, whichever is longer, so a 100M build of
+  3 hours keeps its mark for 12.
 
 ## Incremental refresh (milestone M3)
 
