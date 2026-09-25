@@ -92,7 +92,10 @@ class VBuild : public TransformFunction
                 const std::string node = srvInterface.getCurrentNodeName();
                 const std::string path = vvector::snapshot_path(resolve_cache_dir(srvInterface), name, base);
                 try {
-                    from.open(path, true);
+                    // The base is verified (read in full, checksum) only once rows have arrived: a
+                    // refresh with nothing changed sends no rows, and reading a 63 GB base for it
+                    // cost 83 s on the 100M proof.
+                    from.open(path, false, false, false);
                     copy.open(path, false, false, false, true);
                 } catch (const std::runtime_error &e) {
                     fail("index '" + name + "': base snapshot " + std::to_string(base) + " is not usable in the cache of " + node +
@@ -117,6 +120,13 @@ class VBuild : public TransformFunction
                                 "the vector of id " + std::to_string(id));
                     builder.end_add();
                 } while (in.next());
+                if (builder.rows() == 0) return;                    // nothing changed: no rows out
+                try {
+                    vvector::snapshot_open(from.data(), from.size(), true);
+                } catch (const std::runtime_error &e) {
+                    fail("index '" + name + "': base snapshot " + std::to_string(base) + " is damaged in the cache of " + node +
+                         " (" + e.what() + "): run vload there, or refresh with mode full");
+                }
                 try {
                     // In place on the copy-on-write mapping when the base's layout has room; the
                     // changed bytes are found against the read-only mapping and the checksum comes
