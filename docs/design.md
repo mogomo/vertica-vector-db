@@ -1004,8 +1004,10 @@ removes each:
   VM and RHEL 8 have) when the patch has at most 64 runs, because every write
   into a reflinked file then unshares an extent (copy-on-write: 3 ms per
   scattered 512-byte write measured on xfs, 300 s for 100,000, against 1.3 s
-  into a plain copy that cost 0.35 s); a copy (copy_file_range, else read and
-  write) for a patch of more runs, which every graph patch is. The runs are
+  into a plain copy that cost 0.35 s); a copy by read and write for a patch of
+  more runs, which every graph patch is (not copy_file_range: on xfs that is a
+  reflink too, 0.01 s for 620 MB with every extent shared, and the scattered
+  writes then cost 437 s instead of 0.7 s; session 19). The runs are
   then written over it. The checksum of the new file comes from the base's
   and the runs (the checksum is an XOR over words), so the build reads no more
   than it compares; vload verifies the assembled file in full, as always.
@@ -1031,8 +1033,31 @@ compete for memory. The id index of random (non-ascending) ids shifts from the
 first inserted id on: up to 4 bytes per vector travel then; ascending ids (the
 usual journal) change its tail only.
 
-Measured (session 17): see "Incremental transfer measured" below, filled when
-the 10M and 100M runs of this milestone are in.
+Measured on the 3-node Eon cluster (2 cores and 15 GB per node; 900,000
+random vectors of 128 dimensions, `scripts/benchmark.sh --parts=incremental`,
+fenced; every number is one `refresh_index` call, and its vbuild and vload
+statements from the request log). Before M7 the whole snapshot was built,
+stored and loaded again; after M7 only the changed bytes move:
+
+| adds + deletes | flat: before | flat: M7 (vbuild / vload) | HNSW: before | HNSW: M7 (vbuild / vload) |
+|---|---:|---:|---:|---:|
+| 100 + 50 | 18.9 s | 5.9 s (0.2 / 2.6) | 27.2 s | 8.3 s (1.6 / 3.7) |
+| 1000 + 500 | 19.6 s | 6.4 s (0.7 / 2.6) | 25.3 s | 11.5 s (2.2 / 5.9) |
+| 10000 + 5000 | 17.9 s | 6.7 s (1.4 / 2.6) | 23.9 s | 12.4 s (4.0 / 5.8) |
+| 50000 + 25000 | 21.5 s | 25.5 s (13.5 / 7.8) | 36.0 s | 41.6 s (26.1 / 11.2) |
+| a whole load, for comparison | | 4.5-4.9 s | | 7.9-8.9 s |
+
+The vbuild statement fell from 11 to 17 s to under a second (flat) and 1.6
+to 4 s (HNSW: the graph inserts, then the comparison of the graph with the
+base). The vload of a patch is the copy of the base file plus the
+verification of the new file: it no longer grows with the runs of the patch
+once the copy is by read and write (with copy_file_range, a reflink on xfs,
+it took 7.6, 12.4 and 26 s for the three HNSW rows). The 50,000-change row
+exceeds the 5% room of the layout: the whole snapshot travels once, an
+incremental build, at the cost before M7. What remains per refresh, 2.6 to 4
+s here, is the boundary, the journal verification (0.15 s), the INSERT of the
+patch rows, the manifest and the views. 10M and 100M on the 4-node cluster:
+below, when measured.
 
 ### Journal digest (M3 follow-up)
 

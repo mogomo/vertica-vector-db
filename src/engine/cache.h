@@ -132,9 +132,10 @@ public:
     // base_snapshot > 0: the file starts as a copy of <index>/<base_snapshot>.vv in the same
     // directory, which must be a regular file of this user; the pieces are then written over it.
     // Throws when the base is missing. reflink: a reflink clone where the file system has it (xfs
-    // reflink=1, btrfs), else a copy. A reflink is free, but every write into it then unshares an
-    // extent (copy-on-write): 3 ms per scattered 512-byte write measured on xfs, 300 s for 100,000
-    // (session 18). So the caller asks for it only when the patch has few runs (vload: PATCH_REFLINK_RUNS).
+    // reflink=1, btrfs), else a copy by read and write. A reflink is free, but every write into it
+    // then unshares an extent (copy-on-write): 3 ms per scattered 512-byte write measured on xfs, 300
+    // to 437 s for 100,000, against 0.7 s into a plain copy (sessions 18 and 19). So the caller asks
+    // for it only when the patch has few runs (vload: PATCH_REFLINK_RUNS).
     void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot = 0,
                bool reflink = true);
     // A load in several passes (a large snapshot): every pass writes its pieces into the partial file
@@ -167,10 +168,11 @@ private:
     bool in_parts_ = false;
 };
 
-// Copies the content of one file into another (with reflink: a reflink clone where the file system
-// supports it, xfs with reflink=1, btrfs; else copy_file_range, else read and write). Both must be
-// open; to_fd is truncated first. Throws std::runtime_error with the cause. Returns how it was done:
-// "reflink", "copy_file_range" or "copy".
+// Copies the content of one file into another. With reflink: a reflink clone where the file system
+// supports it (xfs with reflink=1, btrfs), else copy_file_range, else read and write; without: read
+// and write only, because copy_file_range on a reflink file system is a reflink too (session 19).
+// Both must be open; to_fd is truncated first. Throws std::runtime_error with the cause. Returns how
+// it was done: "reflink", "copy_file_range" or "copy".
 const char *clone_file(int from_fd, int to_fd, const std::string &what, bool reflink = true);
 
 } // namespace vvector

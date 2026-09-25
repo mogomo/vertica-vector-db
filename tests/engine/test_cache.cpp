@@ -139,6 +139,9 @@ int main()
         struct stat st;
         CHECK(fstat(to, &st) == 0 && static_cast<std::uint64_t>(st.st_size) == big.buffer.size());
         std::printf("  clone_file: %s\n", how.c_str());
+        // Without reflink the copy is by read and write, never copy_file_range (a reflink on xfs).
+        CHECK(std::string(clone_file(from, to, to_path, false)) == "copy");
+        CHECK(fstat(to, &st) == 0 && static_cast<std::uint64_t>(st.st_size) == big.buffer.size());
         ::close(from); ::close(to); ::unlink(to_path.c_str());
     }
 

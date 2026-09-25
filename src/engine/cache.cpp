@@ -491,17 +491,18 @@ void CacheWriter::discard()
 const char *clone_file(int from_fd, int to_fd, const std::string &what, bool reflink)
 {
     if (ftruncate(to_fd, 0) != 0) fail("cannot empty", what);
+    (void)reflink;                              // unused where neither FICLONE nor copy_file_range exists
 #if defined(__linux__) && defined(FICLONE)
     if (reflink && ioctl(to_fd, FICLONE, from_fd) == 0) return "reflink";
-#else
-    (void)reflink;
 #endif
     struct stat st;
     if (fstat(from_fd, &st) != 0) fail("cannot stat the base of", what);
     std::uint64_t left = static_cast<std::uint64_t>(st.st_size), at = 0;
 #if defined(__linux__)
-    // copy_file_range: the kernel copies, in the file system where it can (a server-side copy).
-    bool ranged = true;
+    // copy_file_range: the kernel copies, in the file system where it can (a server-side copy). On
+    // xfs with reflink=1 that copy IS a reflink (session 19: 0.01 s, every extent shared, 437 s for
+    // 100,000 scattered writes into it afterwards), so it is tried only when a reflink is wanted.
+    bool ranged = reflink;
     while (left > 0 && ranged) {
         off64_t in = static_cast<off64_t>(at), out = static_cast<off64_t>(at);
         const ssize_t n = copy_file_range(from_fd, &in, to_fd, &out, left, 0);

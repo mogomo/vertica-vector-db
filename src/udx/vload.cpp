@@ -19,7 +19,8 @@ using namespace vvector_udx;
 
 static const char *const FN = "vload";
 // A patch with at most this many runs starts from a reflink of the base (a copy-on-write extent per
-// run written, about 3 ms each on xfs); more runs start from a plain copy of the base.
+// run written, about 3 ms each on xfs); more runs start from a plain copy of the base by read and
+// write (copy_file_range would be a reflink again on xfs: cache.h).
 static const std::uint64_t PATCH_REFLINK_RUNS = 64;
 
 class VLoad : public TransformFunction

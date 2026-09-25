@@ -1835,7 +1835,12 @@ On the 3-node Eon test cluster (x86_64, 2 cores and 15 GB per node, Vertica
 costs more: `SELECT 1` 2.7 ms, vsearch `_snap` 12.8 ms fenced and 7.6 ms mixed,
 `vknn` 12.1 and 5.9 ms (precision fast). An exact search over the empty delta
 takes 10.7 ms mixed with the journal replica, which is made there by default,
-and 23.4 ms without it (see [Operations](#operations)).
+and 23.4 ms without it (see [Operations](#operations)). An incremental
+refresh there of 900,000 vectors of 128 dimensions after 1000 adds and 500
+deletes takes 6.4 s (flat) and 11.5 s (HNSW) since only the changed bytes of
+the snapshot travel (19.6 s and 25.3 s when the whole snapshot did; 100
+changes 5.9 and 8.3 s, 10,000 changes 6.7 and 12.4 s; docs/design.md
+"Incremental transfer").
 
 **Filtered and range search** (the VM, SIFT1M, one query, median at the
 client): with an allow-list of 100 ids 8.6 ms fenced / 3.0 ms mixed, 10,000
