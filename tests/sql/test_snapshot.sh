@@ -3,7 +3,8 @@
 # vinfo -> vsearch reading the node cache; the input rules of vbuild and vsearch, and
 # the cache rules (session parameter, stale cache, unknown index); the index option cache_dir
 # (the procedures load into it, a query without cache_dir finds it through the default directory,
-# a bad or unusable directory is refused, back to the default).
+# a bad or unusable directory is refused, back to the default); a load in passes (load_on_nodes with
+# passes smaller than the snapshot).
 #
 #   tests/sql/test_snapshot.sh [--rows=N] [--dims=N] [--schema=NAME] [--cache_dir=DIR] [--keep] [--echo_only]
 #
@@ -32,7 +33,7 @@ for arg in "$@"; do
         --cache_dir=*) CACHE_DIR="${arg#--cache_dir=}" ;;
         --keep)        KEEP=yes ;;
         --echo_only)   ECHO_ONLY=yes ;;
-        -h|--help)     sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "test_snapshot.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -245,6 +246,42 @@ $(vinfo_file /tmp/vvector)"
 expect "a search without cache_dir uses it" "^rows: 3$" "$SEARCH_C"
 expect "unregister names the directory the cache files stay in" "Cache files under <cache_dir>/$IXC stay" "CALL vvector.unregister_index('$IXC');"
 [ "$ECHO_ONLY" = yes ] || rm -rf "${ALT:?}/$IXC" "/tmp/vvector/$IXC"
+
+echo "== load in passes (a snapshot larger than one pass)"
+# 20000 vectors of 128 floats: about 10 MB, two chunks of 8 MB; load_on_nodes with passes of 8 MB
+# loads it in two statements through a partial file (a 50 GB snapshot did not fit one broadcast join).
+IXP=vvtest_lp
+LPQ="SELECT qid, id, rank FROM (SELECT vvector.vsearch(qid, qvec, id, vec, del, ver, snapshot_id USING PARAMETERS index_name='$IXP', k=5, precision='exact') OVER()
+     FROM (SELECT * FROM $SCHEMA.${IXP}_snap UNION ALL SELECT id, vec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.vec128 WHERE id <= 20) x) r"
+run_sql "cleanup of an earlier run" "CALL vvector.unregister_index('$IXP');" > /dev/null
+expect "an index of 20000 x 128 floats: two chunks" "^chunks: 2$" "
+DROP TABLE IF EXISTS $SCHEMA.vec128;
+CREATE TABLE $SCHEMA.vec128 (id INT NOT NULL, vec ARRAY[FLOAT]) ORDER BY id SEGMENTED BY HASH(id) ALL NODES;
+INSERT INTO $SCHEMA.vec128 SELECT id, $(random_vector 128) FROM ($(row_numbers 20000)) g; COMMIT;
+CALL vvector.register_index('$IXP', '$SCHEMA.vec128', 'id', 'vec', NULL, NULL, 'l2', NULL, 'flat');
+CALL vvector.refresh_index('$IXP');
+DROP TABLE IF EXISTS $SCHEMA.lp_before; CREATE TABLE $SCHEMA.lp_before AS $LPQ;
+SELECT 'chunks: ' || COUNT(*) FROM vvector.snapshot s JOIN vvector.manifest m ON m.index_name = s.index_name AND m.active_snapshot = s.snapshot_id
+ WHERE s.index_name = '$IXP';"
+LPSID=$( [ "$ECHO_ONLY" = yes ] && echo 1 || vsql -X -A -t -q -c "SELECT active_snapshot FROM vvector.manifest WHERE index_name = '$IXP'")
+expect "load_on_nodes in passes of 8 MB: loaded on every node" "^every node: t$" "
+CALL vvector.load_on_nodes('$IXP', ${LPSID:-0}, 8);
+SELECT 'every node: ' || (COUNT(DISTINCT v.node_name) = MAX(u.up) AND MIN(v.snapshot_id) = MAX(m.active_snapshot))
+FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXP') OVER(PARTITION NODES) FROM vvector.probe) v
+CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u
+CROSS JOIN (SELECT active_snapshot FROM vvector.manifest WHERE index_name = '$IXP') m;"
+expect "vinfo reads the vectors of the loaded file" "^vectors: 20000$" "
+SELECT 'vectors: ' || MIN(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXP') OVER(PARTITION NODES) FROM vvector.probe) v;"
+expect "the searches give what they gave before" "^differences: 0 of 100$" "
+SELECT 'differences: ' || (SELECT COUNT(*) FROM (($LPQ) EXCEPT (SELECT * FROM $SCHEMA.lp_before)) d) || ' of ' || (SELECT COUNT(*) FROM $SCHEMA.lp_before);"
+if [ "$ECHO_ONLY" = no ]; then
+    if ls "$CACHE_DIR/$IXP/"*.part.* > /dev/null 2>&1; then
+        echo "FAIL  this node: no partial file is left"; ls -la "$CACHE_DIR/$IXP" | sed 's/^/      got: /'; FAILED=$((FAILED + 1))
+    else
+        echo "PASS  this node: no partial file is left"
+    fi
+fi
+run_sql "cleanup" "CALL vvector.unregister_index('$IXP'); DROP TABLE IF EXISTS $SCHEMA.vec128; DROP TABLE IF EXISTS $SCHEMA.lp_before;" > /dev/null
 
 run_sql "cleanup" "DELETE FROM vvector.snapshot WHERE index_name = 'vvtest'; COMMIT;" > /dev/null
 

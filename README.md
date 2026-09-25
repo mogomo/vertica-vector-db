@@ -1405,7 +1405,8 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   Size it for the index files of every index placed there, plus one more
   snapshot during a refresh.
   A refresh whose build needs more than half of the smallest node's free
-  memory (with the page cache) builds in a file in the index's cache
+  memory (with the page cache; for the first build of an index estimated from
+  the journal rows and the vector length) builds in a file in the index's cache
   directory instead (on the test VM 7% slower for flat, 13% for HNSW), and says so in its note; the kernel
   can then write the build out instead of running out of memory. That does
   not get around `FencedUDxMemoryLimitMB`: Vertica applies it as the address
@@ -1461,7 +1462,7 @@ by hand.
 | Function | Rights | What it does |
 |---|---|---|
 | `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
-| `vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time |
+| `vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its chunks into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
 | `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir, index_cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; with `index_cache_dir` (the index option; '' = none) into that directory, plus an OPTIONS file that names it in the default directory and in the session's; returns (node_name, status) |
 | `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
 | `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | vvector_search | what every node has cached (see above) |
@@ -1486,7 +1487,11 @@ The join sends every chunk to one probe row per node. The two hints make
 Vertica broadcast the chunks (the table is segmented); without them a node
 may get only the chunks it stores, and its vload refuses the incomplete
 file. On a single node Vertica warns that the hint is not feasible and runs
-the statement as written.
+the statement as written. The join holds the chunks in memory on every node;
+the procedures therefore load a snapshot larger than 2 GB in passes of 2 GB
+of byte offsets (`AND s.byte_offset >= a AND s.byte_offset < b` and the
+parameters `part`, `pass`, `passes`): one statement for a 50 GB snapshot ran
+out of Vertica's memory on nodes of 78 GB.
 
 Take snapshot ids from `vvector.snapshot_seq` if the index is also refreshed
 by the procedures: a node refuses a snapshot id lower than the one of the

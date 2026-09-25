@@ -467,6 +467,43 @@ void CacheWriter::begin(const std::string &cache_dir, const std::string &index, 
     if (fd_ < 0) fail("cannot create", tmp_path_);
 }
 
+void CacheWriter::begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
+                             const std::string &part, bool resume)
+{
+    if (part.empty() || part.size() > 64 ||
+        part.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos)
+        throw std::runtime_error("part must be 1 to 64 letters and digits");
+    dir_ = index_dir(cache_dir, index);
+    cache_dir_ = cache_dir;
+    index_ = index;
+    make_dir(cache_dir);
+    make_dir(dir_);
+    snapshot_id_ = snapshot_id;
+    final_path_ = snapshot_path(cache_dir, index, snapshot_id);
+    tmp_path_ = final_path_ + ".part." + part;
+    in_parts_ = true;
+    if (resume) {
+        fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_NOFOLLOW);
+        if (fd_ < 0) fail("cannot continue the partial file (an earlier pass of this load failed?)", tmp_path_);
+        struct stat st;
+        if (fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("not a partial file of this user: " + tmp_path_);
+        }
+    } else {
+        fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (fd_ < 0) fail("cannot create", tmp_path_);
+    }
+}
+
+void CacheWriter::keep()
+{
+    if (fd_ < 0 || !in_parts_) throw std::runtime_error("keep() without a partial file");
+    ::close(fd_);
+    fd_ = -1;
+}
+
 void CacheWriter::write_at(std::int64_t byte_offset, const char *data, std::uint64_t len)
 {
     if (byte_offset < 0 || len == 0 || len > CHUNK_BYTES)
@@ -487,8 +524,13 @@ void CacheWriter::write_at(std::int64_t byte_offset, const char *data, std::uint
 std::uint64_t CacheWriter::commit()
 {
     // Every byte written exactly once: no piece missing, none twice. (The checksum below catches
-    // the rest: a hole reads as zeros, and zero words do not match the expected checksum.)
-    if (bytes_written_ != end_offset_)
+    // the rest: a hole reads as zeros, and zero words do not match the expected checksum.) A load in
+    // passes counts only its last pass here: the file size and the checksum check the whole file.
+    if (in_parts_) {
+        struct stat st;
+        if (fstat(fd_, &st) != 0) fail("cannot stat", tmp_path_);
+        end_offset_ = static_cast<std::uint64_t>(st.st_size);
+    } else if (bytes_written_ != end_offset_)
         throw std::runtime_error("pieces are missing or duplicated: " + std::to_string(bytes_written_) +
                                  " bytes received for a file of " + std::to_string(end_offset_));
     if (::fsync(fd_) != 0) fail("cannot sync", tmp_path_);

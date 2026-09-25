@@ -71,6 +71,41 @@ int main()
     // Reload of the same snapshot is fine (vload is idempotent).
     load(dir, "g", 1, big.buffer);
 
+    // A load in passes (a large snapshot, vvector.load_on_nodes): each pass writes its chunks into
+    // the partial file, the last one verifies and activates it. Chunk c goes in pass c % passes + 1.
+    {
+        const std::int64_t chunks = static_cast<std::int64_t>((big.buffer.size() + CHUNK_BYTES - 1) / CHUNK_BYTES);
+        auto pass = [&](std::int64_t id, int p, int passes, bool drop_last_chunk) {
+            CacheWriter w;
+            w.begin_part(dir, "g", id, "load7", p > 1);
+            for (std::int64_t c = chunks - 1; c >= 0; --c) {
+                if (c % passes != p - 1 || (drop_last_chunk && c == chunks - 1)) continue;
+                const std::uint64_t off = c * CHUNK_BYTES;
+                const std::uint64_t len = std::min<std::uint64_t>(CHUNK_BYTES, big.buffer.size() - off);
+                w.write_at(static_cast<std::int64_t>(off), reinterpret_cast<const char *>(big.buffer.data()) + off, len);
+            }
+            if (p < passes) w.keep(); else w.commit();
+        };
+        const std::string partial = snapshot_path(dir, "g", 9) + ".part.load7";
+        pass(9, 1, 3, false);
+        pass(9, 2, 3, false);
+        CHECK(exists(partial) && read_active(dir, "g", active) && active == 1);   // not active before the last pass
+        pass(9, 3, 3, false);
+        CHECK(read_active(dir, "g", active) && active == 9 && !exists(partial));
+        MappedSnapshot m;              // by path: open_active trusts the ACTIVE it read above for ACTIVE_CHECK_MS
+        m.open(snapshot_path(dir, "g", 9), true);
+        CHECK(m.vectors().count == n && m.size() == big.buffer.size());
+        // A pass that is not the first needs the partial file of the earlier passes.
+        CHECK(throws([&] { pass(10, 2, 2, false); }, "cannot continue the partial file"));
+        // A chunk missing in any pass: the last pass refuses the file and removes it; ACTIVE stays.
+        pass(10, 1, 2, true);
+        CHECK(throws([&] { pass(10, 2, 2, true); }));
+        CHECK(read_active(dir, "g", active) && active == 9);
+        CHECK(!exists(snapshot_path(dir, "g", 10)) && !exists(snapshot_path(dir, "g", 10) + ".part.load7"));
+        CacheWriter w;
+        CHECK(throws([&] { w.begin_part(dir, "g", 11, "../x", false); }, "part must be 1 to 64 letters and digits"));
+    }
+
     // A foreign file is never removed; old snapshots are: only active and previous stay.
     const std::string foreign = dir + "/g/notes.txt";
     std::ofstream(foreign) << "not a snapshot";

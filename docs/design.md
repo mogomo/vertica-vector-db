@@ -356,6 +356,14 @@ project this code comes from):
   out on one node, where Vertica only warns that they are not feasible.
 - The mapping is computed inside the same statement, so it follows node and
   shard changes. vload returns one row per node that loaded.
+- The join holds its inner, the broadcast chunks, in memory. At 100M x 128 (a 49.6 GB flat snapshot,
+  4 nodes of 78 GB) the one statement failed: "Join inner did not fit in memory", the plan asked for
+  32 GB more with 28 GB of the general pool free (milestone M6). load_on_nodes(index, snapshot,
+  pass_mb) therefore loads in passes of pass_mb (2048 by default) of byte offsets, one statement each;
+  vload (parameters part, pass, passes) writes every pass into `<id>.vv.part.<part>` at the chunks'
+  offsets (O_NOFOLLOW, a regular file of the process user), and the last pass checks the whole file
+  (size, structure, checksum) and makes it active; a failed pass removes the partial file, so the
+  next pass fails too and the procedure names the pass. A snapshot up to one pass loads as before.
 - vinfo and vconfig read `vvector.probe` for the same reason and answer once
   per node.
 

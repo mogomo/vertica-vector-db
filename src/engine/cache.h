@@ -121,8 +121,15 @@ public:
     CacheWriter &operator=(const CacheWriter &) = delete;
 
     void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id);
+    // A load in several passes (a large snapshot): every pass writes its pieces into the partial file
+    // <snapshot>.vv.part.<part> (part: letters and digits naming the load); the first pass creates it,
+    // later passes (resume) continue it, keep() ends a pass without verifying, commit() the last one.
+    void begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
+                    const std::string &part, bool resume);
     // Pieces may arrive in any order. Together they must cover the file exactly once.
     void write_at(std::int64_t byte_offset, const char *data, std::uint64_t len);
+    // Ends a pass of a load in several passes: the partial file stays for the next pass.
+    void keep();
 
     // Verifies the file (size, structure, checksum, id order), renames it into place,
     // flips ACTIVE (write temp, rename), syncs the directory, and removes snapshot files other
@@ -136,6 +143,7 @@ private:
     std::string cache_dir_, index_, dir_, tmp_path_, final_path_;
     std::int64_t snapshot_id_ = 0;
     std::uint64_t bytes_written_ = 0, end_offset_ = 0;
+    bool in_parts_ = false;
 };
 
 } // namespace vvector

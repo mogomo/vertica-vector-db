@@ -574,9 +574,10 @@ END;
 $$;
 
 -- vload of one snapshot on every node, and a check that every node loaded it.
-CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT) LANGUAGE PLvSQL AS $$
+CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT, pass_mb INT) LANGUAGE PLvSQL AS $$
 DECLARE
-    want INT; got INT; hint VARCHAR(40); dist VARCHAR(40); cd VARCHAR(1100);
+    want INT; got INT; hint VARCHAR(40); dist VARCHAR(40); cd VARCHAR(1100); top INT; span INT; passes INT;
+    part VARCHAR(40); q VARCHAR(2000); lo INT; st VARCHAR(16);
 BEGIN
     cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
            FROM vvector.manifest WHERE index_name = nm);
@@ -590,13 +591,37 @@ BEGIN
     ELSE
         hint := ''; dist := '';
     END IF;
-    got := EXECUTE 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='
-        || QUOTE_LITERAL(nm) || cd || ', snapshot_id=' || sid || ') OVER(PARTITION NODES) FROM (SELECT ' || hint || 's.byte_offset, s.chunk '
-        || 'FROM vvector.probe p JOIN ' || dist || 'vvector.snapshot s ON TRUE WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
-        || ' AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ''loaded''';
-    IF got IS NULL OR got < want THEN
-        RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes', nm, sid, COALESCE(got, 0), want;
-    END IF;
+    -- The join holds its inner, the broadcast chunks, in memory on every node: a 50 GB snapshot did not
+    -- fit on 78 GB nodes. So a snapshot larger than pass_mb is loaded in passes of pass_mb of byte
+    -- offsets; vload writes each pass into a partial file and verifies and activates it after the last.
+    top := (SELECT MAX(byte_offset) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+    span := GREATEST(pass_mb, 8) * 1048576;
+    passes := COALESCE(top, 0) // span + 1;
+    part := 'l' || sid || 't' || (SELECT (EXTRACT(EPOCH FROM CLOCK_TIMESTAMP()) * 1000000)::INT);
+    lo := 0;
+    WHILE lo <= COALESCE(top, 0) LOOP
+        st := CASE WHEN lo + span > COALESCE(top, 0) THEN 'loaded' ELSE 'partial' END;
+        q := 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='
+            || QUOTE_LITERAL(nm) || cd || ', snapshot_id=' || sid
+            || CASE WHEN passes > 1 THEN ', part=' || QUOTE_LITERAL(part) || ', pass=' || (lo // span + 1) || ', passes=' || passes ELSE '' END
+            || ') OVER(PARTITION NODES) FROM (SELECT ' || hint || 's.byte_offset, s.chunk '
+            || 'FROM vvector.probe p JOIN ' || dist || 'vvector.snapshot s ON TRUE WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
+            || CASE WHEN passes > 1 THEN ' AND s.byte_offset >= ' || lo || ' AND s.byte_offset < ' || (lo + span) ELSE '' END
+            || ' AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ' || QUOTE_LITERAL(st);
+        got := EXECUTE q;
+        IF got IS NULL OR got < want THEN
+            RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes (pass % of %)', nm, sid, COALESCE(got, 0), want,
+                            lo // span + 1, passes;
+        END IF;
+        lo := lo + span;
+    END LOOP;
+END;
+$$;
+
+-- Loads a snapshot on every node, in passes of at most 2048 MB (see above).
+CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT) LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.load_on_nodes(nm, sid, 2048);
 END;
 $$;
 
@@ -1008,7 +1033,8 @@ BEGIN
     --    so a cache file left behind by an older index of the same name is always recognised as stale.
     sid := (SELECT NEXTVAL('vvector.snapshot_seq'));
     -- Build memory: the snapshot, 4 bytes per vector for the sort, and the graph build's working
-    -- memory (the estimate of status, from the last snapshot). When it is more than half of the
+    -- memory (the estimate of status, from the last snapshot; before the first one from the journal).
+    -- When it is more than half of the
     -- smallest node's free memory (with the page cache), vbuild builds in a file in the index's cache
     -- directory: its pages can then be written out and reclaimed instead of running the node out of
     -- memory (13% slower for HNSW on the test VM). It does not help against FencedUDxMemoryLimitMB,
@@ -1019,6 +1045,18 @@ BEGIN
                          + CASE WHEN MAX(index_type) = 'hnsw' THEN (COALESCE(MAX(vector_count), 0) + COALESCE(MAX(tombstones), 0))
                                      * (5 + 2 * cores) ELSE 0 END
                   FROM vvector.manifest WHERE index_name = nm);
+    IF build_est IS NULL THEN
+        -- The first build has no snapshot to measure: the estimate of vvector.sizing from the journal
+        -- rows up to the boundary (at least the live vectors) and the length of one vector.
+        IF rows_next IS NULL THEN
+            n_vec := EXECUTE 'SELECT COUNT(*) FROM ' || tab || ' WHERE ' || idc || ' IS NOT NULL';
+        ELSE
+            n_vec := rows_next;
+        END IF;
+        n_dims := EXECUTE 'SELECT MAX(ARRAY_LENGTH(' || vc || ')) FROM (SELECT ' || vc || ' FROM ' || tab || ' WHERE ' || vc || ' IS NOT NULL LIMIT 1) v';
+        build_est := n_vec * (((n_dims + 15) // 16 * 16) * CASE WHEN quant = 'sq8' THEN 5 ELSE 4 END + 8 + 4
+                              + CASE WHEN kind = 'hnsw' THEN (2 * hm + 1) * 4 + 5 + (hm + 1) * 4 // (hm - 1) + 5 + 2 * cores ELSE 0 END);
+    END IF;
     free_mem := (SELECT MIN(total_memory_free_bytes + total_memory_cache_bytes) FROM v_monitor.host_resources);
     IF build_est IS NOT NULL AND free_mem IS NOT NULL AND build_est > free_mem // 2 THEN
         bin_note := 'built in a file: the build needs about ' || build_est // 1048576 || ' MB, the smallest node has '
@@ -1275,6 +1313,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM PUBLIC;
@@ -1300,6 +1339,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM vvector_search;
@@ -1331,5 +1371,6 @@ GRANT EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.apply_replica_core(VARCHAR, BOOLEAN) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) TO vvector_admin;

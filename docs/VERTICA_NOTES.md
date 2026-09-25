@@ -392,3 +392,13 @@ Check again on other versions.
   `CALL vvector.refresh_index(...)` for it. To see that a scheduled refresh ran, read the manifest
   (refresh_note, delta_from) or vertica.log. `v_monitor.vs_stored_procedure_scheduler_statistics`
   shows only the queue now (procedures executing, queued), no history.
+- A cross join with a broadcast inner (`FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON
+  TRUE`, the load of a snapshot) holds the whole inner in memory on every node (26.2.0-3, 4 nodes of 78 GB):
+  for 49.6 GB of chunks every node logged "Plan memory limit exhausted: Request exceeds limits: Memory(KB)
+  Exceeded: Requested = 33554497, Free = 28248499 (Limit = 68000946 ...)" and "Join inner did not fit in
+  memory"; Vertica ran the statement a second time by itself and it failed the same way. Inside the
+  refresh procedure the caller saw only "ERROR 4278: Operation canceled"; the real text is in
+  `v_monitor.error_messages`. The same join with 6.3 GB of chunks ran. vvector loads large snapshots in
+  passes of byte ranges since (docs/design.md).
+- PL/vSQL loops: `FOR j IN RANGE 1 .. n LOOP ... END LOOP;` and `WHILE cond LOOP ... END LOOP;` both work,
+  also with `x := EXECUTE '...'` inside (26.2.0-3).
