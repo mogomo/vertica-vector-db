@@ -193,6 +193,13 @@ WHERE m.index_name = '$ix';"
 done
 expect "the refresh note says what was sent" "sent [0-9]* MB of [0-9]* MB (a patch on snapshot [0-9]* in every node cache; the table holds a chain of 2 snapshots" "
 SELECT refresh_note FROM vvector.manifest WHERE index_name = 'vih_l2';"
+# A patch's runs are small: load_on_nodes sizes its passes by their bytes, so a patch loads in one
+# vload statement (session 18: counted as 8 MB pieces, a 3 MB patch took 13 passes). Counted from
+# the request log: the vload statements that name the active snapshot of vih_l2 (the patch above).
+expect "a patch loads in one pass (one vload statement for the active snapshot)" "^vload statements: 1$" "
+SELECT 'vload statements: ' || COUNT(*)
+FROM v_monitor.query_requests q JOIN vvector.manifest m ON REGEXP_LIKE(q.request, 'index_name=''vih_l2''.*snapshot_id=' || m.active_snapshot || '[^0-9]')
+WHERE m.index_name = 'vih_l2' AND q.request_label = 'vvector_load';"
 expect "status prints the chain and the room to grow" "snapshot pieces in vvector.snapshot: a chain of 2 snapshots from the whole copy [0-9]*, [0-9]* MB of patches after it; the layout has room for [1-9][0-9]* more vectors" "
 CALL vvector.status('vih_l2');"
 expect "vinfo reports the capacity and the file size" "^capacity > count: t, file_bytes > 0: t$" "

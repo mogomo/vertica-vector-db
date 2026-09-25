@@ -117,6 +117,18 @@ std::vector<ByteRange> snapshot_diff(const std::uint8_t *a, const std::uint8_t *
 // the file.
 void seal_in_place(const std::uint8_t *base, std::uint8_t *copy, std::uint64_t size, const std::vector<ByteRange> &runs);
 
+// A patch travels as rows of packed runs: records of (uint64 offset, uint32 bytes, the bytes),
+// little-endian, as many per row as fit into `capacity` bytes (a run longer than a row is split).
+// One row per run would make Vertica's planner reserve the declared row width (8 MB) per run for
+// the load's broadcast join: gigabytes for a few MB of patch. pack_runs builds the rows from the
+// runs over `data` in order and calls emit(first_offset, row, bytes) for each; unpack_runs calls
+// apply(offset, bytes, n) for every record of a row and throws std::runtime_error on a malformed row.
+constexpr std::uint64_t RUN_RECORD_HEADER = 12;
+void pack_runs(const std::uint8_t *data, const std::vector<ByteRange> &runs, std::uint64_t capacity,
+               const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &emit);
+void unpack_runs(const std::uint8_t *row, std::uint64_t bytes,
+                 const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &apply);
+
 } // namespace vvector
 
 #endif

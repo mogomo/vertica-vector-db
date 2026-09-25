@@ -1,16 +1,18 @@
 // vload: writes the snapshot cache file on every node and makes it active.
 //   vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='docs', snapshot_id=7) OVER(PARTITION NODES)
 // Output (node_name, snapshot_id, bytes, status). Idempotent: run it again any time.
-// A piece is "these bytes at this offset": a whole 8 MB chunk (base_snapshot NULL), or a run of
-// changed bytes of a patch (milestone M7): base_snapshot names the snapshot the patch was made on,
-// and the file starts as a copy of that snapshot's file in the node's cache (a reflink where the
-// file system has it). Every piece of one load carries the same base_snapshot.
+// A piece is a whole 8 MB chunk at its offset (base_snapshot NULL), or a row of a patch (milestone
+// M7): up to 8 MB of packed runs of changed bytes (delta.h pack_runs, each written at its own
+// offset); base_snapshot names the snapshot the patch was made on, and the file starts as a copy of
+// that snapshot's file in the node's cache (a reflink where the file system has it). Every piece of
+// one load carries the same base_snapshot.
 // A large snapshot is loaded in passes (vvector.load_on_nodes: a broadcast join holds its inner in
 // memory): parameters part (letters and digits naming the load), pass and passes; pass 1 creates a
 // partial file, every pass writes its pieces into it, the last one verifies and activates it
 // (status 'loaded'), the others return status 'partial'.
 // Thin adapter around src/engine/cache.h.
 #include "udx_common.h"
+#include "../engine/delta.h"
 
 using namespace Vertica;
 using namespace vvector_udx;
@@ -56,7 +58,15 @@ class VLoad : public TransformFunction
                 if ((inputReader.isNull(2) ? 0 : inputReader.getIntRef(2)) != base)
                     fail("index '" + name + "': the pieces of snapshot " + std::to_string(snapshot_id) + " name different base snapshots");
                 const VString &chunk = inputReader.getStringRef(1);
-                writer.write_at(inputReader.getIntRef(0), chunk.data(), chunk.length());
+                if (base == 0) {
+                    writer.write_at(inputReader.getIntRef(0), chunk.data(), chunk.length());
+                } else {
+                    // A patch row: runs packed by vbuild (delta.h), each written at its own offset.
+                    vvector::unpack_runs(reinterpret_cast<const std::uint8_t *>(chunk.data()), chunk.length(),
+                                         [&](std::uint64_t off, const std::uint8_t *data, std::uint64_t n) {
+                                             writer.write_at(static_cast<std::int64_t>(off), reinterpret_cast<const char *>(data), n);
+                                         });
+                }
                 if (isCanceled()) return;
             } while (inputReader.next());
             std::uint64_t bytes = 0;

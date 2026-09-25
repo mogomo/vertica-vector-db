@@ -7,7 +7,8 @@
 // of the node that runs vbuild. Changes that change nothing give no rows. The build runs in place
 // on a copy-on-write mapping of the base when its layout has room (milestone M7, delta.h), and
 // then, with send = patch, only the changed bytes are returned: rows of (byte_offset, chunk) that
-// are runs of changed bytes, with base_snapshot set, which vload writes over its copy of the base.
+// hold up to 8 MB of packed runs of changed bytes (delta.h pack_runs; byte_offset = the first run's),
+// with base_snapshot set, which vload unpacks and writes over its copy of the base.
 // send = whole, a base without room, or a full build: whole chunks of 8 MB, base_snapshot NULL,
 // all-zero chunks (the room to grow) left out.
 // Parameters: index_name, metric (l2 | cosine | dot | l1), index_type (flat | hnsw), max_ver (the
@@ -166,9 +167,9 @@ class VBuild : public TransformFunction
             }
             const vvector::VectorSet set = vvector::snapshot_open(out_bytes, out_size, false);
             const char *bytes = reinterpret_cast<const char *>(out_bytes);
-            auto emit = [&](std::uint64_t off, std::uint64_t len, bool patch) {
+            auto emit = [&](std::uint64_t off, const char *data, std::uint64_t len, bool patch) {
                 out.setInt(0, (vint)off);
-                out.getStringRef(1).copy(bytes + off, len);
+                out.getStringRef(1).copy(data, len);
                 if (patch) out.setInt(2, base); else out.setNull(2);
                 out.setInt(3, (vint)(set.count - set.tombstones));
                 out.setInt(4, (vint)set.dims);
@@ -177,9 +178,16 @@ class VBuild : public TransformFunction
                 out.next();
             };
             if (!runs.empty()) {
-                for (const vvector::ByteRange &r : runs) {
-                    emit(r.offset, r.bytes, true);
-                    if (isCanceled()) return;
+                // The runs packed into rows of up to 8 MB (delta.h pack_runs): Vertica's planner
+                // reserves the declared 8 MB for every row of the load's broadcast join, so one row
+                // per run would ask for gigabytes for a few MB of patch (session 18).
+                try {
+                    vvector::pack_runs(out_bytes, runs, vvector::CHUNK_BYTES, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
+                        emit(first, reinterpret_cast<const char *>(row), len, true);
+                        if (isCanceled()) throw vvector::Cancelled();
+                    });
+                } catch (const vvector::Cancelled &) {
+                    return;
                 }
             } else {
                 // Whole chunks; the all-zero ones (the room to grow) stay home: vload sizes the file
@@ -187,7 +195,7 @@ class VBuild : public TransformFunction
                 for (std::uint64_t off = 0; off < out_size; off += vvector::CHUNK_BYTES) {
                     const std::uint64_t len = std::min<std::uint64_t>(vvector::CHUNK_BYTES, out_size - off);
                     if (off > 0 && vvector::all_zero(out_bytes + off, len)) continue;
-                    emit(off, len, false);
+                    emit(off, bytes + off, len, false);
                     if (isCanceled()) return;
                 }
             }

@@ -641,11 +641,22 @@ static void in_place_case(const std::string &dir, const char *name, Metric metri
     CHECK(minimal && sent < copy.size() / 2);
     std::printf("  in place %-12s %5zu runs, %8llu of %8llu bytes\n", name, runs.size(),
                 static_cast<unsigned long long>(sent), static_cast<unsigned long long>(copy.size()));
-    // What vload does: the runs over a copy of the base give the new file, verified in full.
+    // What vbuild and vload do: the runs packed into rows (small rows here, so there are several),
+    // unpacked over a copy of the base, give the new file, verified in full.
     {
         CacheWriter w;
         w.begin(dir, index, 2, 1);
-        for (const ByteRange &x : runs) w.write_at(static_cast<std::int64_t>(x.offset), reinterpret_cast<const char *>(copy.data()) + x.offset, x.bytes);
+        std::uint64_t rows = 0, packed = 0, unpacked = 0;
+        pack_runs(copy.data(), runs, 4096, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
+            CHECK(len <= 4096 && (rows == 0 || first > 0));
+            ++rows;
+            packed += len;
+            unpack_runs(row, len, [&](std::uint64_t off, const std::uint8_t *b, std::uint64_t n) {
+                w.write_at(static_cast<std::int64_t>(off), reinterpret_cast<const char *>(b), n);
+                unpacked += n;
+            });
+        });
+        CHECK(unpacked == sent && packed >= sent && rows >= (sent + 4095) / 4096);
         CHECK(w.commit() == copy.size());
         MappedSnapshot loaded;
         loaded.open(snapshot_path(dir, index, 2), true);
@@ -706,11 +717,43 @@ static void test_in_place()
     std::system(("rm -rf " + dir).c_str());
 }
 
+// pack_runs / unpack_runs (the rows a patch travels in): every byte of every run comes back at its
+// offset, in order, for row capacities from one record to more than the patch; a run longer than a
+// row is split; malformed rows are refused.
+static void test_pack_runs()
+{
+    std::vector<std::uint8_t> data(100000);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    const std::vector<ByteRange> runs = {{0, 512}, {1024, 1}, {2048, 5000}, {90000, 10000}, {8192, 512}};
+    std::uint64_t total = 0;
+    for (const ByteRange &r : runs) total += r.bytes;
+    for (std::uint64_t capacity : {13ull, 100ull, 600ull, 4096ull, 1048576ull}) {
+        std::uint64_t at_run = 0, at_off = runs[0].offset, got = 0, rows = 0;
+        bool ok = true;
+        pack_runs(data.data(), runs, capacity, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
+            ok = ok && len <= capacity && first == at_off;
+            ++rows;
+            unpack_runs(row, len, [&](std::uint64_t off, const std::uint8_t *b, std::uint64_t n) {
+                ok = ok && off == at_off && n > 0 && std::memcmp(b, data.data() + off, n) == 0;
+                got += n;
+                at_off += n;
+                if (at_off == runs[at_run].offset + runs[at_run].bytes && at_run + 1 < runs.size()) at_off = runs[++at_run].offset;
+            });
+        });
+        CHECK(ok && got == total);
+        CHECK(capacity < total ? rows > 1 : rows == 1);
+    }
+    CHECK(throws([] { std::uint8_t r[8] = {0}; unpack_runs(r, 8, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "record header"));
+    CHECK(throws([] { std::uint8_t r[16] = {0}; r[8] = 9; unpack_runs(r, 16, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "inside a record"));
+    CHECK(throws([] { std::uint8_t r[1] = {0}; unpack_runs(r, 0, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "empty"));
+}
+
 int main(int argc, char **argv)
 {
     std::string dir;
     for (int i = 1; i < argc; ++i)
         if (std::strncmp(argv[i], "--dir=", 6) == 0) dir = argv[i] + 6;
+    test_pack_runs();
     test_flags_and_nothing();
     rounds("flat l2", Metric::L2, false);
     rounds("flat cosine", Metric::Cosine, false);

@@ -599,7 +599,7 @@ $$;
 CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT, pass_mb INT) LANGUAGE PLvSQL AS $$
 DECLARE
     want INT; got INT; hint VARCHAR(40); dist VARCHAR(40); cd VARCHAR(1100); n_rows INT; per_pass INT; passes INT;
-    part VARCHAR(40); q VARCHAR(3000); p INT; lo INT; hi INT; st VARCHAR(16);
+    part VARCHAR(40); q VARCHAR(3000); p INT; lo INT; hi INT; st VARCHAR(16); base_col INT; n_bytes INT;
 BEGIN
     cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
            FROM vvector.manifest WHERE index_name = nm);
@@ -613,11 +613,14 @@ BEGIN
     ELSE
         hint := ''; dist := '';
     END IF;
-    -- The join holds its inner, the broadcast pieces, in memory on every node: a 50 GB snapshot did not
-    -- fit on 78 GB nodes. So the pieces are loaded in passes of at most pass_mb / 8 MB pieces (a piece
-    -- is at most 8 MB; a patch has a few small ones and is one pass), taken in byte_offset order;
-    -- vload writes each pass into a partial file and verifies and activates it after the last. A
-    -- patch (base_snapshot set on its pieces) is written over the node's copy of that base.
+    -- The join holds its inner, the broadcast pieces, in memory on every node, and the planner reserves
+    -- the declared width of a piece, 8 MB, for every row (session 18: a patch of 3,000 small rows asked
+    -- for 8 GB and failed with "Join inner did not fit in memory" on the 15 GB nodes): a 50 GB snapshot
+    -- did not fit on 78 GB nodes. So the pieces are loaded in passes of at most pass_mb / 8 MB rows
+    -- (a whole copy's pieces are 8 MB; a patch packs its runs into rows of up to 8 MB too, so a small
+    -- patch is one row and one pass), taken in byte_offset order; vload writes each pass into a
+    -- partial file and verifies and activates it after the last. A patch (base_snapshot set on its
+    -- pieces) is written over the node's copy of that base.
     n_rows := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
     IF n_rows = 0 THEN
         RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: no pieces in vvector.snapshot', nm, sid;

@@ -422,3 +422,9 @@ Check again on other versions.
   `set_index_options` (the 13-, 14- and 15-argument forms stay) deployed on the cluster without a
   `DROP PROCEDURE` of the old forms: `CREATE OR REPLACE PROCEDURE` with a different argument list
   makes a new overload; the old `set_index_options_core` (15 arguments) is dropped explicitly.
+- The planner reserves the declared width of a LONG VARBINARY column, 8 MB for `vvector.snapshot.chunk`,
+  for every row of a broadcast join's inner (`vvector.probe JOIN /*+DISTRIB(L,B)*/ vvector.snapshot`)
+  whatever the rows hold: 3,000 rows of 1 KB (a 3 MB patch, one row per changed run) asked for 8 GB
+  ("Plan memory limit exhausted: Requested = 8388633 KB", then "Join inner did not fit in memory") on a
+  node with 10.8 GB in the pool. vvector therefore packs a patch's runs into rows of up to 8 MB and
+  counts its load passes in rows (pass_mb / 8 per pass), never in bytes.
