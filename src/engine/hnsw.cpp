@@ -1,6 +1,7 @@
 #include "hnsw.h"
 #include "kernels.h"
 #include "parallel.h"
+#include "reach.h"
 
 #include <algorithm>
 #include <cmath>
@@ -605,6 +606,30 @@ std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::
     return graph_layout(capacity, m, hnsw_upper_capacity(blocks, capacity - n, m)).bytes;
 }
 
+// The header field unreachable1 of the graph just built into section (its layout; h is the header
+// without the field): the live positions no search can reach (reach.h) plus 1, or 0 when this build
+// does not count them: reachability off, or auto on an incremental build of HNSW_REACH_AUTO_LIMIT
+// positions or more.
+static std::uint64_t unreachable_field(const VectorSet &s, const std::uint8_t *section, const GraphLayout &layout,
+                                       const HnswHeader &h, const HnswParams &p, bool incremental,
+                                       const std::function<bool()> &poll)
+{
+    if (p.reachability == Reachability::Off) return 0;
+    if (p.reachability == Reachability::Auto && incremental && h.count >= HNSW_REACH_AUTO_LIMIT) return 0;
+    HnswGraph g;
+    g.m = h.m;
+    g.m0 = h.m0;
+    g.max_level = h.max_level;
+    g.entry_point = h.entry_point;
+    g.count = h.count;
+    g.upper_blocks = h.upper_blocks;
+    g.levels = section + layout.levels;
+    g.level0 = reinterpret_cast<const std::uint32_t *>(section + layout.level0);
+    g.upper_index = reinterpret_cast<const std::uint32_t *>(section + layout.upper_index);
+    g.upper = reinterpret_cast<const std::uint32_t *>(section + layout.upper);
+    return hnsw_unreachable(s, g, p.threads, poll) + 1;
+}
+
 void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, const std::function<bool()> &poll)
 {
     check_m(p.m);
@@ -647,6 +672,7 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, 
     h.level_seed = HNSW_LEVEL_SEED;
     h.upper_blocks = blocks;
     h.upper_capacity = s.has_capacity() ? upper_cap : 0;
+    h.unreachable1 = unreachable_field(s, section, layout, h, p, false, poll);
     std::memcpy(section, &h, sizeof(h));
 }
 
@@ -729,6 +755,7 @@ void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *sectio
     h.level_seed = HNSW_LEVEL_SEED;
     h.upper_blocks = blocks;
     h.upper_capacity = s.has_capacity() ? upper_cap : 0;
+    h.unreachable1 = unreachable_field(s, section, layout, h, p, true, poll);
     std::memcpy(section, &h, sizeof(h));
 }
 
@@ -752,7 +779,8 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
     if (h.count == 0 || h.entry_point >= h.count) graph_fail("entry point outside the vectors");
     if (h.max_level > HNSW_MAX_LEVEL) graph_fail("max_level out of range");
     if (h.upper_blocks >= HNSW_NO_UPPER) graph_fail("too many upper blocks");
-    if (h.reserved0 || h.reserved1) graph_fail("reserved header fields are not 0");
+    if (h.reserved0) graph_fail("a reserved header field is not 0");
+    if (h.unreachable1 > h.count) graph_fail("the unreachable count is above the count");
     if (s.has_capacity() ? h.upper_capacity < h.upper_blocks || h.upper_capacity >= HNSW_NO_UPPER : h.upper_capacity != 0)
         graph_fail("upper_capacity does not fit the snapshot");
     const std::uint64_t upper_cap = s.has_capacity() ? h.upper_capacity : h.upper_blocks;
@@ -769,6 +797,8 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
     g.upper_blocks = h.upper_blocks;
     g.capacity = s.capacity;
     g.upper_capacity = upper_cap;
+    g.counted = h.unreachable1 != 0;
+    g.unreachable = g.counted ? h.unreachable1 - 1 : 0;
     g.levels = s.graph + l.levels;
     g.level0 = reinterpret_cast<const std::uint32_t *>(s.graph + l.level0);
     g.upper_index = reinterpret_cast<const std::uint32_t *>(s.graph + l.upper_index);

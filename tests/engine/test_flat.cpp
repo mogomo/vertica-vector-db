@@ -169,6 +169,44 @@ int main()
             CHECK(c[0] == 0 && c[8] == 0);
             s.has_radius = false;
         }
+
+        // Blocks merged one after another (vscan reads a table in blocks of rows and merges each
+        // into the running result with merge_block) give exactly the one-block search, whatever
+        // the block size, with and without a radius.
+        for (bool radius : {false, true}) {
+            s.n_queries = 17;
+            s.k = 25;
+            s.threads = 1;
+            s.has_radius = radius;
+            const RowBlock whole = snap.block(false);
+            if (radius) {
+                std::vector<Neighbor> all;
+                std::vector<std::uint32_t> c;
+                FlatSearch probe = s;
+                probe.has_radius = false;
+                probe.k = 100;
+                flat_search(probe, &whole, 1, all, c);
+                s.radius = key_to_score(m, all[60].key);
+            }
+            std::vector<Neighbor> ref, got;
+            std::vector<std::uint32_t> rc, gc;
+            flat_search(s, &whole, 1, ref, rc);
+            for (std::uint64_t block_rows : {1ull, 7ull, 1000ull, 4096ull, 30000ull}) {
+                got.assign(s.n_queries * s.k, Neighbor{0, 0});
+                gc.assign(s.n_queries, 0);
+                for (std::uint64_t at = 0; at < snap.n(); at += block_rows) {
+                    RowBlock part;
+                    part.rows = snap.rows.data() + at * snap.stride;
+                    part.ids = snap.ids.data() + at;
+                    part.n = std::min(block_rows, snap.n() - at);
+                    merge_block(s, &part, got, gc);
+                }
+                const bool ok = equal(s, got, gc, ref, rc);
+                CHECK(ok);
+                if (!ok) std::printf("  merged blocks of %llu rows differ (%s, radius %d)\n", (unsigned long long)block_rows, metric_name(m), radius);
+            }
+            s.has_radius = false;
+        }
     }
 
     // Ties: equal vectors under different ids come back ordered by id, whatever the threads.

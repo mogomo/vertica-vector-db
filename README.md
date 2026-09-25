@@ -160,7 +160,7 @@ snapshots, which are in schema `vvector_admin`:
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
 | role `vvector_admin` | may build, load and manage indexes; holds `vvector_search` |
 | role `vvector_search` | may search (the functions in `vvector`) |
-| functions in `vvector` | `vsearch`, `vknn`, `vinfo`, `vversion` (search and information) |
+| functions in `vvector` | `vsearch`, `vknn`, `vscan`, `vinfo`, `vversion` (search and information) |
 | functions in `vvector_admin` | `vbuild`, `vload`, `vconfig`, `vnode` (build and load; `refresh_index` and `load_all` call them) |
 | procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
 
@@ -444,10 +444,13 @@ runs within 30 seconds of the minute.
 
     CALL vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
                                    tombstone_ratio, rebuild_every, memory_mode, precision_default,
-                                   freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir]]);
+                                   freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir [, reachability]]]);
 
     -- keep the node caches of index docs on a data disk (loaded there at once):
     CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/data/vvector');
+
+    -- count the unreachable vectors of the graph at every refresh, also on a large index:
+    CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'on');
 
     -- verify the journal every 10 refreshes instead of at every one:
     CALL vvector.set_index_options('docs', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 10);
@@ -460,8 +463,8 @@ runs within 30 seconds of the minute.
 
     NOTICE 2005:  vvector: index docs options changed. Build options apply at the next refresh; query defaults apply now.
 
-NULL keeps a value; the 13-argument form leaves `verify_every` and `cache_dir`
-as they are, the 14-argument form `cache_dir`.
+NULL keeps a value; the shorter forms leave the options they do not name
+(`verify_every`, `cache_dir`, `reachability`) as they are.
 Query defaults (precision, freshness, ef_search, threads) apply at once on every
 node (within 200 ms); `'default'` (text) or `0` (numbers) sets one back to the
 built-in default. Build options apply at the next refresh.
@@ -481,6 +484,7 @@ built-in default. Build options apply at the next refresh.
 | ef_search_default | 0 to 100000 | 0 (preset) | in use (HNSW) |
 | threads_default | 0 (one per core) to 64 | 0 | in use |
 | cache_dir | an absolute path (letters, digits, `/ . _ -`), or `default` | the default directory (`/tmp/vvector`, or the session parameter) | in use: where every node keeps the cache files of this index; see [Operations](#operations) |
+| reachability | auto, on, off | auto | in use (HNSW): whether a build counts the vectors that no search can reach (see [Unreachable vectors](#unreachable-vectors)); `auto` counts at every full build and at incremental builds below 8 million vectors, `on` at every build, `off` never |
 
 `cache_dir` takes effect at once: the active snapshot is loaded into the new
 directory on every node (as `load_all` does), and the change counts only when
@@ -497,6 +501,7 @@ default directory (and into the one of the calling session) on every node.
     CALL vvector.status('docs');
 
     NOTICE 2005:  vvector: index docs: hnsw index, 5 live vectors, 1 tombstones (tombstone_ratio 0.2), refresh_mode auto, 1 incremental refreshes since the last full build (rebuild_every never)
+    NOTICE 2005:  vvector: index docs: vectors no search can reach: 0 (reachability auto)
     NOTICE 2005:  vvector: index docs: journal digest verified at every refresh (verify_every 1); 0 refreshes since the last verification or full build
     NOTICE 2005:  vvector: index docs: node cache directory: the default (/tmp/vvector, or the cache_dir session parameter)
     NOTICE 2005:  vvector: index docs: last refresh: refreshed: snapshot 963, incremental from snapshot 962 (1 vectors appended, 1 tombstoned), 5 vectors of 3 dimensions, 1 tombstones, 0 MB, 0.347 seconds; journal verified in 0.021 seconds
@@ -504,7 +509,9 @@ default directory (and into the one of the calling session) on every node.
     NOTICE 2005:  vvector: index docs: journal replica auto: none: a single node reads the delta locally already
     NOTICE 2005:  vvector: index docs: sizing: index 0 MB, all indexes 1126 MB, build about 0 MB, smallest node 35155 MB of memory (28580 MB free or cache), 8 cores
 
-`status` reports the live vectors and the tombstones, the refresh mode, what
+`status` reports the live vectors and the tombstones, the refresh mode, the
+vectors of an HNSW graph that no search can reach (see [Unreachable
+vectors](#unreachable-vectors)), what
 the last refresh did, a refresh that is running now, the rows in the delta and how long they take to read,
 the journal replica, open transactions that write to the table, versions in
 the future (a sign that an application sets the version column itself), and a
@@ -575,7 +582,9 @@ verification or full build), `refresh_note` (what the last refresh did and why),
 copy and the patches after it, up to the active one), `chain_bytes` (the
 patch bytes since that whole copy), `sent_bytes` and `transfer` (what the
 last refresh stored and sent: `whole` or `patch`), `capacity` (the vectors
-the active snapshot's layout has room for)), and
+the active snapshot's layout has room for), `reachability` and `unreachable`
+(the option, and the vectors of the active graph no search can reach; NULL
+when not counted)), and
 the journal replica (`journal_replica` = auto, on or off;
 `replica_projection`, the projection vvector made; `replica_note`, what the
 last check did and why).
@@ -1035,6 +1044,57 @@ nearest other one), pairs above a threshold:
 For a large table run it in slices of query ids (`WHERE id % 10 = 0`, ...):
 each statement searches all its query rows in one call.
 
+### Exact search without an index: vscan
+
+`vscan` scans a table in parallel on every node and returns the exact k
+nearest rows to one or more query vectors, with no index, no registration
+and no refresh. Use it for tables too large or too rarely searched for an
+index, for a filtered search where the filter is any SQL predicate, and as
+the exact reference for an index. It reads every row: a scan of 100 million
+vectors of 128 dimensions takes minutes, not milliseconds.
+
+    -- one query: k rows out, closest first (l2 and l1: ORDER BY score; cosine and dot: DESC)
+    SELECT id, score
+    FROM (SELECT vvector.vscan(id, vec USING PARAMETERS query='[0.1, 0.2, 0.3]', k=10, metric='cosine')
+                 OVER(PARTITION BEST)
+          FROM app.docs) s
+    ORDER BY score DESC LIMIT 10;
+
+    -- several queries in one statement: qid is the position in the list (1, 2, ...)
+    SELECT qid, id, score
+    FROM (SELECT qid, id, score, ROW_NUMBER() OVER(PARTITION BY qid ORDER BY score, id) AS rank
+          FROM (SELECT vvector.vscan(id, vec USING PARAMETERS queries='[0.1, 0.2, 0.3];[0.4, 0.5, 0.6]', k=10)
+                       OVER(PARTITION BEST)
+                FROM app.docs) s) r
+    WHERE rank <= 10 ORDER BY qid, rank;
+
+    -- any filter, before the scan
+    ... FROM app.docs WHERE lang = 'de' AND published > '2026-01-01') s ...
+
+`OVER(PARTITION BEST)` lets Vertica run one instance per node and core over
+the rows each node holds; every instance returns its own k best rows per
+query as (qid, id, score), and the `ORDER BY ... LIMIT k` or the
+`ROW_NUMBER()` around it merges them. The scores are the built-ins' values
+(VECTOR_L2, COSINE_SIMILARITY, DOT_PRODUCT, and the Manhattan distance for
+l1), computed with the same kernels as `vsearch`, so an index search with
+`precision='exact'` and a `vscan` of the same rows give the same numbers.
+
+Parameters: `query` (one vector as text, qid 0) or `queries` (vectors
+separated by `;`, a LONG VARCHAR of up to 32 MB, qid 1, 2, ...); `k` (10,
+at most 16384); `metric` (l2 default, cosine, dot, l1); `radius` (only rows
+whose score is within it: l2 and l1 score <= radius, cosine and dot
+score >= radius); `threads` (1: Vertica supplies the parallelism; more only
+for `OVER()` on one instance). Rows with a NULL id or a NULL vector are
+skipped; a vector with a different number of elements than the query is an
+error. A journal table (adds and deletes over time, see [Prepare a
+table](#prepare-a-table)) is scanned as it is: put the consolidation (the
+latest row per id, not deleted) in a subquery first:
+
+    FROM (SELECT id, vec FROM (SELECT id, vec, del, ROW_NUMBER() OVER(PARTITION BY id ORDER BY ts DESC, del DESC) AS rn
+                               FROM app.docs) j WHERE rn = 1 AND NOT del) live
+
+`vscan` needs the role `vvector_search`, like the other search functions.
+
 ## Index types and tuning
 
 Two index types, chosen at registration (`register_index`, last argument) or
@@ -1096,6 +1156,25 @@ Build options of an HNSW index (`set_index_options`, then `refresh_index`):
 `ef_search` sets the candidate list of a search directly and overrides
 `precision`; per query, per session (`ALTER SESSION SET UDPARAMETER FOR
 vvector ef_search = '150'`) or per index (`set_index_options`).
+
+#### Unreachable vectors
+
+A search walks the graph along links from one entry point. A vector that no
+chain of links leads to is never returned by an approximate search (an exact
+search still finds it). The build links every vector it finds without a link
+back into the graph, and then counts what is left: one walk over the lowest
+level after the build, stored in the snapshot. `vinfo` shows it as
+`unreachable`, the manifest keeps it, `status` prints it, and `refresh_note`
+names it when it is above 0 or was not counted. The count is 0 on SIFT1M and
+on the generated test sets. The option `reachability` (`set_index_options`)
+chooses when to count: `auto` (the default) at every full build and at
+incremental builds of graphs below 8 million vectors, `on` at every build,
+`off` never. The walk reads the whole lowest level of the graph: 0.11 s for
+1 million vectors on 8 cores, so about 10 s for 100 million when the graph
+is in memory and minutes when it has to come from disk, against an
+incremental refresh of seconds; that is why `auto` skips it on large
+incremental builds. A count above 0 after an incremental refresh usually
+goes back to 0 with `refresh_index(name, 'full')`.
 
 | If you want | Set |
 |---|---|
@@ -1385,7 +1464,9 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   cache file is in the node's memory now: what a query reads without going to
   disk; vinfo itself reads nothing ahead), capacity (the vectors the layout
   has room for: an incremental refresh appends into that room and sends only
-  the changed bytes), file_bytes (the size of the cache file).
+  the changed bytes), file_bytes (the size of the cache file), unreachable
+  (HNSW: the live vectors no search can reach, counted by the build; NULL
+  when it did not count, see [Unreachable vectors](#unreachable-vectors)).
 - **Cache directory**: `/tmp/vvector` by default. Per index (recommended):
   the option `cache_dir` of [set_index_options](#set_index_options); the
   procedures and every query then use it without further settings. Per
@@ -1485,7 +1566,7 @@ by hand.
 
 | Function | Rights | What it does |
 |---|---|---|
-| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in, growth, send) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); `growth` (percent of the vectors, default 5, at least 4096 vectors; 0 = none) is the room to grow of the layout; returns (byte_offset, chunk, base_snapshot, vector_count, dims, max_ver, format_version): the pieces of the snapshot, chunks of 8 MB (all-zero ones left out) with base_snapshot NULL, or, for an incremental build with `send='patch'` (the default), only the bytes that changed, with base_snapshot set; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing; `send='whole'`, or a base without room for the appended rows, returns the whole snapshot |
+| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in, growth, send, reachability) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `reachability` (auto, on, off) says whether an HNSW build counts the vectors no search can reach and stores the count in the graph header (`auto`: every full build, incremental builds below 8 million vectors); `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); `growth` (percent of the vectors, default 5, at least 4096 vectors; 0 = none) is the room to grow of the layout; returns (byte_offset, chunk, base_snapshot, vector_count, dims, max_ver, format_version): the pieces of the snapshot, chunks of 8 MB (all-zero ones left out) with base_snapshot NULL, or, for an incremental build with `send='patch'` (the default), only the bytes that changed, with base_snapshot set; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing; `send='whole'`, or a base without room for the appended rows, returns the whole snapshot |
 | `vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. A piece with base_snapshot set is a patch: the file starts as a copy of that snapshot's file in the node's cache (an error when it is missing: run `load_all`), and the pieces are written over it; the file is sized from its header, so chunks left out (all zero) read as zeros. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its pieces into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
 | `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir, index_cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; with `index_cache_dir` (the index option; '' = none) into that directory, plus an OPTIONS file that names it in the default directory and in the session's; returns (node_name, status) |
 | `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
@@ -1956,12 +2037,12 @@ Operations:
 |---|---|
 | `Makefile` | `make`, `make test`, `make bench`, `make tools`, `make deploy [FENCED=yes\|no\|mixed] [SEARCH=role\|public]`, `make undeploy` |
 | `src/engine/` | pure C++17, no Vertica includes: snapshot format, incremental build (`delta.cpp`), node cache, distance kernels, flat search, HNSW (`hnsw.cpp`), int8 codes (`sq8.cpp`), the search with rescoring and filters (`search.cpp`), the arithmetic of the vector functions (`vecmath.cpp`), threads, query text |
-| `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vbuild.cpp`, ...), and one per family of vector functions (`vector_functions.cpp`, `vector_aggregates.cpp`) |
+| `src/udx/` | the Vertica adapters: one small file per SQL function (`vsearch.cpp`, `vknn.cpp`, `vscan.cpp`, `vbuild.cpp`, ...), and one per family of vector functions (`vector_functions.cpp`, `vector_aggregates.cpp`) |
 | `sql/` | `install.sql`, `procedures.sql`, `uninstall.sql` |
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `demo.sh`, `scale.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M, BIGANN) to text for COPY, and generates random clustered vectors |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them all unfenced and a short set fenced (`--complete`: all in every mode) |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vscan.sh` (exact search without an index), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them all unfenced and a short set fenced (`--complete`: all in every mode) |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

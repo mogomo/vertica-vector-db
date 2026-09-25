@@ -3,7 +3,7 @@
 --   vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin [, index_type])
 --   vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
 --                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
---                             freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir]])
+--                             freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir [, reachability]]])
 --   vvector.refresh_index(index_name [, mode])
 --   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
@@ -438,14 +438,19 @@ $$;
 -- by hand). The procedures then use it for this index even
 -- when a session sets the cache_dir session parameter; a query without cache_dir finds it through a
 -- small OPTIONS file in the default directory.
+-- x_reach (reachability, argument 16): whether an HNSW build counts the live vectors that no search
+-- can reach (auto: every full build, and incremental builds below 8M positions; on: every build;
+-- off: never). Applies at the next refresh; vinfo and the manifest report the count.
 -- set_index_options_core does the work; every form prints the NOTICE (NOTICEs of a nested CALL do not
 -- reach the caller).
 DROP PROCEDURE IF EXISTS vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR,
                                                         VARCHAR, VARCHAR, INT, INT, INT);
+DROP PROCEDURE IF EXISTS vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR,
+                                                        VARCHAR, VARCHAR, INT, INT, INT, VARCHAR);
 CREATE OR REPLACE PROCEDURE vvector.set_index_options_core(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                            x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                            x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
-                                                           x_cache VARCHAR)
+                                                           x_cache VARCHAR, x_reach VARCHAR)
 LANGUAGE PLvSQL AS $$
 DECLARE
     old_home VARCHAR(1024); new_home VARCHAR(1024); sid INT;
@@ -496,6 +501,9 @@ BEGIN
     IF x_verify IS NOT NULL AND x_verify < 0 THEN
         RAISE EXCEPTION 'vvector.set_index_options: verify_every must be 0 (never), 1 (every refresh) or more';
     END IF;
+    IF x_reach IS NOT NULL AND x_reach NOT IN ('auto', 'on', 'off') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: reachability must be auto, on or off';
+    END IF;
     old_home := (SELECT MAX(cache_dir) FROM vvector.manifest WHERE index_name = nm);
     new_home := old_home;
     IF x_cache IS NOT NULL THEN
@@ -520,7 +528,8 @@ BEGIN
         ef_search_default = CASE WHEN x_ef IS NULL THEN ef_search_default WHEN x_ef = 0 THEN NULL ELSE x_ef END,
         threads_default = CASE WHEN x_thr IS NULL THEN threads_default WHEN x_thr = 0 THEN NULL ELSE x_thr END,
         verify_every = COALESCE(x_verify, verify_every),
-        cache_dir = new_home
+        cache_dir = new_home,
+        reachability = COALESCE(x_reach, reachability, 'auto')
         WHERE index_name = nm;
     sid := (SELECT MAX(active_snapshot) FROM vvector.manifest WHERE index_name = nm);
     IF COALESCE(new_home, '') <> COALESCE(old_home, '') AND sid IS NOT NULL THEN
@@ -540,35 +549,48 @@ $$;
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
-                                                      x_cache VARCHAR)
+                                                      x_cache VARCHAR, x_reach VARCHAR)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache);
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, x_reach);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
--- The 14-argument form: cache_dir stays as it is.
+-- The 15-argument form: reachability stays as it is.
+CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
+                                                      x_cache VARCHAR)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, NULL);
+    RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
+END;
+$$;
+
+-- The 14-argument form: cache_dir and reachability stay as they are.
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, x_verify, NULL);
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, NULL, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
--- The 13-argument form of the first releases: verify_every and cache_dir stay as they are.
+-- The 13-argument form of the first releases: verify_every, cache_dir and reachability stay as they are.
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, NULL, NULL);
+                                                x_prec, x_fresh, x_ef, x_thr, NULL, NULL, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
@@ -738,6 +760,11 @@ BEGIN
     every := (SELECT MAX(rebuild_every) FROM vvector.manifest WHERE index_name = nm);
     RAISE NOTICE 'vvector: index %: % index, % live vectors, % tombstones (tombstone_ratio %), refresh_mode %, % incremental refreshes since the last full build (rebuild_every %)',
                  nm, kind, live, tomb, ratio, COALESCE(rmode, 'auto'), since, COALESCE(every::VARCHAR, 'never');
+    IF kind = 'hnsw' AND (SELECT COUNT(active_snapshot) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
+        RAISE NOTICE 'vvector: index %: vectors no search can reach: % (reachability %)', nm,
+                     (SELECT COALESCE(MAX(unreachable)::VARCHAR, 'not counted') FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT COALESCE(MAX(reachability), 'auto') FROM vvector.manifest WHERE index_name = nm);
+    END IF;
     IF ver IS NOT NULL THEN
         RAISE NOTICE 'vvector: index %: journal digest verified %; % refreshes since the last verification or full build', nm,
                      (SELECT CASE WHEN COALESCE(MAX(verify_every), 1) = 0 THEN 'never (verify_every 0): after a physical UPDATE, DELETE or dropped partition run refresh_index(name, ''full'')'
@@ -867,7 +894,7 @@ DECLARE
     why VARCHAR(600); r_note VARCHAR(2400); build_opts VARCHAR(1600); w_since TIMESTAMPTZ; lag_note VARCHAR(600); young INT;
     cd VARCHAR(1100); build_est INT; free_mem INT; bin_note VARCHAR(300); cores INT; grew BOOLEAN;
     send VARCHAR(8); chain VARCHAR(4000); chain_b INT; whole_b INT; xfer VARCHAR(8); base_col INT; sent INT; n_cap INT;
-    t_note VARCHAR(400); chain_n INT;
+    t_note VARCHAR(400); chain_n INT; reach VARCHAR(8); n_unr INT; u_note VARCHAR(400);
 BEGIN
     -- The manifest row in one query: PL/vSQL runs every assignment as a query of its own (2 to 7 ms
     -- each on a cluster), so the row is read once, not column by column. Digests are compared as
@@ -878,9 +905,11 @@ BEGIN
            active_options, format_version, COALESCE(vector_count, 0), COALESCE(tombstones, 0), boundary_rows,
            boundary_digest::VARCHAR, active_max_ver, COALESCE(verify_every, 1), COALESCE(refreshes_since_verify, 0),
            CASE WHEN cache_dir IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(cache_dir) END,
-           SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), snapshot_chain, COALESCE(chain_bytes, 0), index_bytes
+           SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), snapshot_chain, COALESCE(chain_bytes, 0), index_bytes,
+           COALESCE(reachability, 'auto')
       INTO tab, idc, vc, op, ver, measure, kind, quant, hm, hefc, margin, prev, prev_from, rmode, ratio, every, since,
-           prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl, chain, chain_b, whole_b
+           prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl, chain, chain_b, whole_b,
+           reach
       FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
@@ -1115,7 +1144,8 @@ BEGIN
     build_opts := 'index_name=' || QUOTE_LITERAL(nm) || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind)
                || ', quantization=' || QUOTE_LITERAL(quant) || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || max_ver
                || CASE WHEN why IS NULL THEN ', base_snapshot=' || prev || ', send=' || QUOTE_LITERAL(send) ELSE '' END || cd
-               || CASE WHEN bin_note IS NULL THEN '' ELSE ', build_in=''file''' END;
+               || CASE WHEN bin_note IS NULL THEN '' ELSE ', build_in=''file''' END
+               || CASE WHEN kind = 'hnsw' THEN ', reachability=' || QUOTE_LITERAL(reach) ELSE '' END;
     EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot (index_name, snapshot_id, byte_offset, chunk, base_snapshot) SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
          || ', byte_offset, chunk, base_snapshot FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS ' || build_opts
          || ') OVER() FROM (' || source || ') e) b';
@@ -1156,6 +1186,20 @@ BEGIN
         n_tomb := EXECUTE 'SELECT MAX(tombstones) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
         n_bytes := EXECUTE 'SELECT MAX(file_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
         n_cap := EXECUTE 'SELECT MAX(capacity) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        -- Unreachable vectors of an HNSW graph: counted by the build (vbuild reachability) and kept in
+        -- the graph header; NULL when not counted. Named in the note when there are any, or when the
+        -- build did not count.
+        n_unr := NULL;
+        u_note := NULL;
+        IF kind = 'hnsw' THEN
+            n_unr := EXECUTE 'SELECT MAX(unreachable) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+            IF n_unr IS NULL THEN
+                u_note := 'unreachable vectors not counted (reachability ' || reach
+                       || CASE WHEN reach = 'auto' THEN ': an incremental build of 8 million positions or more; set_index_options reachability on counts every build' ELSE '' END || ')';
+            ELSIF n_unr > 0 THEN
+                u_note := n_unr || ' vectors that no search can reach (the graph left them without a link; a full build, refresh_index(name, ''full''), usually links them)';
+            END IF;
+        END IF;
         -- What was stored and sent: a patch's pieces are few and small (summed); a whole copy's are
         -- 8 MB chunks, all-zero ones left out (counted, not read).
         base_col := (SELECT MAX(base_snapshot) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
@@ -1184,15 +1228,15 @@ BEGIN
             r_note := 'refreshed: snapshot ' || sid || ', full build (' || why || '), ';
         END IF;
         r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
-               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds; ' || t_note || COALESCE('; ' || bin_note, '') || COALESCE('; ' || j_note, '')
-               || COALESCE('; ' || lag_note, '');
+               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds; ' || t_note || COALESCE('; ' || u_note, '') || COALESCE('; ' || bin_note, '')
+               || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '');
         PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
                        base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
                        graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
                        active_options = opts, incremental_count = CASE WHEN why IS NULL THEN since + 1 ELSE 0 END,
                        boundary_rows = rows_next, boundary_digest = digest_next::NUMERIC(38,0),
                        refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = LEFT(r_note, 1000),
-                       snapshot_chain = chain, chain_bytes = chain_b, sent_bytes = sent, transfer = xfer, capacity = n_cap
+                       snapshot_chain = chain, chain_bytes = chain_b, sent_bytes = sent, transfer = xfer, capacity = n_cap, unreachable = n_unr
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
@@ -1382,7 +1426,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VA
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM PUBLIC;
-REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
@@ -1408,7 +1453,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VA
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM vvector_search;
-REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM vvector_search;
@@ -1425,7 +1471,8 @@ GRANT EXECUTE ON PROCEDURE vvector.register_index(VARCHAR, VARCHAR, VARCHAR, VAR
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) TO vvector_admin;
-GRANT EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;

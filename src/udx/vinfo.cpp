@@ -2,14 +2,17 @@
 //   vvector.vinfo([USING PARAMETERS index_name='docs']) OVER(PARTITION NODES) FROM vvector.probe
 // Output (node_name, index_name, snapshot_id, max_ver, vector_count, dims, metric, index_type,
 // quantization, graph_bytes, tombstones, base_snapshot, precision_default, freshness_default,
-// ef_search_default, threads_default, cache_file, loaded, resident_mb, capacity, file_bytes). The
-// defaults are the index defaults of set_index_options (NULL = the built-in default). vector_count
-// counts the live vectors; the snapshot has vector_count + tombstones positions. resident_mb: how much
-// of the cache file is in the node's memory now (page cache; milestone M6). capacity: the positions
-// the layout has room for (milestone M7: an incremental build appends into the room without moving a
-// section); file_bytes: the size of the cache file.
+// ef_search_default, threads_default, cache_file, loaded, resident_mb, capacity, file_bytes,
+// unreachable). The defaults are the index defaults of set_index_options (NULL = the built-in
+// default). vector_count counts the live vectors; the snapshot has vector_count + tombstones
+// positions. resident_mb: how much of the cache file is in the node's memory now (page cache;
+// milestone M6). capacity: the positions the layout has room for (milestone M7: an incremental build
+// appends into the room without moving a section); file_bytes: the size of the cache file;
+// unreachable: the live vectors of an HNSW graph that no search can reach, as counted by the build
+// (NULL for a flat index and when the build did not count: vbuild parameter reachability).
 // Without index_name it lists every index of the cache directory that has an ACTIVE or OPTIONS file.
 #include "udx_common.h"
+#include "../engine/hnsw.h"
 
 #include <limits>
 
@@ -19,7 +22,7 @@ using namespace vvector_udx;
 static const char *const FN = "vinfo";
 
 enum { C_NODE, C_INDEX, C_SNAPSHOT, C_MAX_VER, C_COUNT, C_DIMS, C_METRIC, C_TYPE, C_QUANT, C_GRAPH, C_TOMB, C_BASE,
-       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_CAPACITY, C_BYTES, C_COLUMNS };
+       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_CAPACITY, C_BYTES, C_UNREACHABLE, C_COLUMNS };
 
 class VInfo : public TransformFunction
 {
@@ -71,14 +74,18 @@ class VInfo : public TransformFunction
                     out.setInt(C_RESIDENT, (vint)(snap.resident_bytes() / 1048576));
                     out.setInt(C_CAPACITY, (vint)s.capacity);
                     out.setInt(C_BYTES, (vint)snap.size());
+                    // The graph header only (the links are not read): NULL when the build did not count.
+                    out.setNull(C_UNREACHABLE);
+                    if (s.has_graph()) {
+                        const vvector::HnswGraph g = vvector::hnsw_open(s, false);
+                        if (g.counted) out.setInt(C_UNREACHABLE, (vint)g.unreachable);
+                    }
                 } catch (std::runtime_error &e) {
                     // Not loaded or damaged: say why in the cache_file column.
                     for (int c = C_SNAPSHOT; c < C_FILE; ++c) out.setNull(c);
                     out.getStringRef(C_FILE).copy(std::string(e.what()).substr(0, 1024));
                     out.setBool(C_LOADED, vbool_false);
-                    out.setNull(C_RESIDENT);
-                    out.setNull(C_CAPACITY);
-                    out.setNull(C_BYTES);
+                    for (int c = C_RESIDENT; c < C_COLUMNS; ++c) out.setNull(c);
                 }
                 out.next();
             }
@@ -87,9 +94,7 @@ class VInfo : public TransformFunction
                 for (int c = C_INDEX; c < C_FILE; ++c) out.setNull(c);
                 out.getStringRef(C_FILE).copy("no indexes in " + cache_dir);
                 out.setBool(C_LOADED, vbool_false);
-                out.setNull(C_RESIDENT);
-                out.setNull(C_CAPACITY);
-                out.setNull(C_BYTES);
+                for (int c = C_RESIDENT; c < C_COLUMNS; ++c) out.setNull(c);
                 out.next();
             }
         } catch (std::exception &e) {
@@ -113,6 +118,7 @@ class VInfoFactory : public TransformFunctionFactory
         returnType.addInt();               // resident_mb
         returnType.addInt();               // capacity
         returnType.addInt();               // file_bytes
+        returnType.addInt();               // unreachable
     }
 
     virtual void getReturnType(ServerInterface &srvInterface, const SizedColumnTypes &inputTypes,
@@ -139,6 +145,7 @@ class VInfoFactory : public TransformFunctionFactory
         outputTypes.addInt("resident_mb");
         outputTypes.addInt("capacity");
         outputTypes.addInt("file_bytes");
+        outputTypes.addInt("unreachable");
     }
 
     virtual void getParameterType(ServerInterface &srvInterface, SizedColumnTypes &parameterTypes)

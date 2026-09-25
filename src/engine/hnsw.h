@@ -40,14 +40,23 @@ struct HnswHeader {
     std::uint64_t level_seed;      // levels are a function of (level_seed, id)
     std::uint64_t upper_blocks;    // blocks in the upper part: the sum of all levels
     std::uint64_t upper_capacity;  // blocks the upper part has room for (snapshot FLAG_CAPACITY); else 0
-    std::uint64_t reserved1;
+    std::uint64_t unreachable1;    // live positions no search can reach, plus 1; 0 = not counted (M7 E)
 };
 static_assert(sizeof(HnswHeader) == HNSW_HEADER_BYTES, "graph header must be 64 bytes");
+
+// Whether a build counts the live positions that no search from the entry point can reach (reach.h)
+// and stores the count in the graph header. Auto: every full build, and incremental builds of graphs
+// below HNSW_REACH_AUTO_LIMIT positions (the walk over level 0 costs about a second per 10M positions
+// on a core, and the incremental promise is seconds). On: always. Off: never (the header says "not
+// counted").
+enum class Reachability { Auto, On, Off };
+constexpr std::uint64_t HNSW_REACH_AUTO_LIMIT = 8000000;
 
 struct HnswParams {
     std::uint32_t m = 16;                  // links per node and level (2 x m on level 0)
     std::uint32_t ef_construction = 200;   // candidate list size while building
     int threads = 1;                       // build threads
+    Reachability reachability = Reachability::Auto;
 };
 
 // The level of the node with this id: floor(-ln(u) / ln(m)) for u in (0, 1] from a hash of
@@ -59,6 +68,8 @@ struct HnswGraph {
     std::uint32_t m = 0, m0 = 0, ef_construction = 0, max_level = 0, entry_point = 0;
     std::uint64_t count = 0, upper_blocks = 0;
     std::uint64_t capacity = 0, upper_capacity = 0;   // what the layout has room for (= count, upper_blocks without FLAG_CAPACITY)
+    bool counted = false;                             // the build counted the unreachable live positions
+    std::uint64_t unreachable = 0;                    // that count (valid when counted)
     const std::uint8_t *levels = nullptr;
     const std::uint32_t *level0 = nullptr;
     const std::uint32_t *upper_index = nullptr;

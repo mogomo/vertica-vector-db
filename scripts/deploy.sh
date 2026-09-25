@@ -68,6 +68,6 @@ if [ "$UNDEPLOY" = no ]; then
     vsql -X -c "SELECT vvector.vversion() OVER();"
     vsql -X -c "SELECT schema_name || '.' || function_name AS function_name, is_fenced FROM v_catalog.user_functions
                 WHERE schema_name IN ('vvector', 'vvector_admin')
-                  AND function_name IN ('vversion','vbuild','vload','vconfig','vnode','vinfo','vsearch','vknn','vector_add','vector_avg')
+                  AND function_name IN ('vversion','vbuild','vload','vconfig','vnode','vinfo','vsearch','vknn','vscan','vector_add','vector_avg')
                 ORDER BY 1;"
 fi

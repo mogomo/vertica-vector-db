@@ -77,10 +77,25 @@ for m in l2 cos dot l1; do
 CALL vvector.register_index('vh_$m', '$SCHEMA.journal', 'id', 'vec', 'del', 'ts', '$metric', NULL);
 CALL vvector.refresh_index('vh_$m');"
 done
-expect "manifest and vinfo: hnsw with a graph" "^hnsw hnsw [1-9][0-9]* 16 200$" "
+expect "manifest and vinfo: hnsw with a graph, every vector reachable (counted by the build)" "^hnsw hnsw [1-9][0-9]* 16 200 unreachable 0 0 auto$" "
 SELECT m.index_type || ' ' || i.index_type || ' ' || i.graph_bytes || ' ' || m.hnsw_m || ' ' || m.hnsw_ef_construction
+       || ' unreachable ' || i.unreachable || ' ' || m.unreachable || ' ' || m.reachability
 FROM vvector.manifest m JOIN (SELECT * FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) v) i
      ON i.index_name = m.index_name WHERE m.index_name = 'vh_l2' LIMIT 1;"
+expect "status prints the count" "vectors no search can reach: 0 (reachability auto)" "CALL vvector.status('vh_l2');"
+expect "set_index_options reachability off (16 arguments), refresh: not counted, the note says so" "unreachable vectors not counted (reachability off)" "
+CALL vvector.set_index_options('vh_l1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'off');
+CALL vvector.refresh_index('vh_l1', 'full');"
+expect "vinfo and the manifest show NULL when not counted" "^not counted, not counted$" "
+SELECT COALESCE(i.unreachable::VARCHAR, 'not counted') || ', ' || COALESCE(m.unreachable::VARCHAR, 'not counted')
+FROM vvector.manifest m JOIN (SELECT * FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) v) i
+     ON i.index_name = m.index_name WHERE m.index_name = 'vh_l1' LIMIT 1;"
+expect "reachability on, refresh: counted again" "^0 on$" "
+CALL vvector.set_index_options('vh_l1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'on');
+CALL vvector.refresh_index('vh_l1', 'full');
+SELECT unreachable || ' ' || reachability FROM vvector.manifest WHERE index_name = 'vh_l1';"
+expect "a bad reachability is refused" "reachability must be auto, on or off" "
+CALL vvector.set_index_options('vh_l1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'yes');"
 
 echo "== exact search on an HNSW index"
 for m in l2 cos dot l1; do compare "vh_$m: precision exact equals the full scan" "$m" queries20 10 exact ", precision='exact'"; done

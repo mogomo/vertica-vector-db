@@ -122,6 +122,23 @@ follow hnswlib, the code is our own.
   node (a search for it), preferring a list with room. With it, a search with
   ef = count finds exactly what the flat search finds; `test_hnsw` checks
   that for every metric, for clustered data and for 1500 equal vectors.
+- Unreachable count (milestone M7): after the repair, the build counts the
+  live positions that a walk over level 0 from the entry point does not visit
+  (src/engine/reach.cpp: a breadth-first walk, one frontier per round, the
+  frontier split over the build threads, one bit per position; the count does
+  not depend on the number of threads) and stores it in the graph header
+  (`unreachable1` = count + 1; 0 = not counted, which is what every file
+  written before this field reads as). vinfo reports it (`unreachable`),
+  refresh_index keeps it in the manifest and names it in `refresh_note` when it
+  is above 0 or was not counted, status prints it. The vbuild parameter and
+  index option `reachability` chooses when to count: `auto` at every full
+  build and at incremental builds below 8 million positions (the walk reads
+  the whole level 0, about (2m + 1) x 4 bytes per position: 13.5 GB at 100M
+  x m 16; measured 0.11 s for SIFT1M on the 8 aarch64 cores of the VM, so
+  about 10 s at 100M in memory and minutes from disk, against an incremental
+  refresh that should take seconds), `on` always, `off` never. The repair
+  pass makes the count 0 in every test (SIFT1M: 0); the count is the check
+  that it did.
 - Search: greedy descent from the entry point, then a beam search on level 0
   with ef = max(ef_search, k). The neighbours of a node are scored in one
   kernel call (`keys_gather`) that prefetches the next rows while it scores
@@ -335,6 +352,33 @@ restarting at every doubling cost up to twice the last walk.
 order. A C++ aggregate cannot read an ARRAY argument in Vertica 26.2 (the server crashed in
 `BlockReader::getArrayRef` inside `aggregate()`; VERTICA_NOTES), so vector_sum and vector_avg are
 transform functions, which can also run fenced.
+
+## Exact search without an index: vscan (milestone M7)
+
+`vscan(id, vec USING PARAMETERS query | queries, k, metric, radius) OVER(PARTITION BEST)`
+is the MPP full scan: no snapshot, no registration, no cache. Vertica runs
+one instance per node and core over the rows that node holds; each instance
+converts its rows to float32 blocks of 4096 (the row stride of the snapshot
+format, zero padded, cosine rows normalised on the fly), scores every block
+with the flat kernels (`merge_block` of flat.h keeps the running k best per
+query, exactly as the journal overlay of vsearch) and returns its local k
+best per query as (qid, id, score). The SQL around the function merges the
+instances: `ORDER BY score LIMIT k`, or `ROW_NUMBER() OVER(PARTITION BY qid
+ORDER BY score, id) <= k` for several queries. The scores are the same
+numbers as an exact vsearch on the same rows (the same kernels), so vscan is
+the recall reference for indexes too large for the SQL full scan (the
+built-in `ORDER BY VECTOR_L2(...) LIMIT k` over 100M rows takes about 12
+minutes on the 4-node cluster). The engine test (`test_flat`) checks that
+blocks of 1, 7, 1000, 4096 and 30000 rows merged one after another give
+exactly the one-block search, with and without a radius; `test_vscan.sh`
+checks the function against the built-ins on a cluster.
+
+Several queries travel in the `queries` parameter, a LONG VARCHAR (up to 32
+MB, verified on the 3-node cluster: VERTICA_NOTES M7); a VARCHAR parameter
+would hold 65000 bytes, about 40 queries of 128 dimensions. Memory per
+instance: the queries plus one block. Filtering is a WHERE on the table
+before the function: true pre-filtering with any predicate, at the cost of
+reading the table.
 
 ## vload on every node
 

@@ -6,10 +6,12 @@
 // skipped with a message.
 #include "check.h"
 
+#include "../../src/engine/delta.h"
 #include "../../src/engine/flat.h"
 #include "../../src/engine/hnsw.h"
 #include "../../src/engine/kernels.h"
 #include "../../src/engine/parallel.h"
+#include "../../src/engine/reach.h"
 
 #include <algorithm>
 #include <chrono>
@@ -223,6 +225,66 @@ static void test_layout_and_validity()
     CHECK(throws([] { hnsw_section_bytes(nullptr, 0, 257, 0); }, "m must be 2 to 256"));
 }
 
+// The unreachable count (M7 E): a fresh build stores 0; a graph cut by hand (every link to one
+// node removed) counts that node on any number of threads, and equals what the test walk finds;
+// tombstoned nodes are never counted; reachability off stores "not counted"; the count is valid
+// after an incremental build (delta.h) too.
+static void test_unreachable()
+{
+    TestSet t;
+    build_graph(t, 3000, 33, Metric::L2, 6, 40, 4);
+    HnswGraph g = hnsw_open(t.set, true);
+    CHECK(g.counted && g.unreachable == 0);
+
+    // Cut node 1234 out of every level-0 link list: nothing reaches it any more.
+    const std::uint32_t victim = 1234;
+    CHECK(g.entry_point != victim);
+    std::uint32_t *level0 = reinterpret_cast<std::uint32_t *>(t.buffer.data() + (reinterpret_cast<const std::uint8_t *>(g.level0) - t.buffer.data()));
+    for (std::uint32_t p = 0; p < g.count; ++p) {
+        std::uint32_t *l = level0 + std::uint64_t(p) * (g.m0 + 1);
+        std::uint32_t n = 0;
+        for (std::uint32_t i = 1; i <= l[0]; ++i)
+            if (l[i] != victim) l[1 + n++] = l[i];
+        for (std::uint32_t i = n + 1; i <= l[0]; ++i) l[i] = 0;
+        l[0] = n;
+    }
+    const VectorSet cut = snapshot_open(t.buffer.data(), t.buffer.size(), false);
+    const HnswGraph gc = hnsw_open(cut, true);
+    CHECK(reachable(gc) == cut.count - 1);
+    for (int threads : {1, 3, 8}) CHECK(hnsw_unreachable(cut, gc, threads) == 1);
+    // A tombstoned victim is not counted.
+    {
+        SnapshotBuilder b(Metric::L2);
+        std::vector<float> v(33);
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            test_vector(i, 33, 3, true, v.data());
+            b.add(static_cast<std::int64_t>(7 + 5 * i), v.data(), 33);
+        }
+        // The same graph, then the victim deleted through an incremental build with reachability on.
+        HnswParams p;
+        p.m = 6;
+        p.ef_construction = 40;
+        p.threads = 4;
+        p.reachability = Reachability::Off;
+        const GraphSection gs = hnsw_graph_section(p);
+        SnapshotBuffer buf;
+        b.finish(0, buf, &gs);
+        const VectorSet off = snapshot_open(buf.data(), buf.size(), true);
+        const HnswGraph go = hnsw_open(off, true);
+        CHECK(!go.counted && go.unreachable == 0);
+        p.reachability = Reachability::On;
+        IncrementalBuilder inc(off);
+        inc.remove(static_cast<std::int64_t>(7 + 5 * victim));
+        SnapshotBuffer out;
+        CHECK(inc.finish(1, 1, out, &p));
+        const VectorSet next = snapshot_open(out.data(), out.size(), true);
+        CHECK(next.dead(victim));
+        const HnswGraph gn = hnsw_open(next, true);
+        CHECK(gn.counted && gn.unreachable == 0);
+        CHECK(hnsw_unreachable(next, gn, 2) == 0);
+    }
+}
+
 static void test_small()
 {
     for (std::uint64_t n : {1u, 2u, 3u, 17u}) {
@@ -412,8 +474,14 @@ static void test_sift(const std::string &dir)
     s.n_queries = nq;
     s.k = 10;
     s.threads = p.threads;
-    std::printf("  SIFT1M: %llu x %u, m 16, ef_construction 200, %d threads: build %.1f s\n",
-                static_cast<unsigned long long>(n), dims, p.threads, build_s);
+    std::printf("  SIFT1M: %llu x %u, m 16, ef_construction 200, %d threads: build %.1f s, unreachable %llu (counted by the build)\n",
+                static_cast<unsigned long long>(n), dims, p.threads, build_s, static_cast<unsigned long long>(graph.unreachable));
+    CHECK(graph.counted);
+    const auto t1 = std::chrono::steady_clock::now();
+    const std::uint64_t again = hnsw_unreachable(t.set, graph, p.threads);
+    std::printf("  SIFT1M: the walk again: %llu, %.2f s on %d threads\n", static_cast<unsigned long long>(again),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count(), p.threads);
+    CHECK(again == graph.unreachable);
     for (std::uint32_t ef : {16u, 32u, 64u, 100u, 200u}) {
         std::vector<Neighbor> got;
         std::vector<std::uint32_t> gc;
@@ -434,6 +502,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i)
         if (std::strncmp(argv[i], "--dir=", 6) == 0) dir = argv[i] + 6;
     test_layout_and_validity();
+    test_unreachable();
     test_small();
     exact_at_full_ef("l2", Metric::L2, Shape::Random);
     exact_at_full_ef("cosine", Metric::Cosine, Shape::Random);

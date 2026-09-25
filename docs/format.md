@@ -169,7 +169,7 @@ Graph header (64 bytes):
 | 32 | uint64 | level_seed | seed of the level function |
 | 40 | uint64 | upper_blocks | number of blocks in `upper`: the sum of all levels |
 | 48 | uint64 | upper_capacity | FLAG_CAPACITY: blocks `upper` has room for, >= upper_blocks; else 0 |
-| 56 | uint64 | reserved1 | 0 |
+| 56 | uint64 | unreachable1 | live positions that no search from the entry point can reach, plus 1; 0 = the build did not count them (files written before this field read as "not counted") |
 
 Parts, in this order (`levels`, `level0` and `upper_index` sized by the
 snapshot's capacity with FLAG_CAPACITY, `upper` by upper_capacity: upper_blocks

@@ -402,3 +402,23 @@ Check again on other versions.
   passes of byte ranges since (docs/design.md).
 - PL/vSQL loops: `FOR j IN RANGE 1 .. n LOOP ... END LOOP;` and `WHILE cond LOOP ... END LOOP;` both work,
   also with `x := EXECUTE '...'` inside (26.2.0-3).
+
+## Verified in milestone M7 (26.2.0-2 3-node Eon; 26.2.0-1 single node aarch64; 2026-09-25)
+- `OVER(PARTITION BEST)` works with a plain transform function (no `isExploder`): vscan over a
+  20,000-row table ran in 6 instances on the 3-node cluster (2 cores per node), each instance
+  receiving the rows of its node in one `processPartition` call; the rows an instance writes after
+  its input ends (its local top k) all arrive. `OVER()` (one instance) gives the same result.
+- A LONG VARCHAR parameter of a transform function (`SizedColumnTypes::addLongVarchar(32000000,
+  "queries")`) is accepted by CREATE TRANSFORM FUNCTION and by `USING PARAMETERS`: a value of
+  84,539 bytes (500 query vectors of 16 elements) arrived whole, above the 65,000-byte limit of a
+  VARCHAR parameter. vscan's `queries` parameter uses it.
+- A function of the query path may be added to a library that is already deployed: `CREATE OR
+  REPLACE LIBRARY` followed by `CREATE OR REPLACE TRANSFORM FUNCTION vvector.vscan` (install.sql)
+  needs no new grants when the rights are per schema (`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA`
+  runs again in install.sql).
+- `STRING_AGG(x ORDER BY y)` is not Vertica syntax (LISTAGG has no ORDER BY inside either): a test
+  that needs an ordered list takes `MIN(CASE WHEN rank = n THEN id END)` per position.
+- The refresh's build query with the new vbuild parameter `reachability` and the 16-argument form of
+  `set_index_options` (the 13-, 14- and 15-argument forms stay) deployed on the cluster without a
+  `DROP PROCEDURE` of the old forms: `CREATE OR REPLACE PROCEDURE` with a different argument list
+  makes a new overload; the old `set_index_options_core` (15 arguments) is dropped explicitly.

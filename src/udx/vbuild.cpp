@@ -17,7 +17,10 @@
 // build in an unlinked file in <cache_dir>/<index_name> instead of anonymous memory, so the kernel
 // can write the snapshot out and reclaim its pages; for builds larger than the free memory),
 // growth (room to grow in the layout, percent of the count, default 5, 0 = none; milestone M7),
-// send (patch | whole, default patch: what an incremental build returns, see above).
+// send (patch | whole, default patch: what an incremental build returns, see above), reachability
+// (auto | on | off, milestone M7: whether an HNSW build counts the live vectors no search can reach
+// and stores the count in the graph header; auto = every full build and incremental builds below
+// 8M positions).
 // Output (byte_offset, chunk, base_snapshot, vector_count, dims, max_ver, format_version);
 // vector_count counts the live vectors (tombstoned positions are not counted).
 // Thin adapter around src/engine/snapshot.h, src/engine/delta.h and src/engine/hnsw.h.
@@ -56,6 +59,8 @@ class VBuild : public TransformFunction
             if (growth < 0 || growth > vvector::MAX_GROWTH_PERCENT) fail("growth must be 0 to " + std::to_string(vvector::MAX_GROWTH_PERCENT) + " percent");
             const std::string send = params.containsParameter("send") ? params.getStringRef("send").str() : "patch";
             if (send != "patch" && send != "whole") fail("send must be patch or whole, not '" + send + "'");
+            const std::string reach = params.containsParameter("reachability") ? params.getStringRef("reachability").str() : "auto";
+            if (reach != "auto" && reach != "on" && reach != "off") fail("reachability must be auto, on or off, not '" + reach + "'");
             if (build_in != "ram" && build_in != "file") fail("build_in must be ram or file, not '" + build_in + "'");
             const std::string build_dir = build_in == "file" ? vvector::ensure_index_dir(resolve_cache_dir(srvInterface), name) : "";
             if (type != "flat" && type != "hnsw") fail("index_type must be flat or hnsw, not '" + type + "'");
@@ -68,6 +73,7 @@ class VBuild : public TransformFunction
             hp.m = static_cast<std::uint32_t>(m);
             hp.ef_construction = static_cast<std::uint32_t>(efc);
             hp.threads = threads;
+            hp.reachability = reach == "on" ? vvector::Reachability::On : reach == "off" ? vvector::Reachability::Off : vvector::Reachability::Auto;
             const vvector::HnswParams *graph = type == "hnsw" ? &hp : nullptr;
             const auto poll = [this] { return isCanceled(); };
             vvector::SnapshotBuffer buffer;
@@ -229,6 +235,7 @@ class VBuildFactory : public TransformFunctionFactory
         parameterTypes.addVarchar(16, "build_in");
         parameterTypes.addInt("growth");
         parameterTypes.addVarchar(16, "send");
+        parameterTypes.addVarchar(16, "reachability");
     }
 
     virtual TransformFunction *createTransformFunction(ServerInterface &srvInterface)

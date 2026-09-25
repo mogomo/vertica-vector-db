@@ -117,6 +117,9 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS chain_bytes INT DEFAULT NU
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS sent_bytes INT DEFAULT NULL;               -- bytes the last refresh stored and sent to the nodes
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS transfer VARCHAR(8) DEFAULT NULL;          -- how the last refresh sent its snapshot: whole or patch
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS capacity INT DEFAULT NULL;                 -- positions the active snapshot's layout has room for
+-- Unreachable vectors of an HNSW graph (milestone M7): counted by the build, reported by vinfo.
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS reachability VARCHAR(8) DEFAULT 'auto';    -- auto (full builds, and incremental ones below 8M positions), on, off
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS unreachable INT DEFAULT NULL;              -- live vectors of the active graph no search can reach; NULL = not counted, or flat
 -- Journal replica (set_journal_replica; kept up to date by register_index and refresh_index):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS journal_replica VARCHAR(16) DEFAULT 'auto';     -- auto, on or off
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS replica_projection VARCHAR(256) DEFAULT NULL;   -- schema.projection made by vvector
@@ -151,6 +154,7 @@ CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vconfig  AS LANGUAGE 'C++' NA
 CREATE OR REPLACE TRANSFORM FUNCTION vvector_admin.vnode    AS LANGUAGE 'C++' NAME 'VNodeFactory'    LIBRARY vvector :fenced_build;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vsearch  AS LANGUAGE 'C++' NAME 'VSearchFactory'  LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vknn     AS LANGUAGE 'C++' NAME 'VKnnFactory'     LIBRARY vvector :fenced_search;
+CREATE OR REPLACE TRANSFORM FUNCTION vvector.vscan    AS LANGUAGE 'C++' NAME 'VScanFactory'    LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vinfo    AS LANGUAGE 'C++' NAME 'VInfoFactory'    LIBRARY vvector :fenced_search;
 CREATE OR REPLACE TRANSFORM FUNCTION vvector.vversion AS LANGUAGE 'C++' NAME 'VVersionFactory' LIBRARY vvector :fenced_search;
 
