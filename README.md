@@ -536,7 +536,11 @@ may call it:
     CALL vvector.unregister_index('docs');  -- remove schedule, views, snapshots and manifest row
 
 `load_all` repairs node caches (a node that was down during a refresh, a
-deleted cache directory). `unregister_index` leaves the cache files on the
+deleted cache directory) and, in Eon, loads a subcluster that did not run the
+refresh (see [Operations](#operations)). It first asks every node whether it
+already holds the active snapshot and then only rewrites the index defaults
+("already in the cache of all N nodes: nothing to load", milliseconds), so it
+can run as often as wanted. `unregister_index` leaves the cache files on the
 nodes: remove `<cache_dir>/<index_name>` by hand. An index with a schedule
 can be unregistered by a superuser only (Vertica lets only a superuser drop a
 trigger); for anyone else `unregister_index` stops before it removes anything.
@@ -1408,6 +1412,32 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   Tested on one node, on a 3-node Eon cluster and on a 4-node Enterprise
   cluster. A search runs on the node
   that receives the statement; the index is not split over nodes.
+- **Eon subclusters**: a statement runs on the nodes of the subcluster its
+  session is connected to, never on another. So every subcluster keeps node
+  caches of its own: a `refresh_index` builds the snapshot, stores it in
+  `vvector.snapshot` (communal storage, visible to every subcluster) and loads
+  the nodes of the subcluster it runs in. A scheduled refresh runs on
+  Vertica's scheduler node, a primary node, whatever subcluster created the
+  schedule, so it loads the primary subcluster. Every other subcluster that
+  searches the index loads it with
+
+      CALL vvector.load_all('docs');    -- in a session on that subcluster, after each refresh
+
+  from the application after a refresh, or from a cron job with vsql every
+  minute: `load_all` first asks every node of the subcluster whether it has the
+  active snapshot (one call, milliseconds) and loads only when one has not, so
+  the repeated call costs nothing between refreshes. `refresh_index` prints a
+  reminder when the database has more than one subcluster; `status` says how
+  many nodes of the session's subcluster hold the active snapshot; `vinfo`
+  lists the nodes of the session's subcluster. Nothing goes wrong without the
+  load: `vsearch` on a subcluster that is behind answers
+  `snapshot cache stale on <node>: run vload`, and with no cache at all
+  `no snapshot cache for index ... run vload`. `vknn` has no stale check and
+  answers from the snapshot that subcluster holds. A refresh can also run from
+  a session on a secondary subcluster (it needs the base snapshot in that
+  subcluster's cache for an incremental build, else it builds in full); then
+  the primary is the one that runs `load_all`. Tested with
+  `tests/sql/test_subcluster.sh --secondary='vsql -h <a node of the other subcluster> -X -A -t -q'`.
 - **Journal replica on a cluster**: a statement over the `_delta` view
   reads the journal. With the journal segmented over the nodes, every node
   scans its part and sends the rows to the node that runs the search, even
@@ -1615,8 +1645,8 @@ cache), starting with `vknn:`.
 
 | Message (shortened) | Cause | Fix |
 |---|---|---|
-| `vsearch: no snapshot cache for index 'x' in DIR: run vload` | the index was never refreshed, or this node's cache is missing, or the session uses another cache_dir | `CALL vvector.load_all('x')`; check cache_dir |
-| `vsearch: snapshot cache stale on NODE: run vload` | this node missed the last vload (down during a refresh) | `CALL vvector.load_all('x')` |
+| `vsearch: no snapshot cache for index 'x' in DIR: run vload` | the index was never refreshed, or this node's cache is missing, or the session uses another cache_dir, or (Eon) this subcluster was never loaded | `CALL vvector.load_all('x')` in a session on this subcluster; check cache_dir |
+| `vsearch: snapshot cache stale on NODE: run vload` | this node missed the last vload (down during a refresh), or (Eon) the refresh ran on another subcluster | `CALL vvector.load_all('x')` in a session on this subcluster |
 | `vsearch: snapshot cache of index 'x' is missing or damaged (...): run vload` | the cache file was deleted or changed | `CALL vvector.load_all('x')` |
 | `... format version 1, this library reads version 2: refresh the index ...` | cache written by an older library | `CALL vvector.refresh_index('x')` |
 | `vsearch: index 'x' has N dimensions, the query parameter has M` (or `query Q has M`, `the journal vector of id I has M`) | vectors of another length | use vectors of the index's length |
@@ -2022,6 +2052,10 @@ Operations:
 - A refresh builds on one node; its memory is the build memory above.
 - A node that missed a refresh answers "snapshot cache stale ... run vload"
   until `load_all` runs.
+- Eon: a refresh loads the subcluster it runs in (a scheduled one the
+  primary subcluster); every other subcluster runs `load_all` in a session
+  of its own after each refresh, and `vknn` there has no stale check
+  (see [Operations](#operations)).
 - A new snapshot format needs a refresh of every index; the error says so.
 - An incremental refresh reads only the changes and sends only the bytes that
   changed, but every node still reads the new snapshot file once (its
@@ -2056,7 +2090,7 @@ Operations:
 | `scripts/` | `deploy.sh`, `register.sh`, `refresh.sh`, `load_dataset.sh`, `latency.sh`, `benchmark.sh`, `demo.sh`, `scale.sh` |
 | `tools/fvecs.cpp` | converts `.fvecs`, `.ivecs`, `.bvecs` files (SIFT1M, BIGANN) to text for COPY, and generates random clustered vectors |
 | `tests/engine/` | unit tests (`make test`, among them `test_hnsw.cpp`, `test_delta.cpp`, `test_sq8.cpp`, `test_filter.cpp` and `test_vecmath.cpp`) and the engine benchmarks (`make bench`: `bench_flat.cpp`, `bench_hnsw.cpp` (float and sq8), `bench_filter.cpp` (filtered and range search), and `bench_hnswlib.cpp` with `HNSWLIB_DIR=`) |
-| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vscan.sh` (exact search without an index), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them all unfenced and a short set fenced (`--complete`: all in every mode) |
+| `tests/sql/` | integration tests: `test_snapshot.sh`, `test_freshness.sh`, `test_search.sh`, `test_hnsw.sh`, `test_incremental.sh` (`--sift=SCHEMA` adds the 100-refresh test on SIFT1M), `test_rights.sh` (a user with only the documented rights; needs a superuser connection), `test_sq8.sh` (int8 quantisation; `--sift=SCHEMA` adds recall on SIFT1M), `test_filter.sh` (filtered and range search), `test_vscan.sh` (exact search without an index), `test_subcluster.sh` (Eon subclusters; needs `--secondary=<command for a vsql session on another subcluster>`, else skipped), `test_vector_functions.sh`, `test_journal_types.sh` (ARRAY[INT] and ARRAY[NUMERIC] vectors, INT delete flags, TIMESTAMP and INT versions, grants on the views); `run_all.sh` runs them all unfenced and a short set fenced (`--complete`: all in every mode) |
 | `docs/` | `design.md` (decisions, measurements), `format.md` (snapshot format), `build-x86.md` (step by step on x86_64 and Eon), `VERTICA_NOTES.md` (verified Vertica behaviour) |
 
 ## License

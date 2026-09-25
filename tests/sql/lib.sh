@@ -4,6 +4,11 @@
 FAILED=0
 PRE="${PRE:-}"
 
+# NODES_UP: FROM clause of the UP nodes a statement of this session runs on. OVER(PARTITION NODES)
+# covers the session's subcluster in Eon (docs/design.md "Eon subclusters") and every node in
+# Enterprise, where subcluster_name is NULL (the NULL-safe <=> makes both cases one expression).
+NODES_UP="v_catalog.nodes WHERE node_state = 'UP' AND subcluster_name <=> (SELECT subcluster_name FROM v_catalog.nodes WHERE node_name = local_node_name())"
+
 # run_sql NAME SQL: prints the vsql output. With --echo_only prints the SQL instead.
 run_sql() {
     if [ "$ECHO_ONLY" = yes ]; then echo "-- $1"; [ -n "$PRE" ] && echo "$PRE"; echo "$2"; return 0; fi

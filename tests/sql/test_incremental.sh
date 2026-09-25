@@ -86,7 +86,7 @@ FROM (SELECT vector_count, active_snapshot FROM vvector.manifest WHERE index_nam
 CROSS JOIN (SELECT MAX(vector_count) AS n, COUNT(DISTINCT node_name) AS nodes, MAX(snapshot_id) AS sid
             FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$2') OVER(PARTITION NODES) FROM vvector.probe) v WHERE loaded) i
 CROSS JOIN (SELECT COUNT(*) AS n FROM ($LIVE) x) l
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u
 WHERE i.sid = m.active_snapshot;"
 }
 refresh() {   # NAME INDEX PATTERN [MODE]
@@ -207,7 +207,7 @@ SELECT 'capacity > count: ' || (MIN(capacity) > MAX(vector_count + tombstones)):
 FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='vih_l2') OVER(PARTITION NODES) FROM vvector.probe) i;"
 [ "$ECHO_ONLY" = yes ] || rm -rf "$CACHE_DIR/vih_l2"
 wait_cache_check
-expect "load_all replays the chain (the whole copy, then the patch) into a cache directory that was removed" "loaded on all nodes (2 of the chain" "
+expect "load_all replays the chain (the whole copy, then the patch) into a cache directory that was removed" "loaded on all nodes.*(2 of the chain" "
 CALL vvector.load_all('vih_l2');"
 built_equals_live "vih_l2 after the replay" vih_l2
 IX_PREFIX=vih_

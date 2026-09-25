@@ -158,7 +158,7 @@ expect "vinfo after load_all: every node has the active snapshot" "^nodes with t
 SELECT 'nodes with the active snapshot: ' || CASE WHEN i.ok = u.up THEN 'all' ELSE i.ok || ' of ' || u.up END
 FROM (SELECT COUNT(DISTINCT node_name) AS ok FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) g
       WHERE loaded AND snapshot_id = $SID) i
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u;"
 if [ "$ECHO_ONLY" = yes ]; then
     echo "cp $CACHE_DIR/$IX/<active>.vv $CACHE_DIR/$IX/1.vv; echo 1 > $CACHE_DIR/$IX/ACTIVE"
 else
@@ -172,7 +172,7 @@ expect "vinfo shows exactly one node behind (this one), the others on the active
 SELECT 'nodes behind: ' || (u.up - i.ok)
 FROM (SELECT COUNT(DISTINCT node_name) AS ok FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) g
       WHERE loaded AND snapshot_id = $SID) i
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u;"
 expect "load_all repairs that too" "loaded on all nodes" "CALL vvector.load_all('$IX');"
 expect "vsearch works again after the repairs" "^rows: 5$" "$COUNT5"
 
@@ -254,7 +254,7 @@ echo "== journal replica (an unsegmented projection of the journal, so the delta
 REP="${IX}_journal_rep"
 has_rep() { echo "SELECT 'replica projections: ' || COUNT(DISTINCT projection_name) FROM v_catalog.projections
                    WHERE LOWER(projection_schema) = LOWER('$SCHEMA') AND LOWER(projection_name) = LOWER('$1');"; }
-NODES=$( [ "$ECHO_ONLY" = yes ] && echo 1 || vsql -X -A -t -c "SELECT COUNT(*) FROM v_catalog.nodes" )
+NODES=$( [ "$ECHO_ONLY" = yes ] && echo 1 || vsql -X -A -t -c "SELECT COUNT(*) FROM $NODES_UP" )
 if [ "$NODES" -gt 1 ]; then
     expect "auto on $NODES nodes: register and refresh made the replica" "^replica projections: 1$" "$(has_rep "$REP")"
     Q1=$(printf '%s' "$VEC" | sed 's/RANDOM() \* 2 - 1/0.5/g')

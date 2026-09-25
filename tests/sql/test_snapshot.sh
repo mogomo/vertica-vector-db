@@ -43,7 +43,7 @@ CD=", cache_dir='$CACHE_DIR'"
 # The chunks joined to one probe row per node, as load_on_nodes does: the snapshot table is segmented,
 # so on more than one node the chunks are broadcast (the hint gives only a warning on one node).
 NODES=1
-[ "$ECHO_ONLY" = yes ] || NODES=$(vsql -X -A -t -c "SELECT COUNT(*) FROM nodes WHERE node_state = 'UP'" 2>/dev/null || echo 1)
+[ "$ECHO_ONLY" = yes ] || NODES=$(vsql -X -A -t -c "SELECT COUNT(*) FROM $NODES_UP" 2>/dev/null || echo 1)
 if [ "${NODES:-1}" -gt 1 ]; then
     CHUNKS="SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk, s.base_snapshot FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE"
 else
@@ -87,7 +87,7 @@ FROM (SELECT COUNT(DISTINCT node_name) AS loaded
             FROM ($CHUNKS
                   WHERE s.index_name = 'vvtest' AND s.snapshot_id = 1
                     AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) g WHERE status = 'loaded') l
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u;"
 
 expect "vload again (idempotent)" "^loaded$" "
 SELECT DISTINCT status FROM (SELECT vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
@@ -103,7 +103,7 @@ SELECT CASE WHEN i.nodes_reporting = u.up AND i.min_count = t.n AND i.max_count 
 FROM (SELECT COUNT(DISTINCT node_name) AS nodes_reporting, MIN(vector_count) AS min_count, MAX(vector_count) AS max_count,
              MIN(dims) AS min_dims, MAX(dims) AS max_dims, MAX(metric) AS metrics, MIN(max_ver) AS min_ver, MIN(loaded::INT) AS all_loaded
       FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='vvtest'$CD) OVER(PARTITION NODES) FROM vvector.probe) g) i
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u
 CROSS JOIN (SELECT COUNT(*) AS n FROM $SCHEMA.vectors) t;"
 
 echo "== vbuild input rules"
@@ -212,7 +212,7 @@ vinfo_file() {  # PATTERN: every UP node reports the snapshot file of $IXC under
     echo "SELECT CASE WHEN COUNT(DISTINCT v.node_name) = MAX(u.up) AND MIN(CASE WHEN v.cache_file LIKE '$1/$IXC/%' THEN 1 ELSE 0 END) = 1
                  THEN 'every node: $1' ELSE 'cache_file ' || MAX(v.cache_file) || ' on ' || COUNT(DISTINCT v.node_name) || ' nodes' END
           FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXC') OVER(PARTITION NODES) FROM vvector.probe) v
-          CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
+          CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u;"
 }
 run_sql "cleanup of an earlier run" "CALL vvector.unregister_index('$IXC');" > /dev/null
 [ "$ECHO_ONLY" = yes ] || rm -rf "${ALT:?}/$IXC"
@@ -268,7 +268,7 @@ expect "load_on_nodes in passes of 8 MB: loaded on every node" "^every node: t$"
 CALL vvector.load_on_nodes('$IXP', ${LPSID:-0}, 8);
 SELECT 'every node: ' || (COUNT(DISTINCT v.node_name) = MAX(u.up) AND MIN(v.snapshot_id) = MAX(m.active_snapshot))
 FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXP') OVER(PARTITION NODES) FROM vvector.probe) v
-CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u
+CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u
 CROSS JOIN (SELECT active_snapshot FROM vvector.manifest WHERE index_name = '$IXP') m;"
 expect "vinfo reads the vectors of the loaded file" "^vectors: 20000$" "
 SELECT 'vectors: ' || MIN(vector_count) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IXP') OVER(PARTITION NODES) FROM vvector.probe) v;"

@@ -449,4 +449,26 @@ Check again on other versions.
   `OVER(PARTITION NODES)` over `vvector.probe` from a session on the primary subcluster ran on the 3
   primary nodes only (vnode returned 3 rows of 5 nodes UP; vinfo the same). vload, vconfig and vinfo
   therefore reach the session's subcluster only; the secondary nodes hold no cache until a load runs
-  from a session there. Searches from the secondary subcluster and the rule for it: next session.
+  from a session there.
+- Eon subclusters, from a session on the secondary (session 20): vnode and vinfo listed the 2
+  secondary nodes only; vsearch and vknn answered "no snapshot cache for index ... run vload";
+  `CALL vvector.load_all(...)` there loaded a 630 MB snapshot on its 2 nodes in 10.5 s (the pieces
+  come from communal storage) and the primary's caches stayed as they were; after a refresh on the
+  primary, vsearch on the secondary answered "snapshot cache stale on v_eondb_node0004: run vload"
+  and vknn (no snapshot id input) answered from the older snapshot; load_all on the secondary applied
+  the patch chain (the base cloned from its own cache); refresh_index from the secondary works too
+  (vbuild on a secondary node from the base in its cache; the primary is then the one behind).
+  `v_catalog.nodes.subcluster_name` is NULL in Enterprise (EEVDB4) and the name in Eon, so
+  `subcluster_name <=> (SELECT subcluster_name FROM v_catalog.nodes WHERE node_name = local_node_name())`
+  counts the session's nodes in both modes (4 on EEVDB4, 3 on the Eon primary, 2 on the secondary).
+- Scheduled triggers run on the Active Scheduler Node, a primary node, wherever the schedule was
+  created: two every-minute schedules (`CREATE SCHEDULE ... USING CRON '* * * * *'`, a trigger
+  calling a procedure that inserts `local_node_name()`), one created from a session on the primary
+  and one from the secondary, both fired on v_eondb_node0002. CREATE SCHEDULE and CREATE TRIGGER
+  are accepted from a session on a secondary subcluster.
+- `vsql -c "INSERT ..."` without COMMIT: the session ends and the insert is rolled back (vsql's
+  AUTOCOMMIT is off); the SQL tests end every insert with COMMIT.
+- A network vsql connection to a node of the Eon cluster (by its address, node 1 included) failed
+  with "Authentication failed for username dbadmin": the client_auth record `tls_for_all` (HOSTSSL,
+  method TLS, priority 0) takes every network client and the password records are LOCAL. A session
+  on another subcluster was opened by ssh to that node and a local vsql there.

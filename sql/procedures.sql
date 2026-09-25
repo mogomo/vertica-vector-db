@@ -537,7 +537,7 @@ BEGIN
         -- node cannot load it, the CALL fails with vload's message and the change is rolled back.
         -- (No EXCEPTION block: around a UDx query that fails on several nodes, PL/vSQL gets "Operation
         -- canceled" and the handler does not run; VERTICA_NOTES.)
-        PERFORM CALL vvector.load_all(nm);
+        PERFORM CALL vvector.load_all_core(nm);
         PERFORM COMMIT;
     ELSE
         PERFORM COMMIT;
@@ -665,7 +665,10 @@ $$;
 -- time. The table holds the active chain (the last whole copy and the patch sets after it): the whole
 -- copy is loaded first, then every patch set over the one before, so a node that lost its cache gets
 -- the active snapshot back without a rebuild.
-CREATE OR REPLACE PROCEDURE vvector.load_all(nm VARCHAR) LANGUAGE PLvSQL AS $$
+-- load_all_core loads the active chain (the whole copy, then every patch) on the nodes this session
+-- reaches and writes the index defaults there; it never asks whether that is needed (a changed
+-- cache_dir must load whatever vinfo says: the old directory's redirect makes it look loaded).
+CREATE OR REPLACE PROCEDURE vvector.load_all_core(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
     sid INT; chain VARCHAR(4000); i INT; member VARCHAR(40); loaded INT;
 BEGIN
@@ -693,7 +696,43 @@ BEGIN
         RAISE EXCEPTION 'vvector.load_all: index %: the chain % does not end at the active snapshot %: run CALL vvector.refresh_index(''%'', ''full'')', nm, chain, sid, nm;
     END IF;
     PERFORM CALL vvector.push_options(nm);
-    RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes (% of the chain %)', nm, sid, loaded, chain;
+END;
+$$;
+
+-- load_all: the user's call. Loads only when a node of the session's subcluster lacks the active
+-- snapshot; prints the outcome itself (a NOTICE of a nested CALL does not reach the caller).
+CREATE OR REPLACE PROCEDURE vvector.load_all(nm VARCHAR) LANGUAGE PLvSQL AS $$
+DECLARE
+    sid INT; chain VARCHAR(4000); want INT; got INT; cd VARCHAR(1100); here VARCHAR(200);
+BEGIN
+    SELECT active_snapshot, snapshot_chain INTO sid, chain FROM vvector.manifest WHERE index_name = nm;
+    IF sid IS NULL THEN
+        RAISE EXCEPTION 'vvector.load_all: index % is not registered or has no snapshot yet: run vvector.refresh_index', nm;
+    END IF;
+    IF chain IS NULL OR NOT REGEXP_LIKE(chain, '^[0-9]+(,[0-9]+)*$') THEN
+        chain := sid::VARCHAR;
+    END IF;
+    -- The nodes a statement of this session reaches: in Eon the session's subcluster (every
+    -- subcluster keeps node caches of its own, docs/design.md "Eon subclusters"), in Enterprise
+    -- every node (subcluster_name is NULL there).
+    here := (SELECT CASE WHEN MAX(subcluster_name) IS NULL THEN '' ELSE ' of subcluster ' || MAX(subcluster_name) END
+             FROM v_catalog.nodes WHERE node_name = local_node_name());
+    want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
+           FROM vvector.manifest WHERE index_name = nm);
+    got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd
+        || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE loaded AND snapshot_id = ' || sid;
+    -- Nothing to load when every node has the active snapshot: one vinfo call (milliseconds) instead
+    -- of a load that reads and verifies the whole chain again (seconds), so a periodic load_all on
+    -- a subcluster costs nothing between refreshes. The index defaults are written anyway:
+    -- set_index_options reaches the session's subcluster only.
+    IF COALESCE(got, 0) >= want THEN
+        PERFORM CALL vvector.push_options(nm);
+        RAISE NOTICE 'vvector: index %: snapshot % is already in the cache of all % nodes%: nothing to load', nm, sid, want, here;
+        RETURN;
+    END IF;
+    PERFORM CALL vvector.load_all_core(nm);
+    RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes% (% of the chain %)', nm, sid, here, REGEXP_COUNT(chain, ',') + 1, chain;
 END;
 $$;
 
@@ -746,6 +785,7 @@ DECLARE
     tab VARCHAR(256); ver VARCHAR(128); n INT; t0 TIMESTAMPTZ; ms INT; sch VARCHAR(128); tbl VARCHAR(128);
     bytes INT; all_bytes INT; vectors INT; mem INT; free_mem INT; cores INT; fenced_mb INT; thr INT; build INT;
     rmode VARCHAR(16); tomb INT; kind VARCHAR(16); ver_type VARCHAR(128); live INT; ratio FLOAT; since INT; every INT;
+    sid INT; want INT; got INT; cd VARCHAR(1100); here VARCHAR(200);
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
@@ -779,6 +819,23 @@ BEGIN
     RAISE NOTICE 'vvector: index %: node cache directory: %', nm,
                  (SELECT COALESCE(MAX(cache_dir) || ' (index option cache_dir)', 'the default (' || '/tmp/vvector' || ', or the cache_dir session parameter)')
                   FROM vvector.manifest WHERE index_name = nm);
+    -- The node caches this session can see: in Eon the session's subcluster (every subcluster keeps
+    -- caches of its own, docs/design.md "Eon subclusters"), in Enterprise every node.
+    sid := (SELECT MAX(active_snapshot) FROM vvector.manifest WHERE index_name = nm);
+    IF sid IS NOT NULL THEN
+        here := (SELECT CASE WHEN MAX(subcluster_name) IS NULL THEN '' ELSE ' of subcluster ' || MAX(subcluster_name) END
+                 FROM v_catalog.nodes WHERE node_name = local_node_name());
+        want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+        cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
+               FROM vvector.manifest WHERE index_name = nm);
+        got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd
+            || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE loaded AND snapshot_id = ' || sid;
+        IF COALESCE(got, 0) >= want THEN
+            RAISE NOTICE 'vvector: index %: active snapshot % in the cache of % of % nodes%', nm, sid, got, want, here;
+        ELSE
+            RAISE NOTICE 'vvector: index %: active snapshot % in the cache of % of % nodes%: run CALL vvector.load_all(''%'')', nm, sid, COALESCE(got, 0), want, here, nm;
+        END IF;
+    END IF;
     RAISE NOTICE 'vvector: index %: last refresh: %', nm,
                  (SELECT COALESCE(MAX(refresh_note), 'none yet') FROM vvector.manifest WHERE index_name = nm);
     IF (SELECT COUNT(snapshot_chain) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
@@ -1330,9 +1387,12 @@ $$;
 
 -- refresh_index(index_name [, mode]): mode auto, incremental or full; NULL or left out = the index's
 -- refresh_mode (set_index_options). Prints what was done and why.
+-- In Eon a refresh loads the node caches of the session's subcluster only (a statement never reaches
+-- another subcluster; docs/design.md "Eon subclusters"): with more than one subcluster the caller is
+-- told to run load_all from a session on each of the others.
 CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR, x_mode VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN;
+    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN; nsub INT; sub VARCHAR(128);
 BEGIN
     PERFORM CALL vvector.refresh_index_core(nm, x_mode);
     SELECT refresh_note, replica_note, ver_col IS NOT NULL INTO note, rnote, journal FROM vvector.manifest WHERE index_name = nm;
@@ -1340,18 +1400,28 @@ BEGIN
     IF journal THEN
         RAISE NOTICE 'vvector: index %: journal replica: %', nm, rnote;
     END IF;
+    nsub := (SELECT COUNT(DISTINCT subcluster_name) FROM v_catalog.nodes WHERE node_state = 'UP');
+    IF nsub > 1 THEN
+        sub := (SELECT MAX(subcluster_name) FROM v_catalog.nodes WHERE node_name = local_node_name());
+        RAISE NOTICE 'vvector: index %: loaded on the nodes of subcluster % only; every other subcluster loads it with CALL vvector.load_all(''%'') from a session there (until then a search there gets "snapshot cache stale")', nm, sub, nm;
+    END IF;
 END;
 $$;
 
 CREATE OR REPLACE PROCEDURE vvector.refresh_index(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN;
+    note VARCHAR(1000); rnote VARCHAR(1000); journal BOOLEAN; nsub INT; sub VARCHAR(128);
 BEGIN
     PERFORM CALL vvector.refresh_index_core(nm, NULL);
     SELECT refresh_note, replica_note, ver_col IS NOT NULL INTO note, rnote, journal FROM vvector.manifest WHERE index_name = nm;
     RAISE NOTICE 'vvector: index % %', nm, note;
     IF journal THEN
         RAISE NOTICE 'vvector: index %: journal replica: %', nm, rnote;
+    END IF;
+    nsub := (SELECT COUNT(DISTINCT subcluster_name) FROM v_catalog.nodes WHERE node_state = 'UP');
+    IF nsub > 1 THEN
+        sub := (SELECT MAX(subcluster_name) FROM v_catalog.nodes WHERE node_name = local_node_name());
+        RAISE NOTICE 'vvector: index %: loaded on the nodes of subcluster % only; every other subcluster loads it with CALL vvector.load_all(''%'') from a session there (until then a search there gets "snapshot cache stale")', nm, sub, nm;
     END IF;
 END;
 $$;
@@ -1438,6 +1508,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.load_all_core(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) FROM PUBLIC;
@@ -1465,6 +1536,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM vvector
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.load_all_core(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) FROM vvector_search;
@@ -1492,6 +1564,7 @@ GRANT EXECUTE ON PROCEDURE vvector.apply_replica(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.apply_replica_core(VARCHAR, BOOLEAN) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.register_index_core(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.load_all_core(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) TO vvector_admin;

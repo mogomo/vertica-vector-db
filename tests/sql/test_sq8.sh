@@ -97,7 +97,7 @@ SELECT q || ' on ' || n || ' of ' || up || ' nodes, same: ' || (n = up) FROM
     (SELECT MAX(m.quantization) AS q, COUNT(DISTINCT i.node_name) AS n
      FROM vvector.manifest m JOIN (SELECT * FROM (SELECT vvector.vinfo() OVER(PARTITION NODES) FROM vvector.probe) v) i
           ON i.index_name = m.index_name AND i.quantization = 'sq8' WHERE m.index_name = 'vq_l2') a
-    CROSS JOIN (SELECT COUNT(*) AS up FROM v_catalog.nodes WHERE node_state = 'UP') b;"
+    CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) b;"
 
 echo "== exact results"
 for m in l2 cos dot l1; do compare "vq_$m: precision exact equals the full scan" "$m" queries20 10 exact ", precision='exact'"; done

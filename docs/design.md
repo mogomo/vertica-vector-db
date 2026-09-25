@@ -430,6 +430,47 @@ project this code comes from):
 - vinfo and vconfig read `vvector.probe` for the same reason and answer once
   per node.
 
+### Eon subclusters (milestone M7)
+
+Measured on the Eon test cluster after it grew a secondary subcluster (primary
+`default_subcluster` with 3 nodes, secondary `sc_secondary_1` with 2 nodes, 6
+shards; Vertica 26.2.0-2):
+
+- A statement runs on the nodes of the subcluster its session is connected
+  to and on no other: `OVER(PARTITION NODES) FROM vvector.probe` from a
+  session on the primary ran vnode, vinfo, vconfig and vload on the 3 primary
+  nodes; from a session on the secondary on its 2 nodes. So every subcluster
+  keeps node caches of its own, and a refresh loads the subcluster it runs
+  in. The pieces in `vvector.snapshot` are in communal storage and reach
+  every subcluster: `load_all` from a session on the secondary loaded a
+  1M x 128 HNSW snapshot (630 MB) on its two nodes in 10.5 s, replayed a
+  patch chain there (the clone of the base from its own cache), and
+  `refresh_index` from the secondary works too (vbuild on a secondary node
+  from the base in its cache; then the primary is the one behind).
+- Scheduled triggers run on the Active Scheduler Node, a primary node here,
+  wherever the schedule was created (two every-minute schedules, one made
+  from each subcluster, both ran on primary node 2). A scheduled refresh
+  therefore loads the primary subcluster only. A secondary subcluster is kept
+  current by a client job that runs `CALL vvector.load_all('<index>')` in a
+  session on that subcluster (cron with vsql, or the application after each
+  refresh): load_all first asks vinfo whether every node of the subcluster
+  already has the active snapshot (one call, about 70 ms) and then only
+  rewrites the index defaults, so a load_all every minute costs nothing
+  between refreshes (before this check it re-read and verified the whole
+  chain: 5.6 to 8.5 s for the 630 MB snapshot).
+- Correctness holds without the load: vsearch carries the active snapshot id
+  in the sentinel row and a node whose cache is behind answers "snapshot
+  cache stale on <node>: run vload"; a node with no cache "no snapshot cache
+  for index ... run vload". `vknn` has no snapshot id input and no stale
+  check: on a subcluster that was not loaded it answers from the older
+  snapshot. refresh_index tells the caller when the database has more than
+  one subcluster; status names the subcluster its cache lines cover; the
+  test library counts the UP nodes of the session's subcluster
+  (`subcluster_name <=> the session node's`, NULL in Enterprise).
+- The alternative, a refresh that loads every subcluster, is not possible
+  from SQL: a procedure cannot open a session on another subcluster, and a
+  trigger runs on the scheduler node.
+
 ## Cache rules
 
 - Layout: `<cache_dir>/<index>/<snapshot_id>.vv`, `<cache_dir>/<index>/ACTIVE`
