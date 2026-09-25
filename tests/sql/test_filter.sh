@@ -111,7 +111,12 @@ R_L2=$(run_sql "radius l2" "SELECT d FROM (SELECT VECTOR_L2(l.vec, q.qvec) AS d 
                              WHERE q.qid = 1 ORDER BY 1 LIMIT 30) x ORDER BY d DESC LIMIT 1;")
 R_COS=$(run_sql "radius cosine" "SELECT d FROM (SELECT COSINE_SIMILARITY(l.vec, q.qvec) AS d FROM $SCHEMA.queries q CROSS JOIN ($LIVE) l
                               WHERE q.qid = 1 ORDER BY 1 DESC LIMIT 30) x ORDER BY d LIMIT 1;")
-[ "$ECHO_ONLY" = yes ] && { R_L2=1.5; R_COS=0.7; }
+# The allow-list check below keeps 1% of the ids: within the 30th neighbour's radius the 20 queries
+# have about six allowed rows in all, and none once in a while (seen on Eon, session 21), so it uses
+# the 1000th neighbour's radius (some 200 allowed rows).
+R_PCT=$(run_sql "radius l2 for the allow-list" "SELECT d FROM (SELECT VECTOR_L2(l.vec, q.qvec) AS d FROM $SCHEMA.queries q CROSS JOIN ($LIVE) l
+                             WHERE q.qid = 1 ORDER BY 1 LIMIT 1000) x ORDER BY d DESC LIMIT 1;")
+[ "$ECHO_ONLY" = yes ] && { R_L2=1.5; R_COS=0.7; R_PCT=2; }
 # range NAME INDEX METRIC RADIUS SQL_OF_THE_SEARCH: every result within the radius (1e-5), and recall
 # >= 0.95 against the full scan within the radius, for queries 1 to 20.
 range() {
@@ -139,14 +144,14 @@ range "vknn on vf_l2: radius $R_L2 with k 16384" vf_l2 l2 "$R_L2" \
 
 expect "vf_l2, allow-list a_pct with the radius: every allowed row within it, nothing else" "^filtered range ok" "
 DROP TABLE IF EXISTS $SCHEMA.got; DROP TABLE IF EXISTS $SCHEMA.ref;
-CREATE TABLE $SCHEMA.got AS $(search_sql vf_l2 ", k=16384, radius=$R_L2" "(SELECT * FROM $SCHEMA.vf_l2_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries20
+CREATE TABLE $SCHEMA.got AS $(search_sql vf_l2 ", k=16384, radius=$R_PCT" "(SELECT * FROM $SCHEMA.vf_l2_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries20
     UNION ALL SELECT NULL, NULL, id, NULL, NULL, NULL, NULL FROM $SCHEMA.a_pct) x");
 CREATE TABLE $SCHEMA.ref AS SELECT q.qid, l.id, VECTOR_L2(l.vec, q.qvec) AS d FROM $SCHEMA.queries20 q CROSS JOIN ($LIVE) l
-    WHERE l.id IN (SELECT id FROM $SCHEMA.a_pct) AND VECTOR_L2(l.vec, q.qvec) <= $R_L2 + 1e-5;
+    WHERE l.id IN (SELECT id FROM $SCHEMA.a_pct) AND VECTOR_L2(l.vec, q.qvec) <= $R_PCT + 1e-5;
 SELECT CASE WHEN missing = 0 AND foreign_ids = 0 AND n_ref > 0 THEN 'filtered range ok ' ELSE 'filtered range bad ' END
        || 'results ' || n_got || ', allowed within the radius ' || n_ref || ', missing ' || missing || ', not allowed or outside ' || foreign_ids FROM (
-  SELECT (SELECT COUNT(*) FROM $SCHEMA.got) AS n_got, (SELECT COUNT(*) FROM $SCHEMA.ref WHERE d <= $R_L2 - 1e-5) AS n_ref,
-         (SELECT COUNT(*) FROM $SCHEMA.ref r WHERE r.d <= $R_L2 - 1e-5 AND NOT EXISTS (SELECT 1 FROM $SCHEMA.got g WHERE g.qid = r.qid AND g.id = r.id)) AS missing,
+  SELECT (SELECT COUNT(*) FROM $SCHEMA.got) AS n_got, (SELECT COUNT(*) FROM $SCHEMA.ref WHERE d <= $R_PCT - 1e-5) AS n_ref,
+         (SELECT COUNT(*) FROM $SCHEMA.ref r WHERE r.d <= $R_PCT - 1e-5 AND NOT EXISTS (SELECT 1 FROM $SCHEMA.got g WHERE g.qid = r.qid AND g.id = r.id)) AS missing,
          (SELECT COUNT(*) FROM $SCHEMA.got g WHERE NOT EXISTS (SELECT 1 FROM $SCHEMA.ref r WHERE r.qid = g.qid AND r.id = g.id)) AS foreign_ids) x;"
 
 echo "== filtered search with the journal (500 adds, 500 deletes, 200 replacements, no refresh)"
