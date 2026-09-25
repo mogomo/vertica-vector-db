@@ -441,3 +441,12 @@ Check again on other versions.
   an extent: 100,000 scattered 512-byte pwrites into a reflinked 650 MB file took 300 s (about 3 ms
   each) against 1.3 s into a plain copy that cost 0.35 s to make. vload reflinks only a patch of at
   most 64 runs.
+- `copy_file_range` on xfs with reflink=1 makes a reflink too (session 19, 3-node cluster: 620 MB in
+  0.01 s, every extent shared, then 437 s for 100,000 scattered 512-byte writes; a copy by read and
+  write took 1.57 s and the same writes 0.71 s). So a copy that will be written into scattered must be
+  made by read and write; vload does that for a patch of more than 64 runs.
+- Eon subclusters (session 19; the 3-node cluster grew a secondary subcluster of 2 nodes, 6 shards):
+  `OVER(PARTITION NODES)` over `vvector.probe` from a session on the primary subcluster ran on the 3
+  primary nodes only (vnode returned 3 rows of 5 nodes UP; vinfo the same). vload, vconfig and vinfo
+  therefore reach the session's subcluster only; the secondary nodes hold no cache until a load runs
+  from a session there. Searches from the secondary subcluster and the rule for it: next session.
