@@ -1051,7 +1051,12 @@ nearest rows to one or more query vectors, with no index, no registration
 and no refresh. Use it for tables too large or too rarely searched for an
 index, for a filtered search where the filter is any SQL predicate, and as
 the exact reference for an index. It reads every row: a scan of 100 million
-vectors of 128 dimensions takes minutes, not milliseconds.
+vectors of 128 dimensions takes minutes, not milliseconds. On the 3-node Eon
+test cluster (2 cores per node) a scan of 1M vectors of 128 dimensions takes
+0.6 to 0.7 s against 19 s for `ORDER BY VECTOR_L2(...) LIMIT 10`, and ten
+queries in one statement cost the same 0.6 s; an exact search on a flat
+index of the same rows takes 80 ms (see [Performance and
+results](#performance-and-results)).
 
     -- one query: k rows out, closest first (l2 and l1: ORDER BY score; cosine and dot: DESC)
     SELECT id, score
@@ -1840,7 +1845,11 @@ refresh there of 900,000 vectors of 128 dimensions after 1000 adds and 500
 deletes takes 6.4 s (flat) and 11.5 s (HNSW) since only the changed bytes of
 the snapshot travel (19.6 s and 25.3 s when the whole snapshot did; 100
 changes 5.9 and 8.3 s, 10,000 changes 6.7 and 12.4 s; docs/design.md
-"Incremental transfer").
+"Incremental transfer"). `vscan` over 1M vectors of 128 dimensions there
+takes 0.6 to 0.7 s for one query and 0.6 s for ten queries in one statement,
+against 19 s and 25 s for the built-in full scan; `vsearch` with precision
+exact on a flat index of the same rows 80 ms and 165 ms (the same ids from
+all three).
 
 **Filtered and range search** (the VM, SIFT1M, one query, median at the
 client): with an allow-list of 100 ids 8.6 ms fenced / 3.0 ms mixed, 10,000

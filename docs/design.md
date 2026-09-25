@@ -380,6 +380,22 @@ instance: the queries plus one block. Filtering is a WHERE on the table
 before the function: true pre-filtering with any predicate, at the cost of
 reading the table.
 
+Measured on the 3-node Eon cluster (2 cores per node; 1M random vectors of
+128 dimensions, l2, k 10, statement times from the request log, fenced):
+
+| Statement | one query | ten queries in one statement |
+|---|---:|---:|
+| built-in `ORDER BY VECTOR_L2(vec, ARRAY[...]) LIMIT 10` | 19.0 to 19.6 s | 24.9 s (CROSS JOIN, ROW_NUMBER) |
+| `vscan` over the table, `OVER(PARTITION BEST)` | 0.58 to 0.74 s | 0.60 s |
+| `vsearch` precision exact on the flat index | 77 to 84 ms (1.2 s the first call of a session) | 165 ms |
+
+All three return the same ids; the scores agree to float32. Ten queries
+cost vscan what one costs: its time is reading the rows and converting the
+arrays to float32, not the distances, which is why the `vpack` idea (a
+packed VARBINARY column read with one memcpy) is the lever if a larger
+machine shows the same ratio. An index is another order of magnitude for
+one query because the file is mapped and no row is converted.
+
 ## vload on every node
 
 `vload(...) OVER(PARTITION NODES)` runs one function instance on every node
