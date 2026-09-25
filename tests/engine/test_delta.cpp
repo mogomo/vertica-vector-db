@@ -727,11 +727,11 @@ static void test_pack_runs()
     const std::vector<ByteRange> runs = {{0, 512}, {1024, 1}, {2048, 5000}, {90000, 10000}, {8192, 512}};
     std::uint64_t total = 0;
     for (const ByteRange &r : runs) total += r.bytes;
-    for (std::uint64_t capacity : {13ull, 100ull, 600ull, 4096ull, 1048576ull}) {
+    for (std::uint64_t capacity : {33ull, 100ull, 600ull, 4096ull, 1048576ull}) {
         std::uint64_t at_run = 0, at_off = runs[0].offset, got = 0, rows = 0;
         bool ok = true;
         pack_runs(data.data(), runs, capacity, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
-            ok = ok && len <= capacity && first == at_off;
+            ok = ok && len <= capacity && first == at_off && patch_runs_of(row, len) == runs.size();
             ++rows;
             unpack_runs(row, len, [&](std::uint64_t off, const std::uint8_t *b, std::uint64_t n) {
                 ok = ok && off == at_off && n > 0 && std::memcmp(b, data.data() + off, n) == 0;
@@ -743,9 +743,14 @@ static void test_pack_runs()
         CHECK(ok && got == total);
         CHECK(capacity < total ? rows > 1 : rows == 1);
     }
-    CHECK(throws([] { std::uint8_t r[8] = {0}; unpack_runs(r, 8, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "record header"));
-    CHECK(throws([] { std::uint8_t r[16] = {0}; r[8] = 9; unpack_runs(r, 16, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "inside a record"));
-    CHECK(throws([] { std::uint8_t r[1] = {0}; unpack_runs(r, 0, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "empty"));
+    // Malformed rows: too short for the summary, no summary, a record cut off, a record header cut off.
+    std::vector<std::uint8_t> good;
+    pack_runs(data.data(), runs, 1048576, [&](std::uint64_t, const std::uint8_t *row, std::uint64_t len) { good.assign(row, row + len); });
+    CHECK(throws([&] { unpack_runs(good.data(), 8, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "shorter than its summary"));
+    CHECK(throws([&] { std::vector<std::uint8_t> r(good.begin() + 20, good.end()); unpack_runs(r.data(), r.size(), [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "summary record"));
+    CHECK(throws([&] { unpack_runs(good.data(), good.size() - 1, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "inside a record"));
+    CHECK(throws([&] { unpack_runs(good.data(), 20 + 5, [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }, "record header"));
+    CHECK(!throws([&] { unpack_runs(good.data(), good.size(), [](std::uint64_t, const std::uint8_t *, std::uint64_t) {}); }));
 }
 
 int main(int argc, char **argv)

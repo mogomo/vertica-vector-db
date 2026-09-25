@@ -409,8 +409,8 @@ project this code comes from):
   (size, structure, checksum) and makes it active; a failed pass removes the partial file, so the
   next pass fails too and the procedure names the pass. A snapshot up to one pass loads as before.
   The passes are counted in rows, not bytes, because the planner reserves the declared 8 MB for
-  every row of the join whatever it holds; a patch (milestone M7) packs its runs into rows of up to
-  8 MB for the same reason, so a small patch is one row and one pass.
+  every row of the join whatever it holds; a patch (milestone M7) packs its runs into rows of 1 MB
+  for the same reason (256 rows = 256 MB of patch per pass), so a patch below that is one pass.
 - vinfo and vconfig read `vvector.probe` for the same reason and answer once
   per node.
 
@@ -990,14 +990,23 @@ removes each:
   parts, the id index, the tombstones, level 0 and the upper part of the
   graph; never the base rows of the vectors) in blocks of 512 bytes, because a
   level-0 link list is 132 bytes and 4 KB pages would send thirty times the
-  change, and stores the changed runs as a patch: rows of up to 8 MB of packed
-  runs (offset, length, bytes), not one row per run, because Vertica's planner
-  reserves the declared row width, 8 MB, for every row of the load's broadcast
-  join (session 18: 3,000 rows of a 3 MB patch asked for 8 GB and failed on the
-  15 GB nodes; in 8 MB passes they took 13 loads). vload clones the node's file
-  of the base (FICLONE: a reflink on xfs with reflink=1, which the cluster's
-  /scratch_b, the VM and RHEL 8 have; else copy_file_range, else a copy) and
-  writes the runs over it. The checksum of the new file comes from the base's
+  change, and stores the changed runs as a patch: rows of packed runs
+  (offset, length, bytes; every row starts with the run total of the patch),
+  not one row per run, because Vertica's planner reserves the declared row
+  width, 8 MB, for every row of the load's broadcast join (session 18: 3,000
+  rows of a 3 MB patch asked for 8 GB and failed on the 15 GB nodes; in 8 MB
+  passes they took 13 loads). The rows hold 1 MB, not 8: the INSERT of a 23 MB
+  patch cost nothing extra in 1 MB rows, 1.8 s in 2 MB rows, 3.8 s in 4 MB
+  rows and 15.7 s in 8 MB rows on the 3-node cluster (a whole copy's 8 MB
+  chunks of vectors do not show this; its cost is the bytes, about 90 MB/s
+  there). vload starts the new file from the node's file of the base: a
+  reflink (FICLONE on xfs with reflink=1, which the cluster's /scratch_b, the
+  VM and RHEL 8 have) when the patch has at most 64 runs, because every write
+  into a reflinked file then unshares an extent (copy-on-write: 3 ms per
+  scattered 512-byte write measured on xfs, 300 s for 100,000, against 1.3 s
+  into a plain copy that cost 0.35 s); a copy (copy_file_range, else read and
+  write) for a patch of more runs, which every graph patch is. The runs are
+  then written over it. The checksum of the new file comes from the base's
   and the runs (the checksum is an XOR over words), so the build reads no more
   than it compares; vload verifies the assembled file in full, as always.
 

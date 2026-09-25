@@ -7,8 +7,9 @@
 // of the node that runs vbuild. Changes that change nothing give no rows. The build runs in place
 // on a copy-on-write mapping of the base when its layout has room (milestone M7, delta.h), and
 // then, with send = patch, only the changed bytes are returned: rows of (byte_offset, chunk) that
-// hold up to 8 MB of packed runs of changed bytes (delta.h pack_runs; byte_offset = the first run's),
-// with base_snapshot set, which vload unpacks and writes over its copy of the base.
+// hold packed runs of changed bytes (delta.h pack_runs; byte_offset = the first run's; patch_row_mb,
+// default 1: Vertica's cost of a large value grows faster than its size, 8 MB rows cost 5 s each on
+// the test cluster), with base_snapshot set, which vload unpacks and writes over its copy of the base.
 // send = whole, a base without room, or a full build: whole chunks of 8 MB, base_snapshot NULL,
 // all-zero chunks (the room to grow) left out.
 // Parameters: index_name, metric (l2 | cosine | dot | l1), index_type (flat | hnsw), max_ver (the
@@ -61,6 +62,8 @@ class VBuild : public TransformFunction
             const std::string send = params.containsParameter("send") ? params.getStringRef("send").str() : "patch";
             if (send != "patch" && send != "whole") fail("send must be patch or whole, not '" + send + "'");
             const std::string reach = params.containsParameter("reachability") ? params.getStringRef("reachability").str() : "auto";
+            const vint patch_row_mb = params.containsParameter("patch_row_mb") ? params.getIntRef("patch_row_mb") : vvector::DEFAULT_PATCH_ROW_MB;
+            if (patch_row_mb < 1 || patch_row_mb > 8) fail("patch_row_mb must be 1 to 8");
             if (reach != "auto" && reach != "on" && reach != "off") fail("reachability must be auto, on or off, not '" + reach + "'");
             if (build_in != "ram" && build_in != "file") fail("build_in must be ram or file, not '" + build_in + "'");
             const std::string build_dir = build_in == "file" ? vvector::ensure_index_dir(resolve_cache_dir(srvInterface), name) : "";
@@ -182,7 +185,7 @@ class VBuild : public TransformFunction
                 // reserves the declared 8 MB for every row of the load's broadcast join, so one row
                 // per run would ask for gigabytes for a few MB of patch (session 18).
                 try {
-                    vvector::pack_runs(out_bytes, runs, vvector::CHUNK_BYTES, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
+                    vvector::pack_runs(out_bytes, runs, static_cast<std::uint64_t>(patch_row_mb) << 20, [&](std::uint64_t first, const std::uint8_t *row, std::uint64_t len) {
                         emit(first, reinterpret_cast<const char *>(row), len, true);
                         if (isCanceled()) throw vvector::Cancelled();
                     });
@@ -244,6 +247,7 @@ class VBuildFactory : public TransformFunctionFactory
         parameterTypes.addInt("growth");
         parameterTypes.addVarchar(16, "send");
         parameterTypes.addVarchar(16, "reachability");
+        parameterTypes.addInt("patch_row_mb");
     }
 
     virtual TransformFunction *createTransformFunction(ServerInterface &srvInterface)

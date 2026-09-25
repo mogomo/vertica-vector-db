@@ -130,15 +130,19 @@ public:
     CacheWriter &operator=(const CacheWriter &) = delete;
 
     // base_snapshot > 0: the file starts as a copy of <index>/<base_snapshot>.vv in the same
-    // directory (a reflink where the file system has it, else a copy), which must be a regular file
-    // of this user; the pieces are then written over it. Throws when the base is missing.
-    void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot = 0);
+    // directory, which must be a regular file of this user; the pieces are then written over it.
+    // Throws when the base is missing. reflink: a reflink clone where the file system has it (xfs
+    // reflink=1, btrfs), else a copy. A reflink is free, but every write into it then unshares an
+    // extent (copy-on-write): 3 ms per scattered 512-byte write measured on xfs, 300 s for 100,000
+    // (session 18). So the caller asks for it only when the patch has few runs (vload: PATCH_REFLINK_RUNS).
+    void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot = 0,
+               bool reflink = true);
     // A load in several passes (a large snapshot): every pass writes its pieces into the partial file
     // <snapshot>.vv.part.<part> (part: letters and digits naming the load); the first pass creates it
     // (from the base, if given), later passes (resume) continue it, keep() ends a pass without
     // verifying, commit() the last one.
     void begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
-                    const std::string &part, bool resume, std::int64_t base_snapshot = 0);
+                    const std::string &part, bool resume, std::int64_t base_snapshot = 0, bool reflink = true);
     // Pieces may arrive in any order, 1 to CHUNK_BYTES bytes each. A piece written twice is fine
     // (the same bytes); a missing piece is found by the checksum, unless it was all zero (a whole
     // copy leaves such chunks out: the file is sized from its header).
@@ -155,7 +159,7 @@ public:
 
 private:
     void discard();
-    void start_from_base(std::int64_t base_snapshot);
+    void start_from_base(std::int64_t base_snapshot, bool reflink);
     int fd_ = -1;
     std::string cache_dir_, index_, dir_, tmp_path_, final_path_;
     std::int64_t snapshot_id_ = 0;
@@ -163,11 +167,11 @@ private:
     bool in_parts_ = false;
 };
 
-// Copies the content of one file into another (a reflink clone where the file system supports it:
-// xfs with reflink=1, btrfs; else copy_file_range, else read and write). Both must be open; to_fd
-// is truncated first. Throws std::runtime_error with the cause. Returns how it was done: "reflink",
-// "copy_file_range" or "copy".
-const char *clone_file(int from_fd, int to_fd, const std::string &what);
+// Copies the content of one file into another (with reflink: a reflink clone where the file system
+// supports it, xfs with reflink=1, btrfs; else copy_file_range, else read and write). Both must be
+// open; to_fd is truncated first. Throws std::runtime_error with the cause. Returns how it was done:
+// "reflink", "copy_file_range" or "copy".
+const char *clone_file(int from_fd, int to_fd, const std::string &what, bool reflink = true);
 
 } // namespace vvector
 

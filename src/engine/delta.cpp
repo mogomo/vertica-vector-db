@@ -363,7 +363,8 @@ void seal_in_place(const std::uint8_t *base, std::uint8_t *copy, std::uint64_t s
 void pack_runs(const std::uint8_t *data, const std::vector<ByteRange> &runs, std::uint64_t capacity,
                const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &emit)
 {
-    if (capacity <= RUN_RECORD_HEADER) throw std::logic_error("pack_runs: capacity too small for a record");
+    if (capacity <= 2 * RUN_RECORD_HEADER + 8) throw std::logic_error("pack_runs: capacity too small for a record");
+    const std::uint64_t total = runs.size();
     std::vector<std::uint8_t> row;
     row.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(capacity, 1u << 20)));
     std::uint64_t first = 0;
@@ -372,19 +373,26 @@ void pack_runs(const std::uint8_t *data, const std::vector<ByteRange> &runs, std
         emit(first, row.data(), row.size());
         row.clear();
     };
+    auto record = [&](std::uint64_t off, const std::uint8_t *bytes, std::uint32_t n) {
+        const std::size_t at = row.size();
+        row.resize(at + RUN_RECORD_HEADER + n);
+        std::memcpy(row.data() + at, &off, 8);
+        std::memcpy(row.data() + at + 8, &n, 4);
+        std::memcpy(row.data() + at + RUN_RECORD_HEADER, bytes, n);
+    };
     for (const ByteRange &r : runs) {
         std::uint64_t off = r.offset, left = r.bytes;
         while (left > 0) {
             if (row.size() + RUN_RECORD_HEADER >= capacity) flush();
+            if (row.empty()) {
+                // Every row starts with the summary record: the run total of the patch (vload
+                // decides on it before it clones the base).
+                first = off;
+                record(RUN_SUMMARY_OFFSET, reinterpret_cast<const std::uint8_t *>(&total), 8);
+            }
             const std::uint64_t room = capacity - row.size() - RUN_RECORD_HEADER;
             const std::uint64_t n = std::min<std::uint64_t>(left, std::min<std::uint64_t>(room, 0xFFFFFFFFu));
-            if (row.empty()) first = off;
-            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
-            const std::size_t at = row.size();
-            row.resize(at + RUN_RECORD_HEADER + n);
-            std::memcpy(row.data() + at, &off, 8);
-            std::memcpy(row.data() + at + 8, &n32, 4);
-            std::memcpy(row.data() + at + RUN_RECORD_HEADER, data + off, n);
+            record(off, data + off, static_cast<std::uint32_t>(n));
             off += n;
             left -= n;
         }
@@ -392,11 +400,23 @@ void pack_runs(const std::uint8_t *data, const std::vector<ByteRange> &runs, std
     flush();
 }
 
+std::uint64_t patch_runs_of(const std::uint8_t *row, std::uint64_t bytes)
+{
+    if (bytes < RUN_RECORD_HEADER + 8) throw std::runtime_error("a patch row is shorter than its summary record");
+    std::uint64_t off, total;
+    std::uint32_t n;
+    std::memcpy(&off, row, 8);
+    std::memcpy(&n, row + 8, 4);
+    if (off != RUN_SUMMARY_OFFSET || n != 8) throw std::runtime_error("a patch row does not start with its summary record");
+    std::memcpy(&total, row + RUN_RECORD_HEADER, 8);
+    return total;
+}
+
 void unpack_runs(const std::uint8_t *row, std::uint64_t bytes,
                  const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &apply)
 {
-    std::uint64_t at = 0;
-    if (bytes == 0) throw std::runtime_error("a patch row is empty");
+    patch_runs_of(row, bytes);                          // the summary record must be there
+    std::uint64_t at = RUN_RECORD_HEADER + 8;
     while (at < bytes) {
         if (bytes - at < RUN_RECORD_HEADER) throw std::runtime_error("a patch row ends inside a record header");
         std::uint64_t off;
@@ -404,7 +424,7 @@ void unpack_runs(const std::uint8_t *row, std::uint64_t bytes,
         std::memcpy(&off, row + at, 8);
         std::memcpy(&n, row + at + 8, 4);
         at += RUN_RECORD_HEADER;
-        if (n == 0 || bytes - at < n) throw std::runtime_error("a patch row ends inside a record");
+        if (n == 0 || off == RUN_SUMMARY_OFFSET || bytes - at < n) throw std::runtime_error("a patch row ends inside a record");
         apply(off, row + at, n);
         at += n;
     }

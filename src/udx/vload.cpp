@@ -18,6 +18,9 @@ using namespace Vertica;
 using namespace vvector_udx;
 
 static const char *const FN = "vload";
+// A patch with at most this many runs starts from a reflink of the base (a copy-on-write extent per
+// run written, about 3 ms each on xfs); more runs start from a plain copy of the base.
+static const std::uint64_t PATCH_REFLINK_RUNS = 64;
 
 class VLoad : public TransformFunction
 {
@@ -43,15 +46,23 @@ class VLoad : public TransformFunction
             }
 
             vvector::CacheWriter writer;
-            // The base comes with the first piece; every piece must name the same one.
+            // The base comes with the first piece; every piece must name the same one. A patch of a
+            // few runs starts from a reflink of the base (free); one of many runs from a copy: every
+            // write into a reflink unshares an extent (3 ms each on xfs, cache.h).
             const vint base = inputReader.isNull(2) ? 0 : inputReader.getIntRef(2);
             if (base < 0) fail("index '" + name + "': base_snapshot must be a snapshot id");
             if (base == snapshot_id) fail("index '" + name + "': a snapshot cannot be its own base");
+            bool reflink = true;
+            if (base != 0) {
+                if (inputReader.getStringRef(1).isNull()) fail("index '" + name + "': NULL chunk");
+                const VString &first = inputReader.getStringRef(1);
+                reflink = vvector::patch_runs_of(reinterpret_cast<const std::uint8_t *>(first.data()), first.length()) <= PATCH_REFLINK_RUNS;
+            }
             if (in_parts)
                 writer.begin_part(resolve_cache_dir(srvInterface), name, snapshot_id,
-                                  params.getStringRef("part").str(), pass > 1, base);
+                                  params.getStringRef("part").str(), pass > 1, base, reflink);
             else
-                writer.begin(resolve_cache_dir(srvInterface), name, snapshot_id, base);
+                writer.begin(resolve_cache_dir(srvInterface), name, snapshot_id, base, reflink);
             do {
                 if (inputReader.isNull(0) || inputReader.getStringRef(1).isNull())
                     fail("index '" + name + "': NULL byte_offset or chunk");

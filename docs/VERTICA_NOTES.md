@@ -428,3 +428,16 @@ Check again on other versions.
   ("Plan memory limit exhausted: Requested = 8388633 KB", then "Join inner did not fit in memory") on a
   node with 10.8 GB in the pool. vvector therefore packs a patch's runs into rows of up to 8 MB and
   counts its load passes in rows (pass_mb / 8 per pass), never in bytes.
+- The cost of inserting a large LONG VARBINARY value grows faster than its size: the same 23 MB of
+  patch data as 23 rows of 1 MB added nothing measurable to the statement, as 12 rows of 2 MB 1.8 s,
+  as 6 rows of 4 MB 3.8 s, as 3 rows of 8 MB 15.7 s (3-node cluster, 2 cores per node; the encoding
+  of the column, NONE, ZSTD_FAST_COMP, ZSTD_COMP or AUTO, made no difference; a table-to-table copy
+  of the 8 MB rows cost the same). 8 MB chunks of float vectors (a whole snapshot copy) do not show
+  it: 650 MB in 75 chunks of 8 MB cost 8.5 s of INSERT, in 650 chunks of 1 MB 6.9 s, about 90 MB/s
+  either way. vvector packs a patch into rows of 1 MB (vbuild parameter patch_row_mb) and keeps
+  8 MB chunks for whole copies. `REPEAT('x', n)` returns at most 65,000 bytes, so it cannot make a
+  large test value.
+- A reflink clone (FICLONE) on xfs with reflink=1 is free, but every later write into it unshares
+  an extent: 100,000 scattered 512-byte pwrites into a reflinked 650 MB file took 300 s (about 3 ms
+  each) against 1.3 s into a plain copy that cost 0.35 s to make. vload reflinks only a patch of at
+  most 64 runs.

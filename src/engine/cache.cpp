@@ -488,11 +488,13 @@ void CacheWriter::discard()
     }
 }
 
-const char *clone_file(int from_fd, int to_fd, const std::string &what)
+const char *clone_file(int from_fd, int to_fd, const std::string &what, bool reflink)
 {
     if (ftruncate(to_fd, 0) != 0) fail("cannot empty", what);
 #if defined(__linux__) && defined(FICLONE)
-    if (ioctl(to_fd, FICLONE, from_fd) == 0) return "reflink";
+    if (reflink && ioctl(to_fd, FICLONE, from_fd) == 0) return "reflink";
+#else
+    (void)reflink;
 #endif
     struct stat st;
     if (fstat(from_fd, &st) != 0) fail("cannot stat the base of", what);
@@ -527,7 +529,7 @@ const char *clone_file(int from_fd, int to_fd, const std::string &what)
     return "copy";
 }
 
-void CacheWriter::start_from_base(std::int64_t base_snapshot)
+void CacheWriter::start_from_base(std::int64_t base_snapshot, bool reflink)
 {
     const std::string base = snapshot_path(cache_dir_, index_, base_snapshot);
     const int from = ::open(base.c_str(), O_RDONLY | O_NOFOLLOW);
@@ -538,7 +540,7 @@ void CacheWriter::start_from_base(std::int64_t base_snapshot)
         fail("base snapshot is not a regular file of this user:", base, false);
     }
     try {
-        clone_file(from, fd_, tmp_path_);
+        clone_file(from, fd_, tmp_path_, reflink);
     } catch (...) {
         ::close(from);
         throw;
@@ -547,7 +549,8 @@ void CacheWriter::start_from_base(std::int64_t base_snapshot)
     end_offset_ = static_cast<std::uint64_t>(st.st_size);
 }
 
-void CacheWriter::begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot)
+void CacheWriter::begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot,
+                        bool reflink)
 {
     dir_ = index_dir(cache_dir, index);
     cache_dir_ = cache_dir;
@@ -559,11 +562,11 @@ void CacheWriter::begin(const std::string &cache_dir, const std::string &index, 
     tmp_path_ = final_path_ + temp_suffix();
     fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd_ < 0) fail("cannot create", tmp_path_);
-    if (base_snapshot > 0) start_from_base(base_snapshot);
+    if (base_snapshot > 0) start_from_base(base_snapshot, reflink);
 }
 
 void CacheWriter::begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
-                             const std::string &part, bool resume, std::int64_t base_snapshot)
+                             const std::string &part, bool resume, std::int64_t base_snapshot, bool reflink)
 {
     if (part.empty() || part.size() > 64 ||
         part.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos)
@@ -589,7 +592,7 @@ void CacheWriter::begin_part(const std::string &cache_dir, const std::string &in
     } else {
         fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
         if (fd_ < 0) fail("cannot create", tmp_path_);
-        if (base_snapshot > 0) start_from_base(base_snapshot);
+        if (base_snapshot > 0) start_from_base(base_snapshot, reflink);
     }
 }
 

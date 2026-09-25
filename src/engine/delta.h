@@ -120,12 +120,22 @@ void seal_in_place(const std::uint8_t *base, std::uint8_t *copy, std::uint64_t s
 // A patch travels as rows of packed runs: records of (uint64 offset, uint32 bytes, the bytes),
 // little-endian, as many per row as fit into `capacity` bytes (a run longer than a row is split).
 // One row per run would make Vertica's planner reserve the declared row width (8 MB) per run for
-// the load's broadcast join: gigabytes for a few MB of patch. pack_runs builds the rows from the
-// runs over `data` in order and calls emit(first_offset, row, bytes) for each; unpack_runs calls
-// apply(offset, bytes, n) for every record of a row and throws std::runtime_error on a malformed row.
+// the load's broadcast join: gigabytes for a few MB of patch. Every row starts with a summary
+// record (offset RUN_SUMMARY_OFFSET, 8 bytes: the run total of the patch), so that vload knows
+// from any row whether the patch is a few runs (a reflink clone of the base pays) or thousands
+// (a copy: cache.h). pack_runs builds the rows from the runs over `data` in order and calls
+// emit(first_offset, row, bytes) for each; patch_runs_of reads a row's summary; unpack_runs calls
+// apply(offset, bytes, n) for every run record of a row. Both throw std::runtime_error on a
+// malformed row.
 constexpr std::uint64_t RUN_RECORD_HEADER = 12;
+constexpr std::uint64_t RUN_SUMMARY_OFFSET = ~0ull;
+// The row capacity of a patch in MB (vbuild parameter patch_row_mb). Measured on the 3-node cluster
+// (session 18, a 23 MB patch): rows of 1 MB add nothing to the INSERT, 2 MB add 1.8 s, 4 MB 3.8 s,
+// 8 MB 15.7 s (Vertica's cost of a large value grows faster than its size).
+constexpr int DEFAULT_PATCH_ROW_MB = 1;
 void pack_runs(const std::uint8_t *data, const std::vector<ByteRange> &runs, std::uint64_t capacity,
                const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &emit);
+std::uint64_t patch_runs_of(const std::uint8_t *row, std::uint64_t bytes);
 void unpack_runs(const std::uint8_t *row, std::uint64_t bytes,
                  const std::function<void(std::uint64_t, const std::uint8_t *, std::uint64_t)> &apply);
 
