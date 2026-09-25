@@ -97,6 +97,7 @@ void SnapshotBuffer::back_with_file(const std::string &dir)
     if (fd < 0) throw std::runtime_error("cannot create a build file in " + dir + ": " + std::strerror(errno));
     ::unlink(path.c_str());
     fd_ = fd;
+    dir_ = dir;
 #else
     (void)dir;
 #endif
@@ -104,10 +105,9 @@ void SnapshotBuffer::back_with_file(const std::string &dir)
 
 void SnapshotBuffer::release()
 {
-    if (!data_) return;
 #if defined(__linux__)
     if (data_) munmap(data_, capacity_);
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; dir_.clear(); }     // also a file that was never mapped
 #else
     std::free(data_);
 #endif
@@ -162,6 +162,7 @@ void SnapshotBuffer::swap(SnapshotBuffer &other) noexcept
     std::swap(size_, other.size_);
     std::swap(capacity_, other.capacity_);
     std::swap(fd_, other.fd_);
+    std::swap(dir_, other.dir_);
 }
 
 void SnapshotBuffer::set_size(std::uint64_t bytes)
@@ -370,20 +371,35 @@ void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out, const Gr
         for (std::uint64_t i = 1; i < n; ++i)
             if (ids_[order[i]] == ids_[order[i - 1]])
                 throw std::runtime_error("id " + std::to_string(ids_[order[i]]) + " appears twice");
-        // Move the rows in place, one cycle of the permutation at a time, with one spare row.
-        // A position is done when order[i] == i; finished positions are marked that way.
-        std::vector<float> spare(stride_);
         const std::size_t row_bytes = std::size_t(stride_) * 4;
-        for (std::uint64_t start = 0; start < n; ++start) {
-            if (order[start] == start) continue;
-            std::memcpy(spare.data(), rows + start * stride_, row_bytes);
-            std::uint64_t at = start;
-            for (;;) {
-                const std::uint64_t from = order[at];
-                order[at] = static_cast<std::uint32_t>(at);
-                if (from == start) { std::memcpy(rows + at * stride_, spare.data(), row_bytes); break; }
-                std::memcpy(rows + at * stride_, rows + from * stride_, row_bytes);
-                at = from;
+        if (buffer_.file_backed()) {
+            // In a file, moving the rows in place writes them in random order: each row dirties a
+            // page that the kernel writes back on its own, and the disk's random writes bound the
+            // sort (8.5 MB/s, about 10 hours for 100M x 128 on a cluster node). Copy the rows in
+            // position order into a second file instead: it is written front to back and the
+            // first one is only read. It is dropped at the end of this block (unlinked already).
+            SnapshotBuffer sorted;
+            sorted.back_with_file(buffer_.file_dir());
+            sorted.allocate(HEADER_BYTES + n * row_bytes);
+            float *to = reinterpret_cast<float *>(sorted.data() + HEADER_BYTES);
+            for (std::uint64_t i = 0; i < n; ++i)
+                std::memcpy(to + i * stride_, rows + std::uint64_t(order[i]) * stride_, row_bytes);
+            buffer_.swap(sorted);
+        } else {
+            // Move the rows in place, one cycle of the permutation at a time, with one spare row.
+            // A position is done when order[i] == i; finished positions are marked that way.
+            std::vector<float> spare(stride_);
+            for (std::uint64_t start = 0; start < n; ++start) {
+                if (order[start] == start) continue;
+                std::memcpy(spare.data(), rows + start * stride_, row_bytes);
+                std::uint64_t at = start;
+                for (;;) {
+                    const std::uint64_t from = order[at];
+                    order[at] = static_cast<std::uint32_t>(at);
+                    if (from == start) { std::memcpy(rows + at * stride_, spare.data(), row_bytes); break; }
+                    std::memcpy(rows + at * stride_, rows + from * stride_, row_bytes);
+                    at = from;
+                }
             }
         }
         std::sort(ids_.begin(), ids_.end());
@@ -415,7 +431,16 @@ void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out, const Gr
     std::memcpy(base + h.off_ids, ids_.data(), n * 8);
     std::memcpy(base, &h, sizeof(h));
     if (codes) codes->fill(snapshot_open(base, h.total_bytes, false), base + h.off_sq8);
-    if (graph) graph->fill(snapshot_open(base, h.total_bytes, false), base + h.off_graph);
+    if (graph && buffer_.file_backed()) {
+        // The graph is written in random order while it grows: in the file that is the slow case
+        // of the sort above. Build it in memory, then copy it into the file in one pass.
+        SnapshotBuffer links;
+        links.allocate(h.graph_bytes);
+        graph->fill(snapshot_open(base, h.total_bytes, false), links.data());
+        std::memcpy(base + h.off_graph, links.data(), h.graph_bytes);
+    } else if (graph) {
+        graph->fill(snapshot_open(base, h.total_bytes, false), base + h.off_graph);
+    }
     h.checksum = snapshot_checksum(base, h.total_bytes);
     std::memcpy(base + offsetof(SnapshotHeader, checksum), &h.checksum, sizeof(h.checksum));
 

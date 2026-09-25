@@ -1395,20 +1395,27 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   100 to 200 MB of 630 MB on the other nodes. Spread
   the clients over the nodes you want warm, or expect the first searches on
   a cold node to read from disk.
-  Two ways to keep an index in memory, both with `cache_dir` on a RAM
-  file system: `/dev/shm` (no setup; the memory is taken for good, and
-  after a reboot the cache is empty until `load_all`), or a tmpfs mounted
-  with huge pages, which is also faster (a root step on every node, for
-  example `mount -t tmpfs -o size=8G,huge=always,mode=0755 tmpfs
-  /data/vvhot` and `chown` to the database user): on the test VM batches of
-  1000 searches took 22% less time and single searches 4 instead of 5 ms.
-  Size it for the index files of every index placed there, plus one more
-  snapshot during a refresh.
+  A small, hot index can be pinned in memory with `cache_dir` on a RAM
+  file system, if it fits there with room to spare beside Vertica on every
+  node: `/dev/shm` (no setup), or a tmpfs mounted with huge pages, which is
+  also faster (a root step on every node, for example `mount -t tmpfs -o
+  size=8G,huge=always,mode=0755 tmpfs /data/vvhot` and `chown` to the
+  database user): on the test VM batches of 1000 searches took 22% less
+  time and single searches 4 instead of 5 ms. Size it for the index files
+  of every index placed there, plus one more snapshot during a refresh. The
+  memory is taken for good, and after a reboot the cache is empty until
+  `load_all`. Large indexes belong in a `cache_dir` on a disk: the page
+  cache keeps what the searches use.
   A refresh whose build needs more than half of the smallest node's free
   memory (with the page cache; for the first build of an index estimated from
   the journal rows and the vector length) builds in a file in the index's cache
   directory instead (on the test VM 7% slower for flat, 13% for HNSW), and says so in its note; the kernel
-  can then write the build out instead of running out of memory. That does
+  can then write the build out instead of running out of memory. Such a
+  build sorts the rows into a second file, so the cache directory needs room
+  for two more copies of the vectors during the build, and it keeps the HNSW graph
+  in memory (the graph part of `vvector.sizing`), because graph links are
+  written in random order and random writes to a file run at the speed of
+  the disk. It does
   not get around `FencedUDxMemoryLimitMB`: Vertica applies it as the address
   space limit of the fenced process, which counts a file mapping too.
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options

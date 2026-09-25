@@ -128,6 +128,7 @@ public:
     // behind, also after a crash. Call it while the buffer is empty.
     void back_with_file(const std::string &dir);
     bool file_backed() const { return fd_ >= 0; }
+    const std::string &file_dir() const { return dir_; }
 
     std::uint8_t *data() { return data_; }
     const std::uint8_t *data() const { return data_; }
@@ -139,6 +140,7 @@ private:
     std::uint8_t *data_ = nullptr;
     std::uint64_t size_ = 0, capacity_ = 0;
     int fd_ = -1;                 // back_with_file: the unlinked file
+    std::string dir_;             // and its directory
 };
 
 // Fills the section offsets and total_bytes of h from count, row_stride, flags, sq8_bytes and graph_bytes.
@@ -163,7 +165,8 @@ bool snapshot_has_magic(const std::uint8_t *data, std::uint64_t size);
 
 // A section that SnapshotBuilder::finish builds in place, after the rows are sorted: the HNSW
 // graph (hnsw.h). bytes() gives its size for the ids in position order; fill() writes it into the
-// zero-filled section of the finished snapshot s (s.graph is the same bytes, read-only). The
+// zero-filled section of the finished snapshot s, or, for a build in a file, into zero-filled
+// memory that is copied there afterwards: fill writes only through its section argument. The
 // checksum is computed after fill.
 struct GraphSection {
     std::function<std::uint64_t(const std::int64_t *ids, std::uint64_t n)> bytes;
@@ -179,7 +182,8 @@ struct CodeSection {
 
 // Builds a full snapshot. Rows are written straight into the final buffer as they arrive; ids
 // may arrive in any order and are sorted at finish by moving the rows in place, so the builder
-// never holds a second copy of the vectors.
+// never holds a second copy of the vectors in memory. A build in a file sorts into a second file
+// instead (random writes to a file run at the disk's speed) and builds the graph in memory.
 // Memory: 4 x row_stride + 12 bytes per vector (rows, ids, sort order), plus the unwritten part
 // of the last growth step, which costs address space only on Linux.
 class SnapshotBuilder {

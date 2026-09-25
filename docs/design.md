@@ -498,6 +498,17 @@ results of session 12).
   (the one `status` prints) exceeds half of the smallest node's free memory
   plus page cache, and says so in the refresh note. It does not get around
   `FencedUDxMemoryLimitMB` (address space).
+  The 100M proof (milestone M6) showed that a file must never be written in
+  random order: the rows arrive in random id order, and the in-place sort
+  (one permutation cycle at a time) dirtied one 4 KB page per row. The node
+  reached its dirty-page limit (16 GB) and the kernel wrote the pages back
+  one by one: 8.5 MB/s on the cluster's virtual disk, 3.5 CPU minutes in 46
+  minutes of build, an estimated 10 hours for 100M x 128. A build in a file
+  therefore sorts by copying the rows in position order into a second
+  unlinked file (written front to back, the first file only read, then
+  dropped: the disk holds the vectors twice for a moment), and builds the
+  HNSW graph in anonymous memory and copies it into the file in one pass.
+  The in-memory build still sorts in place (no second copy in memory).
 - A separate `hot_dir` for the ids, codes and graph (PLAN 17.1 d) is not
   built: at the scales measured so far one slow search per eviction is the
   whole cost, and `cache_dir` on a tmpfs already pins a whole index. To be
