@@ -38,8 +38,8 @@ static void load(const std::string &dir, const std::string &name, std::int64_t i
 }
 
 // The read-ahead plan of a query mapping: sections in the order a search needs them, the float rows
-// last, whole sections only, within the budget; a compact index's rows are MADV_RANDOM whatever the
-// budget.
+// last, whole sections only within the budget, MADV_RANDOM beyond it (willneed false); what a search
+// reads whole is always asked for; a compact index's rows are MADV_RANDOM whatever the budget.
 static void test_prewarm_plan()
 {
     auto off = [](const std::uint8_t *base, const void *at) {
@@ -55,11 +55,11 @@ static void test_prewarm_plan()
     CHECK(plan[1].offset == 0 && plan[1].bytes == HEADER_BYTES + 1000ull * flat.set.row_stride * 4 && plan[1].willneed);
     CHECK(plan[1].bytes <= off(fd, flat.set.ids));
     // A flat index without codes reads every row at each search: its rows are asked for whatever the
-    // budget; the ids follow the budget.
+    // budget; the ids follow the budget (MADV_RANDOM beyond it).
     plan = prewarm_plan(fd, fsize, flat.set, false, 1000 * 8 + 100);
-    CHECK(plan.size() == 2 && plan[0].offset == off(fd, flat.set.ids) && plan[1].offset == 0 && plan[1].willneed);
+    CHECK(plan.size() == 2 && plan[0].offset == off(fd, flat.set.ids) && plan[0].willneed && plan[1].offset == 0 && plan[1].willneed);
     plan = prewarm_plan(fd, fsize, flat.set, false, 0);
-    CHECK(plan.size() == 1 && plan[0].offset == 0 && plan[0].willneed);
+    CHECK(plan.size() == 2 && plan[0].offset == off(fd, flat.set.ids) && !plan[0].willneed && plan[1].offset == 0 && plan[1].willneed);
 
     // HNSW with sq8 codes: ids, codes, graph, then the rows.
     TestSet coded;
@@ -96,17 +96,34 @@ static void test_prewarm_plan()
     }
     total += plan[9].bytes;
     CHECK(total <= csize);
-    // A budget of everything but level 0 (the largest section): level 0 is left out whole, the
+    // A budget of everything but level 0 (the largest section): level 0 becomes MADV_RANDOM, the
     // smaller sections after it (upper index, upper levels, the rows) are still asked for.
     CHECK(plan[6].bytes > plan[7].bytes + plan[8].bytes + plan[9].bytes);
     std::vector<PrewarmRange> cut = prewarm_plan(cd, csize, coded.set, false, total - plan[6].bytes);
-    CHECK(cut.size() == 9);
-    for (std::size_t i = 0; i < cut.size(); ++i) CHECK(cut[i].offset == plan[i < 6 ? i : i + 1].offset);
-    // compact: the rows MADV_RANDOM, even with no budget at all.
+    CHECK(cut.size() == 10);
+    for (std::size_t i = 0; i < cut.size(); ++i) CHECK(cut[i].offset == plan[i].offset && cut[i].willneed == (i != 6));
+    // Budget 0 on a graph index: every section MADV_RANDOM.
+    cut = prewarm_plan(cd, csize, coded.set, false, 0);
+    CHECK(cut.size() == 10);
+    for (const PrewarmRange &r : cut) CHECK(!r.willneed);
+    // compact: the rows MADV_RANDOM, even with the full budget.
     plan = prewarm_plan(cd, csize, coded.set, true);
-    CHECK(plan.size() == 10 && plan[9].offset == 0 && !plan[9].willneed);
-    plan = prewarm_plan(cd, csize, coded.set, true, 0);
-    CHECK(plan.size() == 1 && plan[0].offset == 0 && !plan[0].willneed);
+    CHECK(plan.size() == 10 && plan[9].offset == 0 && !plan[9].willneed && plan[6].willneed);
+    // A flat coded index scans every code: the codes are asked for whatever the budget.
+    TestSet fcoded;
+    {
+        SnapshotBuilder b(Metric::L2);
+        std::vector<float> v(8);
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            test_vector(i, 8, 6, true, v.data());
+            b.add(static_cast<std::int64_t>(1 + i), v.data(), 8);
+        }
+        const CodeSection c = sq8_code_section();
+        b.finish(0, fcoded.buffer, nullptr, &c);
+        fcoded.set = snapshot_open(fcoded.buffer.data(), fcoded.buffer.size(), true);
+    }
+    cut = prewarm_plan(fcoded.buffer.data(), fcoded.buffer.size(), fcoded.set, false, 0);
+    CHECK(cut.size() == 5 && !cut[0].willneed && cut[1].willneed && cut[2].willneed && cut[3].willneed && !cut[4].willneed);
 }
 
 int main()

@@ -573,19 +573,20 @@ results of session 12).
   4 MB; the first search 321 ms, the next four 15 ms on average, then normal
   again (median 7 ms); after the series the file was resident again (630
   MB): the read-ahead advice of the new mapping reloads the whole file at
-  disk speed (here about 2 GB/s). At 100M vectors (63 GB for HNSW) the same
-  reload took 45 s, during which the first search waited, and the searches
-  after it 10 to 25 s while the disk served the rest ("100 million vectors"
-  below). Since milestone M7 the advice is bounded: `prewarm_plan` (cache.h)
-  asks for the sections in the order a search needs them, ids, id index,
-  tombstones, codes, graph, float rows, each whole or not at all, at most
-  8 GB per mapping; a larger section is paged in on demand (the rows of a
-  flat index without codes are always asked for: a search reads them all
-  anyway, and the advice reads them in large pieces). At 100M HNSW
-  that is the ids and the upper graph levels (2.6 GB); level 0 (6.8 GB) and
-  the rows (51 GB) come in as searches touch them, so the first search costs
-  a few thousand random reads instead of a minute. Below 8 GB nothing
-  changes. The next two points are for indexes that must never be evicted.
+  disk speed (here about 2 GB/s). At 100M vectors (63 GB for HNSW) the first
+  search on a cold file took 46 s and the next ones 10 to 25 s ("100 million
+  vectors" below): not the advice but the kernel's read-around, 4 MB per page
+  fault on that cluster's disks (read_ahead_kb 4096), which a walk of a few
+  thousand random faults turns into the whole file. Since milestone M7
+  `prewarm_plan` (cache.h) asks for the sections in the order a search needs
+  them, ids, id index, tombstones, codes, graph, float rows, each whole or not
+  at all, at most 8 GB per mapping, and marks every section beyond the budget
+  MADV_RANDOM (a fault reads its page only); the rows of a flat index and the
+  codes of a flat coded index are always asked for, a search reads them all
+  anyway. At 100M HNSW that is the ids and the upper graph levels (2.3 GB)
+  read ahead, level 0 (13 GB) and the rows (51 GB) page by page as searches
+  touch them. Below 8 GB nothing changes. The next two points are for indexes
+  that must never be evicted.
 - A cache directory on tmpfs (`/dev/shm`, the index option `cache_dir`):
   the same warm speed (median 5 to 6 ms) and immune to eviction: after the
   page cache was emptied the index stayed resident and the first search took
@@ -1520,16 +1521,21 @@ What the numbers say:
   the others' files. Measured right after the sq8 build, with the HNSW file down to 4 MB resident on
   node 1 (`vinfo`): the first search took 45 s, the next nine (other queries) 10 to 25 s, then five
   repeats of one query 85 ms, a batch of 1000 queries 129 s and the next one 2.4 s; the file was fully
-  resident again after that. The cause is the read-ahead advice a new query mapping gives: MADV_WILLNEED
-  over the whole file, which the kernel serves before it returns, 63 GB at about 1.4 GB/s, and the disk
-  stays busy with it while the next searches read their pages. The flat index behaved the same: 45 s
-  for the first two searches, then 1.1 to 1.7 s (from the page cache 0.78 s: with the HNSW file
-  resident the 50 GB do not fit next to it), the batch 174 s twice. So at this size an index must fit
-  in the node's page cache beside Vertica's working set, or every eviction costs a minute; `load_all`
-  re-reads a file that was pushed out. The M6 decision on `hot_dir` (a pinned second file with the
-  graph, ids and codes): not built; the walk itself, once resident, costs 4.7 ms at 100M as at 10M, the
-  float rows are half of every search's reads, and a tmpfs `cache_dir` pins an index that fits. What
-  the numbers ask for is a bound on the read-ahead: a mapping should not stall its first search for a
-  file that cannot be read in seconds (milestone M7: the advice is given section by section in the
-  order the walk needs them, ids, id index, tombstones, codes, graph, float rows, and stops at a budget;
-  the rest is paged in on demand).
+  resident again after that. The cause is not the search's reads (a walk touches a few thousand rows
+  and graph blocks, tens of MB) but the kernel's read-around: on this cluster every disk has
+  read_ahead_kb 4096, so each page fault of a plain file mapping reads 4 MB around the page, and a
+  few thousand random faults read gigabytes; the first search on a cold file read all 63 GB (46 s at
+  about 1.4 GB/s) and the disk stayed busy while the next searches read theirs. (A first attempt
+  bounded the MADV_WILLNEED advice of the new mapping and changed nothing: 46 s again, the file fully
+  resident again.) The flat index behaved the same: 45 s for the first two searches, then 1.1 to
+  1.7 s (from the page cache 0.78 s: with the HNSW file resident the 50 GB do not fit next to it),
+  the batch 174 s twice. So at this size an index must fit in the node's page cache beside Vertica's
+  working set, or every eviction costs a minute; `load_all` re-reads a file that was pushed out.
+  The M6 decision on `hot_dir` (a pinned second file with the graph, ids and codes): not built; the
+  walk itself, once resident, costs 4.7 ms at 100M as at 10M, the float rows are half of every
+  search's reads, and a tmpfs `cache_dir` pins an index that fits. What the numbers ask for is the
+  right advice per section (milestone M7, `prewarm_plan` in cache.h): MADV_WILLNEED section by
+  section in the order the walk needs them, ids, id index, tombstones, codes, graph, float rows, up
+  to a budget of 8 GB per mapping, and MADV_RANDOM on every section beyond it, so a fault reads its
+  page and nothing around it; what every search reads whole (the rows of a flat index, the codes of
+  a flat coded index) is always asked for. Measured again below.

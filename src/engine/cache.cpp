@@ -286,23 +286,29 @@ std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t s
     // (FLAG_CAPACITY) is never read, so it costs no memory.
     std::vector<PrewarmRange> plan;
     std::uint64_t left = budget;
-    auto want = [&](const void *at, std::uint64_t bytes) {
+    // whole: the section is asked for whether it fits or not (a search reads all of it anyway).
+    // Otherwise it is asked for when it fits the budget that is left, else marked MADV_RANDOM: a
+    // search reads it at random, and without the mark every page fault reads the disk's read-around
+    // (read_ahead_kb, 4 MB on the test cluster), which loaded a whole 63 GB file in one search.
+    auto want = [&](const void *at, std::uint64_t bytes, bool whole = false) {
         if (bytes == 0 || at == nullptr) return;
         const std::uint64_t off = static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - data);
         if (off >= size) return;
         bytes = std::min(bytes, size - off);
-        if (bytes > left) return;       // whole or not at all; smaller sections after it may still fit
-        left -= bytes;
-        plan.push_back(PrewarmRange{off, bytes, true});
+        const bool fits = bytes <= left;
+        if (fits) left -= bytes;
+        plan.push_back(PrewarmRange{off, bytes, whole || fits});
     };
+    const bool flat = !s.has_graph();
     want(s.ids, s.count * 8);
     if (s.id_index) want(s.id_index, s.count * 4);
     if (s.tombstone_bits) want(s.tombstone_bits, (s.count + 63) / 64 * 8);
     if (s.flags & FLAG_SQ8) {
+        // A flat coded index scans every code at each search; a graph reads them at random.
         const Sq8Codes c = sq8_open(s, false);
-        want(s.sq8, SQ8_HEADER_BYTES);
-        want(c.codes, c.count * c.stride);
-        want(c.sums, c.count * 4);
+        want(s.sq8, SQ8_HEADER_BYTES, flat);
+        want(c.codes, c.count * c.stride, flat);
+        want(c.sums, c.count * 4, flat);
     }
     if (s.has_graph()) {
         const HnswGraph g = hnsw_open(s, false);
@@ -313,12 +319,11 @@ std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t s
         want(g.upper, g.upper_blocks * (std::uint64_t(g.m) + 1) * 4);
     }
     // The float rows: a flat index without codes reads every row at each search, so they are always
-    // asked for (the search would fault them in at once otherwise, page by page); with a graph or
-    // codes a search reads a few thousand of them at random, so the budget applies.
+    // asked for; with a graph or codes a search reads a few thousand of them at random (compact:
+    // MADV_RANDOM whatever the budget).
     const std::uint64_t rows = std::min(HEADER_BYTES + s.count * s.row_stride * 4, size);
     if (compact) plan.push_back(PrewarmRange{0, rows, false});
-    else if (!s.has_graph() && !(s.flags & FLAG_SQ8)) plan.push_back(PrewarmRange{0, rows, true});
-    else want(data, rows);
+    else want(data, rows, flat && !(s.flags & FLAG_SQ8));
     return plan;
 }
 

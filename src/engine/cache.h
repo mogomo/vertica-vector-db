@@ -65,19 +65,20 @@ IndexOptions read_index_options(const std::string &cache_dir, const std::string 
 // Read-ahead of a query mapping. The kernel is asked (MADV_WILLNEED) to read the sections a search
 // needs, in the order it needs them: ids, id index, tombstones, sq8 header, codes and sums, graph
 // header, levels, level 0, upper index and upper levels, and the float rows last; every section is
-// asked for whole or not at all, and the asking stops at PREWARM_BUDGET_BYTES per mapping. The advice
-// is served before the first search of the mapping runs, so the budget bounds that wait to a few
-// seconds of disk (the 100M proof, docs/design.md: 63 GB asked for at once stalled the first search
-// for 45 s). Sections beyond the budget are paged in as searches touch them; vload and load_all read
-// the whole file. A flat index without codes reads every row at each search: its rows are always asked
-// for. compact (memory_mode compact): the float rows get MADV_RANDOM instead, whatever the budget
-// (rescoring reads a few of them per query).
+// asked for whole or not at all, within PREWARM_BUDGET_BYTES per mapping. The advice is served before
+// the first search of the mapping runs, so the budget bounds that wait to a few seconds of disk. A
+// section beyond the budget is marked MADV_RANDOM: a search reads it at random, page by page, and
+// without the mark every page fault also reads the disk's read-around (read_ahead_kb: 4 MB on the
+// test cluster), which made one search on a cold 63 GB file read all of it (46 s; the 100M proof,
+// docs/design.md). What every search reads whole is always asked for: the rows of a flat index, the
+// codes of a flat coded index. vload and load_all read the whole file. compact (memory_mode compact):
+// the float rows get MADV_RANDOM whatever the budget (rescoring reads a few of them per query).
 constexpr std::uint64_t PREWARM_BUDGET_BYTES = 8ull << 30;
 
 struct PrewarmRange {
     std::uint64_t offset = 0;   // from the start of the file, page aligned by the caller
     std::uint64_t bytes = 0;
-    bool willneed = true;       // false: MADV_RANDOM (the float rows of a compact index)
+    bool willneed = true;       // false: MADV_RANDOM
 };
 
 // The ranges prewarm asks for, in order, for the sections of `set` mapped at `data` (a file of
