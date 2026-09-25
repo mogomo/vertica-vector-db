@@ -6,7 +6,7 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M6 in progress (memory and cache placement, scale tests).** Two index
+**Status: milestone M6 done (memory and cache placement, scale tests up to 100M vectors).** Two index
 types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
 each optionally with int8 codes (`sq8`) that make searches faster while the
 returned scores stay exact. k-nearest-neighbour search works for the metrics
@@ -1695,6 +1695,33 @@ here than on SIFT (see [int8 quantisation](#int8-quantisation-sq8)). The sq8
 balanced column was measured with 2 x k rescored; with the preset of 4 x k
 for 512 dimensions and more, balanced gives 0.965 (768) and 0.956 (1536), and
 1000 queries take 115 and 180 ms fenced (docs/design.md).
+
+**100 million vectors** (the first 100M of BIGANN / SIFT1B, 128 dimensions,
+with its ground truth for 100M; the 4-node cluster, 78 GB per node, 1000
+queries; one index built at a time, the build in a file, caches on the second
+data disk):
+
+| Measurement | Flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot, cache file per node | 48 GB | 62 GB | 74 GB |
+| full build (`refresh_index`; vbuild / vload) | 1,628 s (1,162 / 109) | 12,872 s (12,056 / 178) | 13,641 s (12,586 / 260) |
+| incremental refresh, 1000 adds and 500 deletes (before M7) | 1,156 s | 1,739 s | 2,766 s |
+| recall@10 fast / balanced / best | 1.000 (exact) | 0.748 / 0.903 / 0.981 | 0.741 / 0.903 / 0.981 |
+| one search, fenced / mixed (client ms) | 779 / 786 ms | 13.6 / 7.6 ms | 15.5 / 6.6 ms |
+| 1000 queries in one statement, balanced, fenced / mixed | 175 / 176 s | 822 / 452 ms | 1,143 / 918 ms |
+
+A search costs the same as at 10M once the file is in memory (4.7 ms of server
+time unfenced). Recall at a given `ef_search` falls with the size: balanced
+(ef 100) gives 0.903 here against 0.953 at 10M; use a larger `ef_search`
+(the index default `ef_search_default`) for a 100M index, `precision='best'`
+gives 0.981. sq8 is slower than the float index at this size and gains no
+recall: it saves nothing at 128 dimensions. The three files (184 GB) do not fit
+one node's memory together; after another build had pushed the HNSW file out,
+the first search took 45 s and the next ones 10 to 25 s while the file was
+read back (docs/design.md, "100 million vectors"): a node needs the memory for
+the indexes it serves beside Vertica. A refresh with nothing changed takes 18
+to 82 s: the journal digest over 100M rows, from disk when the table is not in
+the page cache (`verify_every`).
 
 **A journal of one billion rows** (10M ids written 100 times, 8 numbers per
 vector, partitioned by day; flat index; the 4-node cluster): full build 104 s

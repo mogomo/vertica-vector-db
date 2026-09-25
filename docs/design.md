@@ -510,9 +510,13 @@ results of session 12).
   HNSW graph in anonymous memory and copies it into the file in one pass.
   The in-memory build still sorts in place (no second copy in memory).
 - A separate `hot_dir` for the ids, codes and graph (PLAN 17.1 d) is not
-  built: at the scales measured so far one slow search per eviction is the
-  whole cost, and `cache_dir` on a tmpfs already pins a whole index. To be
-  decided with the 100M proof, where the float rows alone are 51 GB.
+  built (decided with the 100M proof, "100 million vectors" below): at 1M
+  and 10M one slow search per eviction is the whole cost, `cache_dir` on a
+  tmpfs pins a whole index that fits, and at 100M the float rows (half of
+  every search's reads) would still come from disk. The 100M numbers showed
+  instead that the whole-file read-ahead of a new mapping stalls the first
+  search for as long as the disk needs for the file (45 s for 63 GB); the
+  advice is bounded since milestone M7 (below).
 
 ## Freshness: exact results between refreshes
 
@@ -1249,3 +1253,76 @@ What the numbers say:
 - A cache file that no query has touched since its load is the first thing the kernel drops when
   Vertica writes: after the three 1536 builds, vinfo showed 1.5 to 2.4 GB of the 5.7 GB flat file
   resident; the first flat search then read the rest from disk.
+
+### 100 million vectors (milestone M6, the 4-node cluster)
+
+The first 100M vectors of BIGANN (SIFT1B, 128 dimensions, uint8 values converted to float; 13.2 GB of
+the bvecs file) with the ground truth for 100M (idx_100M), loaded with scripts/load_dataset.sh into one
+journal (all rows the same day, 100M rows), indexes flat, HNSW and HNSW with sq8 (m 16,
+ef_construction 200), fenced build, caches on the second data disk through the index option
+`cache_dir`, 1000 queries. Vertica 26.2.0-3, 4 nodes, 10 cores and 78 GB each. One index was built at a
+time; `refresh_index` chose the file-backed build for all of them (the estimate is above half of the
+free memory), so the build ran as page cache: the fenced process showed up to 62 GB (flat), 65 GB
+(HNSW) and 70 GB (sq8) of resident memory, but the node's available memory never fell below 50 GB,
+and Vertica's own process stayed at 10 GB. scripts/scale.sh; 12 hours for the three indexes.
+
+| | flat | HNSW | HNSW with sq8 |
+|---|---:|---:|---:|
+| snapshot, cache file per node | 49,591 MB | 63,088 MB | 75,677 MB |
+| build memory estimate (`sizing`) | 49,973 MB | 65,854 MB | 78,443 MB |
+| full refresh (vbuild / vload) | 1,628 s (1,162 / 109) | 12,872 s (12,056 / 178) | 13,641 s (12,586 / 260) |
+| incremental, 1000 adds + 500 deletes (vbuild / vload) | 1,156 s (642 / 140) | 1,739 s (1,025 / 234) | 2,766 s (1,625 / 242) |
+| refresh with nothing changed (journal verified) | 18.5 s (14.4) | 50.9 s (43.1) | 81.8 s (74.2) |
+| recall@10 fast / balanced / best / exact | 1.0000 (exact, 175 s) | 0.7476 / 0.9034 / 0.9813 / 1.0000 | 0.7406 / 0.9027 / 0.9812 / 1.0000 |
+| one search, client ms median, fenced / mixed | 779 / 786 | 13.6 / 7.6 | 15.5 / 6.6 |
+| the same, server ms median, fenced / mixed | 771 / 782 | 7.6 / 4.7 | 9.1 / 3.9 |
+| vknn, client ms median, fenced / mixed | 775 / 787 | 14.9 / 7.0 | 14.8 / 6.5 |
+| exact search over the empty delta, client ms, fenced / mixed | 801 / 821 | 42.0 / 35.3 | 43.8 / 33.6 |
+| 1000 queries, balanced, fenced / mixed | 175 s / 176 s (exact) | 822 / 452 ms | 1,143 / 918 ms |
+| 1000 queries, fast and best, mixed | | 403 / 554 ms | 1,067 / 1,163 ms |
+
+What the numbers say:
+- The HNSW build takes 3.3 hours of vbuild on 10 cores (8,300 vectors per second; 12,100 at 10M): the
+  graph (13.5 GB) is built in memory, the rows are sorted into a second file, and the file is then
+  written once. The vload in passes of 2 GB writes 50 to 76 GB per node in 109 to 260 s (about 300 to
+  460 MB/s per node from the broadcast join).
+- A search on the HNSW index costs the same as at 10M: 4.7 ms of server time unfenced (4.0 at 10M),
+  7.6 ms fenced. The walk touches a few thousand rows of the 63 GB file; the statement is most of the
+  time. The batch of 1000 queries takes 452 ms unfenced (2,200 queries per second on one node).
+- Recall falls with the size at the same `ef_search`: balanced (ef 100) gives 0.903 at 100M against
+  0.953 at 10M and 0.980 at 1M; best (ef 400 with the M6 presets) 0.981; fast 0.748. The presets are
+  tuned for 1M; a 100M index needs a larger `ef_search` (index default `ef_search_default`, or the
+  parameter) for the 1M recall, at a cost that grows about linearly with ef. The README says so.
+- sq8 does not pay at 100M x 128: its batch is slower than the float index (918 against 452 ms
+  unfenced), because the walk on the codes is followed by the rescoring of 2 x k candidates from the
+  float rows of a 76 GB file (random reads that miss the page cache more often than on a 6 GB file),
+  and recall is the same. sq8 is for memory, not speed, at this size; at 128 dimensions the codes save
+  nothing (the file holds both). A future graph on the codes without float rows (PLAN 18.3) would.
+- The flat index is the correctness reference: one query reads 50 GB (780 ms from the page cache,
+  about 65 GB/s), 1000 queries take 175 s. `precision='exact'` on the HNSW index costs the same.
+- An incremental refresh before milestone M7 rewrites and reloads the whole snapshot: 1,156 s for
+  1000 changes on the flat index, 1,739 s on HNSW, 2,766 s with sq8 (vbuild copies 50 to 76 GB through
+  a file, vload writes it on every node). This is the cost that the incremental transfer of M7
+  removes (only the changed bytes move; measured below).
+- A refresh that changes nothing verifies the journal digest over 100M rows: 14 s while the table was
+  in the page cache, 43 and 74 s later, when the snapshot files had pushed it out (the digest reads the
+  vectors too, 50 GB of storage; `verify_every` N spreads that cost).
+- The exact search over the empty delta costs 30 ms more than `_snap` (the 100M-row journal in one
+  day's partition, above the replica limit), as at 10M.
+- Three active snapshots (189 GB per node) do not fit the 78 GB of a node together: each build evicts
+  the others' files. Measured right after the sq8 build, with the HNSW file down to 4 MB resident on
+  node 1 (`vinfo`): the first search took 45 s, the next nine (other queries) 10 to 25 s, then five
+  repeats of one query 85 ms, a batch of 1000 queries 129 s and the next one 2.4 s; the file was fully
+  resident again after that. The cause is the read-ahead advice a new query mapping gives: MADV_WILLNEED
+  over the whole file, which the kernel serves before it returns, 63 GB at about 1.4 GB/s, and the disk
+  stays busy with it while the next searches read their pages. The flat index behaved the same: 45 s
+  for the first two searches, then 1.1 to 1.7 s (from the page cache 0.78 s: with the HNSW file
+  resident the 50 GB do not fit next to it), the batch 174 s twice. So at this size an index must fit
+  in the node's page cache beside Vertica's working set, or every eviction costs a minute; `load_all`
+  re-reads a file that was pushed out. The M6 decision on `hot_dir` (a pinned second file with the
+  graph, ids and codes): not built; the walk itself, once resident, costs 4.7 ms at 100M as at 10M, the
+  float rows are half of every search's reads, and a tmpfs `cache_dir` pins an index that fits. What
+  the numbers ask for is a bound on the read-ahead: a mapping should not stall its first search for a
+  file that cannot be read in seconds (milestone M7: the advice is given section by section in the
+  order the walk needs them, ids, id index, tombstones, codes, graph, float rows, and stops at a budget;
+  the rest is paged in on demand).
