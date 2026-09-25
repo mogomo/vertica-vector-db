@@ -16,6 +16,9 @@
 # - the same after 1000 journaled adds, 1000 deletes and 500 replacements without a refresh, and
 #   after the incremental refresh that follows (which keeps the codes);
 # - vknn gives what vsearch gives; 1 and 8 threads give the same results;
+# - the balanced preset rescores 4 x k from 512 dimensions on (an index vq_w of 3000 vectors of 512
+#   elements, one of them wide: the default gives what oversampling=4 gives and not what 2 gives, a
+#   session oversampling=2 is honoured) and 2 x k below (vq_l2);
 # - memory_mode compact needs sq8; quantization none again is a full build; vbuild refuses a base
 #   snapshot whose quantization differs.
 # --sift=SCHEMA: also registers the SIFT1M journal SCHEMA.sift_base (scripts/load_dataset.sh) as an
@@ -43,7 +46,7 @@ for arg in "$@"; do
         --cache_dir=*) CACHE_DIR="${arg#--cache_dir=}" ;;
         --sift=*)      SIFT="${arg#--sift=}" ;;
         --echo_only)   ECHO_ONLY=yes ;;
-        -h|--help)     sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "test_sq8.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -64,7 +67,7 @@ QALL() { echo "(SELECT * FROM $SCHEMA.$1_delta UNION ALL SELECT qid, qvec, NULL,
 echo "== test data: journal of $ROWS vectors, four HNSW indexes and a flat index with sq8 codes"
 run_sql "cleanup of an earlier run" "
 CALL vvector.unregister_index('vq_l2'); CALL vvector.unregister_index('vq_cos'); CALL vvector.unregister_index('vq_dot');
-CALL vvector.unregister_index('vq_l1'); CALL vvector.unregister_index('vqf_l2');" > /dev/null
+CALL vvector.unregister_index('vq_l1'); CALL vvector.unregister_index('vqf_l2'); CALL vvector.unregister_index('vq_w');" > /dev/null
 expect "journal and queries" "^journal $ROWS, queries 100$" "
 DROP SCHEMA IF EXISTS $SCHEMA CASCADE;
 CREATE SCHEMA $SCHEMA;
@@ -164,6 +167,37 @@ SELECT 'differences: ' || (SELECT COUNT(*) FROM (
   || ', rows: ' || (SELECT COUNT(*) FROM ($(search_sql vq_dot ", k=10, threads=8$p" "$(QALL vq_dot)")) c);"
 done
 
+echo "== the balanced preset and the dimensions"
+# One element in [-100, 100), 511 in [-1, 1): sq8 has one value range for all elements, so the codes
+# order these vectors poorly and 2 x k and 4 x k rescored give different results.
+W512=$(random_vector 511); W512="ARRAY[RANDOM() * 200 - 100, ${W512#ARRAY[}"
+QW="(SELECT * FROM $SCHEMA.vq_w_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries_w) x"
+expect "vq_w: 3000 vectors of 512 elements, HNSW with sq8 codes" "index vq_w refreshed" "
+CREATE TABLE $SCHEMA.journal_w (id INT NOT NULL, vec ARRAY[FLOAT], del BOOLEAN NOT NULL DEFAULT FALSE,
+                                ts TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP()) ORDER BY id SEGMENTED BY HASH(id) ALL NODES;
+INSERT INTO $SCHEMA.journal_w (id, vec, ts) SELECT id, $W512, CLOCK_TIMESTAMP() - INTERVAL '1 day' FROM ($(row_numbers 3000)) g;
+CREATE TABLE $SCHEMA.queries_w (qid INT, qvec ARRAY[FLOAT]);
+INSERT INTO $SCHEMA.queries_w SELECT id, $W512 FROM ($(row_numbers 100)) g;
+COMMIT;
+CALL vvector.register_index('vq_w', '$SCHEMA.journal_w', 'id', 'vec', 'del', 'ts', 'l2', 0, 'hnsw');
+CALL vvector.set_index_options('vq_w', $SQ8);
+CALL vvector.refresh_index('vq_w');"
+same_as() {   # NAME INDEX QUERIES PARAMS_A PARAMS_B [SESSION_SQL]: the two searches return the same rows
+    expect "$1" "^differences: 0, rows: 1000$" "${6:-}
+SELECT 'differences: ' || (SELECT COUNT(*) FROM (
+  (SELECT * FROM ($(search_sql $2 ", k=10$4" "$3")) a EXCEPT SELECT * FROM ($(search_sql $2 ", k=10$5" "$3")) b)
+  UNION ALL
+  (SELECT * FROM ($(search_sql $2 ", k=10$5" "$3")) b EXCEPT SELECT * FROM ($(search_sql $2 ", k=10$4" "$3")) a)) d)
+  || ', rows: ' || (SELECT COUNT(*) FROM ($(search_sql $2 ", k=10$4" "$3")) c);"
+}
+same_as "vq_w (512 dimensions): balanced rescores 4 x k" vq_w "$QW" "" ", oversampling=4"
+same_as "vq_w: a session oversampling 2 is used instead of the preset" vq_w "$QW" "" ", oversampling=2" \
+    "ALTER SESSION SET UDPARAMETER FOR vvector oversampling = '2';"
+same_as "vq_l2 (16 dimensions): balanced rescores 2 x k" vq_l2 "(SELECT * FROM $SCHEMA.vq_l2_snap UNION ALL SELECT qid, qvec, NULL, NULL, NULL, NULL, NULL FROM $SCHEMA.queries) x" "" ", oversampling=2"
+expect "vq_w: 2 x k rescored gives other rows than the default (so the checks above see the preset)" "^rows of 2 x k not in the default: [1-9]" "
+SELECT 'rows of 2 x k not in the default: ' || COUNT(*) || ' of 1000' FROM (
+  SELECT * FROM ($(search_sql vq_w ", k=10, oversampling=2" "$QW")) a EXCEPT SELECT * FROM ($(search_sql vq_w ", k=10" "$QW")) b) d;"
+
 echo "== memory_mode, options and errors"
 expect "memory_mode compact on an index with sq8, then a refresh: searches work" "^rows: 10$" "
 CALL vvector.set_index_options('vq_l1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'compact', NULL, NULL, NULL, NULL);
@@ -209,7 +243,7 @@ fi
 
 run_sql "cleanup" "
 CALL vvector.unregister_index('vq_l2'); CALL vvector.unregister_index('vq_cos'); CALL vvector.unregister_index('vq_dot');
-CALL vvector.unregister_index('vq_l1'); CALL vvector.unregister_index('vqf_l2');
+CALL vvector.unregister_index('vq_l1'); CALL vvector.unregister_index('vqf_l2'); CALL vvector.unregister_index('vq_w');
 DROP SCHEMA $SCHEMA CASCADE;" > /dev/null
 
 finish_tests test_sq8

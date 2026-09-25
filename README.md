@@ -613,7 +613,7 @@ Parameters:
 | freshness | snapshot | snapshot, exact | `exact` applies the journal rows of the input; `snapshot` ignores them |
 | radius | off | a number | only neighbours within it, at most k: l2 and l1 `score <= radius`; cosine and dot `score >= radius` (on HNSW: see [Range search](#range-search)) |
 | threads | 0 | 0 (one per core) to 64 | threads for one statement |
-| precision | balanced | fast, balanced, best, exact | the speed and recall trade-off, a preset of ef_search (HNSW; fast: 2 x k, at least 32, and 32 with a radius; balanced: 100; best: 400) and, with sq8, of rescore and oversampling (fast: no rescoring; balanced: 2 x k candidates rescored; best: 4 x k). exact reads every float vector. A flat index without sq8 is always exact |
+| precision | balanced | fast, balanced, best, exact | the speed and recall trade-off, a preset of ef_search (HNSW; fast: 2 x k, at least 32, and 32 with a radius; balanced: 100; best: 400) and, with sq8, of rescore and oversampling (fast: no rescoring; balanced: 2 x k candidates rescored, 4 x k from 512 dimensions on; best: 4 x k). exact reads every float vector. A flat index without sq8 is always exact |
 | ef_search | 0 (preset) | 0 to 100000 | HNSW: the length of the candidate list; overrides the preset of `precision`; below k it is raised to k (with a radius it grows from there, see [Range search](#range-search)). No effect on a flat index |
 | exact | false | true, false | `true` reads every vector of an HNSW index (the same as `precision='exact'`) |
 | rescore, oversampling | preset of precision | true or false; 1 to 100 | sq8 only: rank by the bytes, then compute the exact scores of the best k x oversampling candidates from the floats (`rescore=true`), or return the k best with approximate scores (`rescore=false`). No effect on an index without sq8 |
@@ -1143,7 +1143,7 @@ searched exactly) and incremental refresh (which keeps the range). The
 | precision | codes | rescoring |
 |---|---|---|
 | fast | graph walk or scan on the codes | none: the scores are approximate |
-| balanced (default) | the same | 2 x k candidates rescored |
+| balanced (default) | the same | 2 x k candidates rescored; 4 x k from 512 dimensions on |
 | best | the same, ef_search 400 | 4 x k candidates rescored |
 | exact | not used: every float vector is read | |
 
@@ -1162,9 +1162,12 @@ threads, 10,000 queries; `make test DATA_DIR=...`.) Through SQL, recall@10 of
 and 0.999 without sq8.
 
 On generated vectors of 768 and 1536 dimensions (metric cosine, 1M vectors)
-sq8 lost more: balanced 0.933 and 0.931 against 0.971 and 0.960 without
-codes; `precision='best'` gave 0.992 and 0.996 and was no slower than the
-float index at balanced. Measure the recall on your own vectors (the query in
+sq8 lost more with 2 x k rescored: 0.933 and 0.932 against 0.973 and 0.962
+without codes. With 4 x k rescored it gave 0.965 and 0.956 and was still 30%
+faster than the float index, so from 512 dimensions on balanced rescores
+4 x k; an `oversampling` you set (per query or per session) replaces
+that preset. `precision='best'` gave 0.992 and 0.996 and was no slower than
+the float index at balanced. Measure the recall on your own vectors (the query in
 [Precision, ef_search and exact search](#precision-ef_search-and-exact-search-on-an-hnsw-index))
 before you choose sq8 for high dimensions.
 
@@ -1676,7 +1679,10 @@ size of text embeddings, metric cosine, recall against the exact search; the
 
 A flat index answers one search in 76 ms (768) and 112 ms (1536) mixed: it
 reads the whole file per query. sq8 halves batch times but loses more recall
-here than on SIFT (see [int8 quantisation](#int8-quantisation-sq8)).
+here than on SIFT (see [int8 quantisation](#int8-quantisation-sq8)). The sq8
+balanced column was measured with 2 x k rescored; with the preset of 4 x k
+for 512 dimensions and more, balanced gives 0.965 (768) and 0.956 (1536), and
+1000 queries take 115 and 180 ms fenced (docs/design.md).
 
 **A journal of one billion rows** (10M ids written 100 times, 8 numbers per
 vector, partitioned by day; flat index; the 4-node cluster): full build 104 s

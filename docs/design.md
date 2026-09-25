@@ -201,8 +201,10 @@ stay: they are needed for rescoring and for `precision='exact'`.
   multiply-add of 16-bit pairs); g++ 8.5 takes that form for a dot product only when a factor is
   signed, so the row code is shifted by 128 and the sum corrected exactly with the query's code
   sum. With 32-bit factors it used 32-bit multiplies.
-- Presets of `precision`: fast = codes only (no rescoring), balanced = 2 x k rescored, best =
-  4 x k; each can be overridden by `rescore` and `oversampling`.
+- Presets of `precision`: fast = codes only (no rescoring), balanced = 2 x k rescored (4 x k from
+  512 dimensions on, see "768 and 1536 dimensions"), best = 4 x k; each can be overridden by
+  `rescore` and `oversampling` (per call or per session: a value set there replaces the preset at
+  every dimension).
 - Incremental refresh keeps the base's range and codes the appended rows with it; a full build
   trains anew. A change of the option is a full build (the options are part of active_options).
 - `memory_mode compact`: a query mapping asks the kernel to read ahead only what follows the float
@@ -1199,6 +1201,25 @@ What the numbers say:
   code step is large against the differences between near neighbours. `precision='best'`
   (4 x k rescored) gives 0.992 and 0.996 and is no slower than the float index at balanced;
   measure recall on your own vectors before choosing sq8 at these sizes (README, int8 quantisation).
+- Rescoring more candidates closes most of the gap (measured after the tables on the same data, the
+  HNSW indexes built again: the parallel build gives a slightly different graph, so recall moves by up
+  to 0.002; fenced, 1000 queries in one statement, median of 3 statements, recall@10 against the
+  exact search):
+
+  | balanced, candidates rescored | 768: recall | 768: batch | 1536: recall | 1536: batch |
+  |---|---:|---:|---:|---:|
+  | 2 x k (the preset until then) | 0.9330 | 113 ms | 0.9320 | 159 ms |
+  | 3 x k | 0.9579 | 118 ms | 0.9522 | 168 ms |
+  | 4 x k | 0.9646 | 115 ms | 0.9564 | 180 ms |
+  | 6 x k | 0.9681 | 122 ms | 0.9580 | 179 ms |
+  | float HNSW index, balanced | 0.9732 | 165 ms | 0.9618 | 263 ms |
+
+  The walk on the codes finds the neighbours; the codes only order them less well, so more of them
+  must be rescored from the floats. Rescoring costs little next to the walk. From 512 dimensions on
+  the balanced preset therefore rescores 4 x k: within 0.009 and 0.006 of the float index and still
+  30% faster than it. Below 512 dimensions it stays 2 x k (SIFT: 0.979 against 0.980 already). The
+  limit 512 lies between the dimensions measured (128, 768); tests/sql/test_sq8.sh checks the
+  preset at 512 and at 16 dimensions.
 - The HNSW build takes 163 s at 768 and 303 s at 1536 dimensions: the distance computations grow
   with the dimension, the number of them does not.
 - An incremental refresh stores and loads the whole file: at 1536 dimensions about 60 s of vbuild

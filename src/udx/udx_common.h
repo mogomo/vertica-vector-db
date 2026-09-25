@@ -166,6 +166,13 @@ public:
         fail(from + " " + name + " = '" + v + "' is not true or false");
     }
 
+    // True when the value is set at any level above the built-in default.
+    bool has(const char *name)
+    {
+        std::string v, from;
+        return params_.containsParameter(name) || lookup(name, v, from);
+    }
+
 private:
     bool lookup(const char *name, std::string &v, std::string &from)
     {
@@ -188,8 +195,8 @@ inline bool one_of(const std::string &v, std::initializer_list<const char *> all
 // On a flat index without codes every precision is exact and ef_search has no effect; rescore and
 // oversampling act on an index with sq8 codes only. All are checked, so that the same SQL works on
 // every index. Presets of the precision levels (PLAN 4.1): fast: ef max(2 x k, 32), no rescoring;
-// balanced (the default): ef 100, rescoring of 2 x k candidates; best: ef 400, 4 x k; exact: every
-// vector, float rows.
+// balanced (the default): ef 100, rescoring of 2 x k candidates (4 x k from 512 dimensions on); best:
+// ef 400, 4 x k; exact: every vector, float rows.
 struct SearchSettings {
     static const vint MAX_K = 16384;
     vint k = 10;
@@ -198,6 +205,7 @@ struct SearchSettings {
     bool exact = false;
     bool rescore = true;
     double oversampling = 1.0;
+    bool oversampling_preset = true;   // not set by call, session or index: the preset applies
     int threads = 1;
     bool has_radius = false;
     double radius = 0;
@@ -213,6 +221,7 @@ struct SearchSettings {
         if (ef_search < 0 || ef_search > 100000) fail("ef_search must be 0 (preset) to 100000");
         exact = cfg.boolean("exact", false);
         rescore = cfg.boolean("rescore", precision != "fast");
+        oversampling_preset = !cfg.has("oversampling");
         oversampling = cfg.real("oversampling", precision == "best" ? 4.0 : precision == "balanced" ? 2.0 : 1.0);
         if (!(oversampling >= 1.0 && oversampling <= 100.0)) fail("oversampling must be 1 to 100");
         threads = vvector::resolve_threads(cfg.integer("threads", 0));
@@ -250,6 +259,15 @@ struct SearchSettings {
         return fs;
     }
 
+    // Candidates rescored per query: k x this. The balanced preset rescores 4 x k from 512 dimensions
+    // on: the int8 codes of long vectors order the candidates less well (1M generated cosine vectors of
+    // 768 / 1536 dimensions, recall@10 0.933 / 0.932 at 2 x k, 0.965 / 0.956 at 4 x k, float index
+    // 0.973 / 0.962; still 30% faster than the float index; docs/design.md).
+    double oversampling_for(const vvector::VectorSet &s) const
+    {
+        return oversampling_preset && precision == "balanced" && s.dims >= 512 ? 4.0 : oversampling;
+    }
+
     // The search ranks by the sq8 codes when the index has them, unless precision is exact or exact is true.
     bool use_codes(const vvector::VectorSet &s) const
     {
@@ -273,7 +291,7 @@ struct SearchSettings {
         p.ef = ef();
         p.codes = use_codes(s);
         p.rescore = rescore;
-        p.oversampling = oversampling;
+        p.oversampling = oversampling_for(s);
         vvector::index_search(fs, s, p, skip, extra, out, count, poll);
     }
 };
