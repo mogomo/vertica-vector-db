@@ -573,9 +573,19 @@ results of session 12).
   4 MB; the first search 321 ms, the next four 15 ms on average, then normal
   again (median 7 ms); after the series the file was resident again (630
   MB): the read-ahead advice of the new mapping reloads the whole file at
-  disk speed (here about 2 GB/s). At 100M vectors (66 GB for HNSW) the same
-  reload takes the better part of a minute, and the searches during it are
-  slow: that is where the next two points matter.
+  disk speed (here about 2 GB/s). At 100M vectors (63 GB for HNSW) the same
+  reload took 45 s, during which the first search waited, and the searches
+  after it 10 to 25 s while the disk served the rest ("100 million vectors"
+  below). Since milestone M7 the advice is bounded: `prewarm_plan` (cache.h)
+  asks for the sections in the order a search needs them, ids, id index,
+  tombstones, codes, graph, float rows, each whole or not at all, at most
+  8 GB per mapping; a larger section is paged in on demand (the rows of a
+  flat index without codes are always asked for: a search reads them all
+  anyway, and the advice reads them in large pieces). At 100M HNSW
+  that is the ids and the upper graph levels (2.6 GB); level 0 (6.8 GB) and
+  the rows (51 GB) come in as searches touch them, so the first search costs
+  a few thousand random reads instead of a minute. Below 8 GB nothing
+  changes. The next two points are for indexes that must never be evicted.
 - A cache directory on tmpfs (`/dev/shm`, the index option `cache_dir`):
   the same warm speed (median 5 to 6 ms) and immune to eviction: after the
   page cache was emptied the index stayed resident and the first search took

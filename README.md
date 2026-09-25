@@ -1520,8 +1520,13 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   `vinfo` shows how much of it is in memory (`resident_mb`). Vertica's own
   scans go through the same cache, so a large scan can push index pages out;
   the next search then reads them from disk (on the test VM: one search of
-  0.3 s for a 632 MB index, then normal speed; at 100M vectors a minute or
-  more). A search reads the file on one node only, in the tests the node the
+  0.3 s for a 632 MB index, then normal speed). A new mapping asks the
+  kernel to read the file ahead, the ids, codes and graph before the float
+  rows and at most 8 GB in all (a flat index reads all its rows at every
+  search, so they are always asked for), so the first search of a graph index's
+  mapping waits a few seconds at most; the rest of a larger file comes in as searches touch it
+  (on the 100M test, 63 GB, the first search waited 45 s before this bound),
+  and `load_all` reads all of it. A search reads the file on one node only, in the tests the node the
   client was connected to: on the 4-node test cluster, after a benchmark
   whose sessions all used node 1, the indexes were fully resident there and
   100 to 200 MB of 630 MB on the other nodes. Spread

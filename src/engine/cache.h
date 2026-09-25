@@ -62,6 +62,29 @@ void write_index_options(const std::string &cache_dir, const std::string &index,
 // Reads the OPTIONS file. Missing file = no options.
 IndexOptions read_index_options(const std::string &cache_dir, const std::string &index);
 
+// Read-ahead of a query mapping. The kernel is asked (MADV_WILLNEED) to read the sections a search
+// needs, in the order it needs them: ids, id index, tombstones, sq8 header, codes and sums, graph
+// header, levels, level 0, upper index and upper levels, and the float rows last; every section is
+// asked for whole or not at all, and the asking stops at PREWARM_BUDGET_BYTES per mapping. The advice
+// is served before the first search of the mapping runs, so the budget bounds that wait to a few
+// seconds of disk (the 100M proof, docs/design.md: 63 GB asked for at once stalled the first search
+// for 45 s). Sections beyond the budget are paged in as searches touch them; vload and load_all read
+// the whole file. A flat index without codes reads every row at each search: its rows are always asked
+// for. compact (memory_mode compact): the float rows get MADV_RANDOM instead, whatever the budget
+// (rescoring reads a few of them per query).
+constexpr std::uint64_t PREWARM_BUDGET_BYTES = 8ull << 30;
+
+struct PrewarmRange {
+    std::uint64_t offset = 0;   // from the start of the file, page aligned by the caller
+    std::uint64_t bytes = 0;
+    bool willneed = true;       // false: MADV_RANDOM (the float rows of a compact index)
+};
+
+// The ranges prewarm asks for, in order, for the sections of `set` mapped at `data` (a file of
+// `size` bytes). Pure, so tests can check the order and the budget without a file.
+std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t size, const VectorSet &set,
+                                       bool compact, std::uint64_t budget = PREWARM_BUDGET_BYTES);
+
 // A snapshot file mapped read-only. Throws std::runtime_error with the cause.
 class MappedSnapshot {
 public:
@@ -71,9 +94,10 @@ public:
     MappedSnapshot &operator=(const MappedSnapshot &) = delete;
 
     // verify: read and check the whole file (vload). Otherwise (a query mapping) the kernel is asked
-    // to read the file ahead; compact (memory_mode compact, an index with sq8 codes): everything but
-    // the float rows, which only rescoring reads, a few rows per query. prewarm false: no read-ahead
-    // advice (vinfo, which must not load a file just to report how much of it is in memory).
+    // to read the file ahead (prewarm_plan above); compact (memory_mode compact, an index with sq8
+    // codes): everything but the float rows, which only rescoring reads, a few rows per query.
+    // prewarm false: no read-ahead advice (vinfo, which must not load a file just to report how much
+    // of it is in memory).
     // writable_copy: a private copy-on-write mapping (MAP_PRIVATE, read-write) for an incremental
     // build in place (delta.h): writes change the mapping, never the file, and cost memory for the
     // pages written only. No read-ahead, never kept.

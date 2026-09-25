@@ -3,6 +3,8 @@
 
 #include "../../src/engine/cache.h"
 #include "../../src/engine/delta.h"
+#include "../../src/engine/hnsw.h"
+#include "../../src/engine/sq8.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -35,10 +37,83 @@ static void load(const std::string &dir, const std::string &name, std::int64_t i
     w.commit();
 }
 
+// The read-ahead plan of a query mapping: sections in the order a search needs them, the float rows
+// last, whole sections only, within the budget; a compact index's rows are MADV_RANDOM whatever the
+// budget.
+static void test_prewarm_plan()
+{
+    auto off = [](const std::uint8_t *base, const void *at) {
+        return static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - base);
+    };
+    TestSet flat;
+    build(flat, 1000, 8);
+    const std::uint8_t *fd = flat.buffer.data();
+    const std::uint64_t fsize = flat.buffer.size();
+    std::vector<PrewarmRange> plan = prewarm_plan(fd, fsize, flat.set, false);
+    CHECK(plan.size() == 2);
+    CHECK(plan[0].offset == off(fd, flat.set.ids) && plan[0].bytes == 1000 * 8 && plan[0].willneed);
+    CHECK(plan[1].offset == 0 && plan[1].bytes == HEADER_BYTES + 1000ull * flat.set.row_stride * 4 && plan[1].willneed);
+    CHECK(plan[1].bytes <= off(fd, flat.set.ids));
+    // A flat index without codes reads every row at each search: its rows are asked for whatever the
+    // budget; the ids follow the budget.
+    plan = prewarm_plan(fd, fsize, flat.set, false, 1000 * 8 + 100);
+    CHECK(plan.size() == 2 && plan[0].offset == off(fd, flat.set.ids) && plan[1].offset == 0 && plan[1].willneed);
+    plan = prewarm_plan(fd, fsize, flat.set, false, 0);
+    CHECK(plan.size() == 1 && plan[0].offset == 0 && plan[0].willneed);
+
+    // HNSW with sq8 codes: ids, codes, graph, then the rows.
+    TestSet coded;
+    {
+        SnapshotBuilder b(Metric::L2);
+        std::vector<float> v(8);
+        for (std::uint64_t i = 0; i < 1000; ++i) {
+            test_vector(i, 8, 5, true, v.data());
+            b.add(static_cast<std::int64_t>(3 + 2 * i), v.data(), 8);
+        }
+        HnswParams p;
+        p.m = 12;
+        p.ef_construction = 40;
+        p.threads = 1;
+        const GraphSection g = hnsw_graph_section(p);
+        const CodeSection c = sq8_code_section();
+        b.finish(0, coded.buffer, &g, &c);
+        coded.set = snapshot_open(coded.buffer.data(), coded.buffer.size(), true);
+    }
+    const std::uint8_t *cd = coded.buffer.data();
+    const std::uint64_t csize = coded.buffer.size();
+    const HnswGraph g = hnsw_open(coded.set, false);
+    plan = prewarm_plan(cd, csize, coded.set, false);
+    CHECK(plan.size() == 10);
+    CHECK(plan[0].offset == off(cd, coded.set.ids));
+    CHECK(plan[1].offset == off(cd, coded.set.sq8) && plan[1].bytes == SQ8_HEADER_BYTES);
+    CHECK(plan[4].offset == off(cd, coded.set.graph) && plan[4].bytes == HNSW_HEADER_BYTES);
+    CHECK(plan[6].offset == off(cd, g.level0) && plan[6].bytes == 1000ull * (g.m0 + 1) * 4);
+    CHECK(plan[9].offset == 0 && plan[9].willneed);
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i + 1 < plan.size(); ++i) {
+        CHECK(plan[i].willneed && plan[i].offset < plan[i + 1].offset + (i + 2 == plan.size() ? csize : 0));
+        total += plan[i].bytes;
+    }
+    total += plan[9].bytes;
+    CHECK(total <= csize);
+    // A budget of everything but level 0 (the largest section): level 0 is left out whole, the
+    // smaller sections after it (upper index, upper levels, the rows) are still asked for.
+    CHECK(plan[6].bytes > plan[7].bytes + plan[8].bytes + plan[9].bytes);
+    std::vector<PrewarmRange> cut = prewarm_plan(cd, csize, coded.set, false, total - plan[6].bytes);
+    CHECK(cut.size() == 9);
+    for (std::size_t i = 0; i < cut.size(); ++i) CHECK(cut[i].offset == plan[i < 6 ? i : i + 1].offset);
+    // compact: the rows MADV_RANDOM, even with no budget at all.
+    plan = prewarm_plan(cd, csize, coded.set, true);
+    CHECK(plan.size() == 10 && plan[9].offset == 0 && !plan[9].willneed);
+    plan = prewarm_plan(cd, csize, coded.set, true, 0);
+    CHECK(plan.size() == 1 && plan[0].offset == 0 && !plan[0].willneed);
+}
+
 int main()
 {
     char tmpl[] = "/tmp/vvector_test_XXXXXX";
     const std::string dir = mkdtemp(tmpl);
+    test_prewarm_plan();
 
     CHECK(valid_index_name("docs_2") && !valid_index_name("") && !valid_index_name("../x") &&
           !valid_index_name("a/b") && !valid_index_name("a b"));

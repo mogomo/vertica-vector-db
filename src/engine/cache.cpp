@@ -279,45 +279,68 @@ std::map<std::string, IndexState> states;      // by <cache_dir>/<index>
 
 } // namespace
 
-// Read-ahead advice for a query mapping, over the used bytes of every section only: the slack of a
-// layout with room to grow (FLAG_CAPACITY) is never read, so it costs no memory. compact: the float
-// rows are read at random by rescoring only; the sections after them (ids, codes, graph) are read ahead.
+std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t size, const VectorSet &s,
+                                       bool compact, std::uint64_t budget)
+{
+    // Over the used bytes of every section only: the slack of a layout with room to grow
+    // (FLAG_CAPACITY) is never read, so it costs no memory.
+    std::vector<PrewarmRange> plan;
+    std::uint64_t left = budget;
+    auto want = [&](const void *at, std::uint64_t bytes) {
+        if (bytes == 0 || at == nullptr) return;
+        const std::uint64_t off = static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - data);
+        if (off >= size) return;
+        bytes = std::min(bytes, size - off);
+        if (bytes > left) return;       // whole or not at all; smaller sections after it may still fit
+        left -= bytes;
+        plan.push_back(PrewarmRange{off, bytes, true});
+    };
+    want(s.ids, s.count * 8);
+    if (s.id_index) want(s.id_index, s.count * 4);
+    if (s.tombstone_bits) want(s.tombstone_bits, (s.count + 63) / 64 * 8);
+    if (s.flags & FLAG_SQ8) {
+        const Sq8Codes c = sq8_open(s, false);
+        want(s.sq8, SQ8_HEADER_BYTES);
+        want(c.codes, c.count * c.stride);
+        want(c.sums, c.count * 4);
+    }
+    if (s.has_graph()) {
+        const HnswGraph g = hnsw_open(s, false);
+        want(s.graph, HNSW_HEADER_BYTES);
+        want(g.levels, g.count);
+        want(g.level0, g.count * (std::uint64_t(g.m0) + 1) * 4);
+        want(g.upper_index, g.count * 4);
+        want(g.upper, g.upper_blocks * (std::uint64_t(g.m) + 1) * 4);
+    }
+    // The float rows: a flat index without codes reads every row at each search, so they are always
+    // asked for (the search would fault them in at once otherwise, page by page); with a graph or
+    // codes a search reads a few thousand of them at random, so the budget applies.
+    const std::uint64_t rows = std::min(HEADER_BYTES + s.count * s.row_stride * 4, size);
+    if (compact) plan.push_back(PrewarmRange{0, rows, false});
+    else if (!s.has_graph() && !(s.flags & FLAG_SQ8)) plan.push_back(PrewarmRange{0, rows, true});
+    else want(data, rows);
+    return plan;
+}
+
+namespace {
+
+// Applies the read-ahead plan of a query mapping (prewarm_plan in cache.h).
 static void prewarm(void *m, std::uint64_t size, bool compact)
 {
     const std::uint8_t *data = static_cast<const std::uint8_t *>(m);
     const std::uint64_t page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
-    auto advise = [&](const void *at, std::uint64_t bytes, int what) {
-        if (bytes == 0) return;
-        const std::uint64_t off = static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - data);
-        if (off >= size) return;
-        const std::uint64_t from = off / page * page, to = std::min(size, off + bytes);
-        madvise(static_cast<std::uint8_t *>(m) + from, to - from, what);
-    };
     try {
         const VectorSet s = snapshot_open(data, size, false);
-        const std::uint64_t vector_bytes = s.count * s.row_stride * 4;
-        advise(data, HEADER_BYTES + vector_bytes, compact ? MADV_RANDOM : MADV_WILLNEED);
-        advise(s.ids, s.count * 8, MADV_WILLNEED);
-        if (s.id_index) advise(s.id_index, s.count * 4, MADV_WILLNEED);
-        if (s.tombstone_bits) advise(s.tombstone_bits, (s.count + 63) / 64 * 8, MADV_WILLNEED);
-        if (s.flags & FLAG_SQ8) {
-            const Sq8Codes c = sq8_open(s, false);
-            advise(s.sq8, SQ8_HEADER_BYTES, MADV_WILLNEED);
-            advise(c.codes, c.count * c.stride, MADV_WILLNEED);
-            advise(c.sums, c.count * 4, MADV_WILLNEED);
-        }
-        if (s.has_graph()) {
-            const HnswGraph g = hnsw_open(s, false);
-            advise(s.graph, HNSW_HEADER_BYTES, MADV_WILLNEED);
-            advise(g.levels, g.count, MADV_WILLNEED);
-            advise(g.level0, g.count * (std::uint64_t(g.m0) + 1) * 4, MADV_WILLNEED);
-            advise(g.upper_index, g.count * 4, MADV_WILLNEED);
-            advise(g.upper, g.upper_blocks * (std::uint64_t(g.m) + 1) * 4, MADV_WILLNEED);
+        for (const PrewarmRange &r : prewarm_plan(data, size, s, compact)) {
+            const std::uint64_t from = r.offset / page * page, to = std::min(size, r.offset + r.bytes);
+            madvise(static_cast<std::uint8_t *>(m) + from, to - from, r.willneed ? MADV_WILLNEED : MADV_RANDOM);
         }
     } catch (const std::runtime_error &) {
         // Not a snapshot this library reads: open() reports it; nothing to read ahead.
     }
 }
+
+} // namespace
 
 std::uint64_t MappedSnapshot::resident_bytes() const
 {
