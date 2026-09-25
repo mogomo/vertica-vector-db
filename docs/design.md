@@ -396,6 +396,24 @@ packed VARBINARY column read with one memcpy) is the lever if a larger
 machine shows the same ratio. An index is another order of magnitude for
 one query because the file is mapped and no row is converted.
 
+On the 4-node Enterprise cluster (10 cores and 78 GB per node, AVX-512; the
+same statements, k 10, l2, fenced; BIGANN prefixes of 10M and 100M rows
+beside the generated 1M; one run at 100M):
+
+| Rows | built-in, one query | `vscan`, one query | `vsearch` exact, one query | built-in, ten queries | `vscan`, ten queries | `vsearch` exact, ten queries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1M | 14.1 to 20.1 s | 0.51 to 0.60 s | 32 to 38 ms (0.9 s the first call) | 16.5 s | VSCAN10_1M | 51 ms |
+| 10M | 37 to 80 s | 3.6 to 3.7 s | 132 ms (7.5 s the first call) | 163 s | VSCAN10_10M | 328 ms |
+| 100M | 364 s | 18.9 s | 1.25 s | not run | VSCAN10_100M | 3.2 s |
+
+vscan reads the 100M rows (51 GB of float arrays over 4 nodes) in 19 s: about
+5.3 million rows per second on 40 cores, 19 times the built-in. The flat
+index answers one query 15 times faster still (the file is mapped, no row is
+converted) and a batch of ten in a third of the time of ten vscan runs. The
+100M journal was loaded on one day, so both scans read all of it; a journal
+partitioned by day lets vscan (any predicate before the function) skip
+partitions that a query does not need.
+
 ## vload on every node
 
 `vload(...) OVER(PARTITION NODES)` runs one function instance on every node
@@ -1069,13 +1087,17 @@ removes each:
   chunks of vectors do not show this; its cost is the bytes, about 90 MB/s
   there). vload starts the new file from the node's file of the base: a
   reflink (FICLONE on xfs with reflink=1, which the cluster's /scratch_b, the
-  VM and RHEL 8 have) when the patch has at most 64 runs, because every write
-  into a reflinked file then unshares an extent (copy-on-write: 3 ms per
-  scattered 512-byte write measured on xfs, 300 s for 100,000, against 1.3 s
-  into a plain copy that cost 0.35 s); a copy by read and write for a patch of
-  more runs, which every graph patch is (not copy_file_range: on xfs that is a
-  reflink too, 0.01 s for 620 MB with every extent shared, and the scattered
-  writes then cost 437 s instead of 0.7 s; session 19). The runs are
+  VM and RHEL 8 have) when the patch has few runs for the base's size, at
+  most one per MB of the base and at least 64, because every write into a
+  reflinked file unshares an extent (copy-on-write: 3 ms per scattered
+  512-byte write measured on xfs, 300 s for 100,000, against 1.3 s into a
+  plain copy that cost 0.35 s); a copy by read and write for a patch of more
+  runs (not copy_file_range: on xfs that is a reflink too, 0.01 s for 620 MB
+  with every extent shared, and the scattered writes then cost 437 s instead
+  of 0.7 s; session 19). The copy costs the base's bytes at the disk's speed:
+  704 s for a 66.7 GB HNSW base on the 100M proof (the rule was "at most 64
+  runs" then, so every graph patch copied), where a reflink with 8 MB of
+  scattered writes costs under a minute. The runs are
   then written over it. The checksum of the new file comes from the base's
   and the runs (the checksum is an XOR over words), so the build reads no more
   than it compares; vload verifies the assembled file in full, as always.
@@ -1124,8 +1146,35 @@ it took 7.6, 12.4 and 26 s for the three HNSW rows). The 50,000-change row
 exceeds the 5% room of the layout: the whole snapshot travels once, an
 incremental build, at the cost before M7. What remains per refresh, 2.6 to 4
 s here, is the boundary, the journal verification (0.15 s), the INSERT of the
-patch rows, the manifest and the views. 10M and 100M on the 4-node cluster:
-below, when measured.
+patch rows, the manifest and the views.
+
+On the 4-node Enterprise cluster (10 cores per node, the node caches on a
+data disk that writes about 100 MB/s; BIGANN prefixes; 1000 adds and 500
+deletes; fenced; the "before" from milestone M6 with the same journals):
+
+| | before M7 | M7 (vbuild / vload) | patch sent |
+|---|---:|---:|---:|
+| 900k generated, flat | 12.7 s (HNSW) | 7.1 s (0.9 / 0.9) | under 1 MB |
+| 900k generated, HNSW | 12.7 s | 15.3 s (2.3 / 7.4) | a few MB |
+| 10M, flat | 99 s | 18.8 s (5.7 / 7.3) | under 1 MB |
+| 10M, HNSW | 144 s | 47.1 s (5.2 / 35.4) | 8 MB |
+| 10M, HNSW with sq8 | 157 s | 47.5 s (7.0 / 34.0) | 8 MB |
+| 100M, flat | 1,156 s | M7_100M_FLAT | M7_100M_FLAT_MB |
+| 100M, HNSW | 1,739 s | M7_100M_HNSW | M7_100M_HNSW_MB |
+| 100M, HNSW with sq8 | 2,766 s | M7_100M_SQ8 | M7_100M_SQ8_MB |
+
+At 1M on these nodes nothing is gained: the whole path was already 13 s
+(the fixed part of a refresh is 3.5 to 5 s on this cluster: a refresh with
+nothing changed takes 4 to 5 s), and the patch vload, a copy of the 600 MB
+base plus its verification, costs what the whole load cost. From 10M on
+the transfer is the cost: vbuild falls from 35 to 79 s to 5 to 7 s (the
+build in place), vload of a flat patch to the verification alone (the
+1000 appended rows are one run, so the file is a reflink of the base), and
+vload of an HNSW patch to a copy of the base (the graph changes are
+scattered, so the copy is by read and write) plus the verification: 35 s
+for 6.7 GB here, the disk's speed. A first refresh after the upgrade
+sends the whole snapshot once (the old layout has no room to grow), at the
+cost of an incremental build before M7.
 
 ### Journal digest (M3 follow-up)
 

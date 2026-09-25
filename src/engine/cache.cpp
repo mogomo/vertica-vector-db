@@ -378,8 +378,11 @@ void MappedSnapshot::open(const std::string &path, bool verify, bool compact, bo
     if (st.st_uid != geteuid()) { ::close(fd); fail("not owned by the database's operating system user (vload writes every cache file):", path, false); }
     if (st.st_size == 0) { ::close(fd); fail("empty snapshot file", path, false); }
     // A private copy-on-write mapping of a read-only file: writes go to private pages, the file is
-    // never touched (the incremental build in place, delta.h).
-    void *m = writable_copy ? mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)
+    // never touched (the incremental build in place, delta.h). MAP_NORESERVE: the kernel would
+    // otherwise count the whole file against its commit limit and refuse a base larger than the
+    // node's memory (an 84 GB base on a 78 GB node: "Cannot allocate memory"), while the build
+    // writes a few thousand of its pages.
+    void *m = writable_copy ? mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_NORESERVE, fd, 0)
                             : mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (m == MAP_FAILED) fail("cannot mmap", path);

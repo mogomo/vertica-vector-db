@@ -12,16 +12,25 @@
 // (status 'loaded'), the others return status 'partial'.
 // Thin adapter around src/engine/cache.h.
 #include "udx_common.h"
+
+#include <algorithm>
+#include <sys/stat.h>
 #include "../engine/delta.h"
 
 using namespace Vertica;
 using namespace vvector_udx;
 
 static const char *const FN = "vload";
-// A patch with at most this many runs starts from a reflink of the base (a copy-on-write extent per
-// run written, about 3 ms each on xfs); more runs start from a plain copy of the base by read and
-// write (copy_file_range would be a reflink again on xfs: cache.h).
+// A patch starts from a reflink of the base when its runs are few for the base's size: a write into
+// a reflink unshares a copy-on-write extent, about 3 ms each on xfs, while a plain copy of the base
+// by read and write costs about 10 ms per MB on a 100 MB/s disk (copy_file_range would be a reflink
+// again on xfs: cache.h). So a reflink up to one run per MB of the base, at least PATCH_REFLINK_RUNS
+// (a 620 MB base: 620 runs; a 66 GB base: 66,000 runs, where the copy took 704 s on the 100M proof).
 static const std::uint64_t PATCH_REFLINK_RUNS = 64;
+static bool reflink_for(std::uint64_t runs, std::uint64_t base_bytes)
+{
+    return runs <= std::max<std::uint64_t>(PATCH_REFLINK_RUNS, base_bytes >> 20);
+}
 
 class VLoad : public TransformFunction
 {
@@ -57,7 +66,10 @@ class VLoad : public TransformFunction
             if (base != 0) {
                 if (inputReader.getStringRef(1).isNull()) fail("index '" + name + "': NULL chunk");
                 const VString &first = inputReader.getStringRef(1);
-                reflink = vvector::patch_runs_of(reinterpret_cast<const std::uint8_t *>(first.data()), first.length()) <= PATCH_REFLINK_RUNS;
+                struct stat base_st;
+                const std::uint64_t base_bytes =
+                    stat(vvector::snapshot_path(resolve_cache_dir(srvInterface), name, base).c_str(), &base_st) == 0 ? static_cast<std::uint64_t>(base_st.st_size) : 0;
+                reflink = reflink_for(vvector::patch_runs_of(reinterpret_cast<const std::uint8_t *>(first.data()), first.length()), base_bytes);
             }
             if (in_parts)
                 writer.begin_part(resolve_cache_dir(srvInterface), name, snapshot_id,

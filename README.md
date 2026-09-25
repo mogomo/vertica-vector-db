@@ -1608,7 +1608,7 @@ by hand.
 | Function | Rights | What it does |
 |---|---|---|
 | `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in, growth, send, reachability) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `reachability` (auto, on, off) says whether an HNSW build counts the vectors no search can reach and stores the count in the graph header (`auto`: every full build, incremental builds below 8 million vectors); `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); `growth` (percent of the vectors, default 5, at least 4096 vectors; 0 = none) is the room to grow of the layout; returns (byte_offset, chunk, base_snapshot, vector_count, dims, max_ver, format_version): the pieces of the snapshot, chunks of 8 MB (all-zero ones left out) with base_snapshot NULL, or, for an incremental build with `send='patch'` (the default), only the bytes that changed (runs packed into rows of `patch_row_mb` MB, default 1, each row starting with the run total), with base_snapshot set; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing; `send='whole'`, or a base without room for the appended rows, returns the whole snapshot |
-| `vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. A piece with base_snapshot set is a patch: the file starts as a copy of that snapshot's file in the node's cache (an error when it is missing: run `load_all`; a reflink where the file system has it and the patch has at most 64 runs, else a plain copy, because every write into a reflinked file unshares an extent), and the runs packed in the pieces are written over it; the file is sized from its header, so chunks left out (all zero) read as zeros. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its pieces into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
+| `vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. A piece with base_snapshot set is a patch: the file starts as a copy of that snapshot's file in the node's cache (an error when it is missing: run `load_all`; a reflink where the file system has it and the patch has at most one run per MB of the base, and at least 64 runs, else a plain copy, because every write into a reflinked file unshares an extent), and the runs packed in the pieces are written over it; the file is sized from its header, so chunks left out (all zero) read as zeros. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its pieces into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
 | `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir, index_cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; with `index_cache_dir` (the index option; '' = none) into that directory, plus an OPTIONS file that names it in the default directory and in the session's; returns (node_name, status) |
 | `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
 | `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | vvector_search | what every node has cached (see above) |
@@ -1800,15 +1800,18 @@ through the index option `cache_dir`):
 |---|---:|---:|---:|
 | snapshot, cache file per node | 4.8 GB | 6.2 GB | 7.4 GB |
 | full build (`refresh_index`; vbuild / vload) | 132 s (65 / 55) | 899 s (828 / 65) | 944 s (843 / 94) |
-| incremental refresh, 1000 adds and 500 deletes | 99 s | 144 s | 157 s |
+| incremental refresh, 1000 adds and 500 deletes (milestone M6) | 99 s | 144 s | 157 s |
+| the same since milestone M7 (only the changed bytes travel; vbuild / vload) | 18.8 s (5.7 / 7.3) | 47.1 s (5.2 / 35.4) | 47.5 s (7.0 / 34.0) |
 | recall@10 fast / balanced / best | 1.000 (exact) | 0.826 / 0.953 / 0.995 | 0.818 / 0.952 / 0.995 |
 | one search, fenced / mixed (client ms) | 92 / 87 ms | 14.4 / 7.0 ms | 15.1 / 6.3 ms |
 | 1000 queries in one statement, balanced, fenced / mixed | 17.7 / 17.6 s | 154 / 57 ms | 138 / 52 ms |
 
 At 10M a larger `ef_search` keeps the recall of 1M: 200 gives 0.983 (1000
-queries in 0.4 s). The incremental refresh is dominated by storing and loading
-the whole snapshot on every node; that disk writes 100 MB/s, so vload took
-longer than with the caches on the system disk (192 MB/s) at milestone M4.
+queries in 0.4 s). At milestone M6 the incremental refresh stored and loaded
+the whole snapshot on every node (that disk writes 100 MB/s); since M7 a
+refresh sends under 1 MB (flat) or 8 MB (HNSW) of changed bytes, and what
+remains of the HNSW time is the copy of the 6.7 GB base file on every node
+plus its verification (docs/design.md, "Incremental transfer").
 An exact search over the delta view read the 10M-row journal on every node
 (33 ms instead of 7 ms): its rows were all loaded the same day, so
 partitioning by date could not skip any, and at 2.7 GB it is above the size
@@ -1885,7 +1888,11 @@ changes 5.9 and 8.3 s, 10,000 changes 6.7 and 12.4 s; docs/design.md
 takes 0.6 to 0.7 s for one query and 0.6 s for ten queries in one statement,
 against 19 s and 25 s for the built-in full scan; `vsearch` with precision
 exact on a flat index of the same rows 80 ms and 165 ms (the same ids from
-all three).
+all three). On the 4-node cluster (10 cores per node) `vscan` takes 0.5 to
+0.6 s at 1M rows, 3.6 s at 10M and 19 s at 100M for one query, against 14
+to 20 s, 37 to 80 s and 364 s for the built-in scan; `vsearch` with
+precision exact on the flat index 32 ms, 132 ms and 1.25 s
+(docs/design.md, "Exact search without an index").
 
 **Filtered and range search** (the VM, SIFT1M, one query, median at the
 client): with an allow-list of 100 ids 8.6 ms fenced / 3.0 ms mixed, 10,000
