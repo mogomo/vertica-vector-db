@@ -576,44 +576,55 @@ $$;
 -- vload of one snapshot on every node, and a check that every node loaded it.
 CREATE OR REPLACE PROCEDURE vvector.load_on_nodes(nm VARCHAR, sid INT, pass_mb INT) LANGUAGE PLvSQL AS $$
 DECLARE
-    want INT; got INT; hint VARCHAR(40); dist VARCHAR(40); cd VARCHAR(1100); top INT; span INT; passes INT;
-    part VARCHAR(40); q VARCHAR(2000); lo INT; st VARCHAR(16);
+    want INT; got INT; hint VARCHAR(40); dist VARCHAR(40); cd VARCHAR(1100); n_rows INT; per_pass INT; passes INT;
+    part VARCHAR(40); q VARCHAR(3000); p INT; lo INT; hi INT; st VARCHAR(16);
 BEGIN
     cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
            FROM vvector.manifest WHERE index_name = nm);
     want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
-    -- One probe row per node, joined to every chunk: each node's vload gets the whole snapshot. The
+    -- One probe row per node, joined to every piece: each node's vload gets the whole set. The
     -- snapshot table is segmented (one copy written per refresh, not one per node), so on more than
-    -- one node the chunks are broadcast to the probe rows (DISTRIB(L,B); join hints need
+    -- one node the pieces are broadcast to the probe rows (DISTRIB(L,B); join hints need
     -- SYNTACTIC_JOIN). On one node the hint would only give "not feasible" warnings.
     IF want > 1 THEN
         hint := '/*+SYNTACTIC_JOIN*/ '; dist := '/*+DISTRIB(L,B)*/ ';
     ELSE
         hint := ''; dist := '';
     END IF;
-    -- The join holds its inner, the broadcast chunks, in memory on every node: a 50 GB snapshot did not
-    -- fit on 78 GB nodes. So a snapshot larger than pass_mb is loaded in passes of pass_mb of byte
-    -- offsets; vload writes each pass into a partial file and verifies and activates it after the last.
-    top := (SELECT MAX(byte_offset) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
-    span := GREATEST(pass_mb, 8) * 1048576;
-    passes := COALESCE(top, 0) // span + 1;
+    -- The join holds its inner, the broadcast pieces, in memory on every node: a 50 GB snapshot did not
+    -- fit on 78 GB nodes. So the pieces are loaded in passes of at most pass_mb / 8 MB pieces (a piece
+    -- is at most 8 MB; a patch has a few small ones and is one pass), taken in byte_offset order;
+    -- vload writes each pass into a partial file and verifies and activates it after the last. A
+    -- patch (base_snapshot set on its pieces) is written over the node's copy of that base.
+    n_rows := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+    IF n_rows = 0 THEN
+        RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: no pieces in vvector.snapshot', nm, sid;
+    END IF;
+    per_pass := GREATEST(pass_mb, 8) // 8;
+    passes := (n_rows + per_pass - 1) // per_pass;
     part := 'l' || sid || 't' || (SELECT (EXTRACT(EPOCH FROM CLOCK_TIMESTAMP()) * 1000000)::INT);
-    lo := 0;
-    WHILE lo <= COALESCE(top, 0) LOOP
-        st := CASE WHEN lo + span > COALESCE(top, 0) THEN 'loaded' ELSE 'partial' END;
-        q := 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='
+    p := 1;
+    WHILE p <= passes LOOP
+        IF passes > 1 THEN
+            SELECT MIN(byte_offset), MAX(byte_offset) INTO lo, hi
+              FROM (SELECT byte_offset, ROW_NUMBER() OVER(ORDER BY byte_offset) AS rn FROM vvector.snapshot
+                    WHERE index_name = nm AND snapshot_id = sid) r
+             WHERE rn > (p - 1) * per_pass AND rn <= p * per_pass;
+        END IF;
+        st := CASE WHEN p = passes THEN 'loaded' ELSE 'partial' END;
+        q := 'SELECT /*+LABEL(vvector_load)*/ COUNT(DISTINCT node_name) FROM (SELECT vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='
             || QUOTE_LITERAL(nm) || cd || ', snapshot_id=' || sid
-            || CASE WHEN passes > 1 THEN ', part=' || QUOTE_LITERAL(part) || ', pass=' || (lo // span + 1) || ', passes=' || passes ELSE '' END
-            || ') OVER(PARTITION NODES) FROM (SELECT ' || hint || 's.byte_offset, s.chunk '
+            || CASE WHEN passes > 1 THEN ', part=' || QUOTE_LITERAL(part) || ', pass=' || p || ', passes=' || passes ELSE '' END
+            || ') OVER(PARTITION NODES) FROM (SELECT ' || hint || 's.byte_offset, s.chunk, s.base_snapshot '
             || 'FROM vvector.probe p JOIN ' || dist || 'vvector.snapshot s ON TRUE WHERE s.index_name=' || QUOTE_LITERAL(nm) || ' AND s.snapshot_id=' || sid
-            || CASE WHEN passes > 1 THEN ' AND s.byte_offset >= ' || lo || ' AND s.byte_offset < ' || (lo + span) ELSE '' END
+            || CASE WHEN passes > 1 THEN ' AND s.byte_offset >= ' || lo || ' AND s.byte_offset <= ' || hi ELSE '' END
             || ' AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l WHERE status = ' || QUOTE_LITERAL(st);
         got := EXECUTE q;
         IF got IS NULL OR got < want THEN
             RAISE EXCEPTION 'vvector.load_on_nodes: index %, snapshot %: loaded on % of % nodes (pass % of %)', nm, sid, COALESCE(got, 0), want,
-                            lo // span + 1, passes;
+                            p, passes;
         END IF;
-        lo := lo + span;
+        p := p + 1;
     END LOOP;
 END;
 $$;
@@ -625,18 +636,39 @@ BEGIN
 END;
 $$;
 
--- Cache repair: loads the active snapshot and the index defaults again on every node. Safe at any time.
+-- Cache repair: loads the active snapshot and the index defaults again on every node. Safe at any
+-- time. The table holds the active chain (the last whole copy and the patch sets after it): the whole
+-- copy is loaded first, then every patch set over the one before, so a node that lost its cache gets
+-- the active snapshot back without a rebuild.
 CREATE OR REPLACE PROCEDURE vvector.load_all(nm VARCHAR) LANGUAGE PLvSQL AS $$
 DECLARE
-    sid INT;
+    sid INT; chain VARCHAR(4000); i INT; member VARCHAR(40); loaded INT;
 BEGIN
-    sid := (SELECT MAX(active_snapshot) FROM vvector.manifest WHERE index_name = nm);
+    SELECT active_snapshot, snapshot_chain INTO sid, chain FROM vvector.manifest WHERE index_name = nm;
     IF sid IS NULL THEN
         RAISE EXCEPTION 'vvector.load_all: index % is not registered or has no snapshot yet: run vvector.refresh_index', nm;
     END IF;
-    PERFORM CALL vvector.load_on_nodes(nm, sid);
+    -- An index refreshed by a version without patches: its active snapshot is a whole copy.
+    IF chain IS NULL OR NOT REGEXP_LIKE(chain, '^[0-9]+(,[0-9]+)*$') THEN
+        chain := sid::VARCHAR;
+    END IF;
+    i := 1;
+    loaded := 0;
+    member := SPLIT_PART(chain, ',', 1);
+    WHILE member <> '' LOOP
+        IF (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = member::INT) = 0 THEN
+            RAISE EXCEPTION 'vvector.load_all: index %: snapshot % of the chain % has no pieces in vvector.snapshot: run CALL vvector.refresh_index(''%'', ''full'')', nm, member, chain, nm;
+        END IF;
+        PERFORM CALL vvector.load_on_nodes(nm, member::INT);
+        loaded := loaded + 1;
+        i := i + 1;
+        member := SPLIT_PART(chain, ',', i);
+    END LOOP;
+    IF SPLIT_PART(chain, ',', loaded)::INT <> sid THEN
+        RAISE EXCEPTION 'vvector.load_all: index %: the chain % does not end at the active snapshot %: run CALL vvector.refresh_index(''%'', ''full'')', nm, chain, sid, nm;
+    END IF;
     PERFORM CALL vvector.push_options(nm);
-    RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes', nm, sid;
+    RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes (% of the chain %)', nm, sid, loaded, chain;
 END;
 $$;
 
@@ -719,6 +751,13 @@ BEGIN
                   FROM vvector.manifest WHERE index_name = nm);
     RAISE NOTICE 'vvector: index %: last refresh: %', nm,
                  (SELECT COALESCE(MAX(refresh_note), 'none yet') FROM vvector.manifest WHERE index_name = nm);
+    IF (SELECT COUNT(snapshot_chain) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
+        RAISE NOTICE 'vvector: index %: snapshot pieces in vvector.snapshot: a chain of % snapshots from the whole copy %, % MB of patches after it; the layout has room for % more vectors before a refresh sends the whole snapshot again', nm,
+                     (SELECT LENGTH(MAX(snapshot_chain)) - LENGTH(REPLACE(MAX(snapshot_chain), ',', '')) + 1 FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT SPLIT_PART(MAX(snapshot_chain), ',', 1) FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT COALESCE(MAX(chain_bytes), 0) // 1048576 FROM vvector.manifest WHERE index_name = nm),
+                     (SELECT COALESCE(MAX(capacity) - MAX(vector_count) - MAX(tombstones), 0) FROM vvector.manifest WHERE index_name = nm);
+    END IF;
     IF (SELECT COUNT(refresh_started_at) FROM vvector.manifest WHERE index_name = nm) > 0 THEN
         RAISE NOTICE 'vvector: index %: a refresh is running since % (by %)%', nm,
                      (SELECT TO_CHAR(MAX(refresh_started_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC' FROM vvector.manifest WHERE index_name = nm),
@@ -827,6 +866,8 @@ DECLARE
     v_every INT; v_since INT; verify BOOLEAN; t_scan TIMESTAMPTZ; scan_secs FLOAT; j_note VARCHAR(300);
     why VARCHAR(600); r_note VARCHAR(2400); build_opts VARCHAR(1600); w_since TIMESTAMPTZ; lag_note VARCHAR(600); young INT;
     cd VARCHAR(1100); build_est INT; free_mem INT; bin_note VARCHAR(300); cores INT; grew BOOLEAN;
+    send VARCHAR(8); chain VARCHAR(4000); chain_b INT; whole_b INT; xfer VARCHAR(8); base_col INT; sent INT; n_cap INT;
+    t_note VARCHAR(400); chain_n INT;
 BEGIN
     -- The manifest row in one query: PL/vSQL runs every assignment as a query of its own (2 to 7 ms
     -- each on a cluster), so the row is read once, not column by column. Digests are compared as
@@ -837,9 +878,9 @@ BEGIN
            active_options, format_version, COALESCE(vector_count, 0), COALESCE(tombstones, 0), boundary_rows,
            boundary_digest::VARCHAR, active_max_ver, COALESCE(verify_every, 1), COALESCE(refreshes_since_verify, 0),
            CASE WHEN cache_dir IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(cache_dir) END,
-           SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2)
+           SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), snapshot_chain, COALESCE(chain_bytes, 0), index_bytes
       INTO tab, idc, vc, op, ver, measure, kind, quant, hm, hefc, margin, prev, prev_from, rmode, ratio, every, since,
-           prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl
+           prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl, chain, chain_b, whole_b
       FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
@@ -1062,12 +1103,21 @@ BEGIN
         bin_note := 'built in a file: the build needs about ' || build_est // 1048576 || ' MB, the smallest node has '
                  || free_mem // 1048576 || ' MB free or in the page cache';
     END IF;
+    -- What an incremental build sends: the changed bytes (a patch over the active snapshot, which
+    -- every node holds), unless the patches since the last whole copy outweigh it or the chain is
+    -- long: then the whole snapshot, so the table and a cache repair stay cheap. A base without room
+    -- for the appended rows makes vbuild send the whole snapshot by itself (its pieces say so).
+    send := 'patch';
+    IF why IS NULL AND (chain IS NULL OR NOT REGEXP_LIKE(chain, '^[0-9]+(,[0-9]+)*$')
+                        OR chain_b > COALESCE(whole_b, 0) OR LENGTH(chain) - LENGTH(REPLACE(chain, ',', '')) + 1 >= 200) THEN
+        send := 'whole';
+    END IF;
     build_opts := 'index_name=' || QUOTE_LITERAL(nm) || ', metric=' || QUOTE_LITERAL(measure) || ', index_type=' || QUOTE_LITERAL(kind)
                || ', quantization=' || QUOTE_LITERAL(quant) || ', m=' || hm || ', ef_construction=' || hefc || ', max_ver=' || max_ver
-               || CASE WHEN why IS NULL THEN ', base_snapshot=' || prev ELSE '' END || cd
+               || CASE WHEN why IS NULL THEN ', base_snapshot=' || prev || ', send=' || QUOTE_LITERAL(send) ELSE '' END || cd
                || CASE WHEN bin_note IS NULL THEN '' ELSE ', build_in=''file''' END;
-    EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
-         || ', byte_offset, chunk FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS ' || build_opts
+    EXECUTE 'INSERT /*+LABEL(vvector_build)*/ INTO vvector.snapshot (index_name, snapshot_id, byte_offset, chunk, base_snapshot) SELECT ' || QUOTE_LITERAL(nm) || ', ' || sid
+         || ', byte_offset, chunk, base_snapshot FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS ' || build_opts
          || ') OVER() FROM (' || source || ') e) b';
     PERFORM COMMIT;
     chunks := (SELECT COUNT(*) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
@@ -1104,9 +1154,28 @@ BEGIN
         n_dims := EXECUTE 'SELECT MAX(dims) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
         n_graph := EXECUTE 'SELECT MAX(graph_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
         n_tomb := EXECUTE 'SELECT MAX(tombstones) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
-        -- The size: offset and length of the last chunk (reading every chunk would take seconds).
-        n_bytes := (SELECT MAX(byte_offset) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
-        n_bytes := n_bytes + (SELECT MAX(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid AND byte_offset = n_bytes);
+        n_bytes := EXECUTE 'SELECT MAX(file_bytes) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        n_cap := EXECUTE 'SELECT MAX(capacity) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE snapshot_id = ' || sid;
+        -- What was stored and sent: a patch's pieces are few and small (summed); a whole copy's are
+        -- 8 MB chunks, all-zero ones left out (counted, not read).
+        base_col := (SELECT MAX(base_snapshot) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+        xfer := CASE WHEN base_col IS NULL THEN 'whole' ELSE 'patch' END;
+        IF xfer = 'patch' THEN
+            sent := (SELECT SUM(OCTET_LENGTH(chunk)) FROM vvector.snapshot WHERE index_name = nm AND snapshot_id = sid);
+            chain := chain || ',' || sid;
+            chain_b := chain_b + sent;
+        ELSE
+            sent := LEAST(chunks * 8388608, n_bytes);
+            chain := sid::VARCHAR;
+            chain_b := 0;
+        END IF;
+        chain_n := LENGTH(chain) - LENGTH(REPLACE(chain, ',', '')) + 1;
+        IF xfer = 'patch' THEN
+            t_note := 'sent ' || sent // 1048576 || ' MB of ' || n_bytes // 1048576 || ' MB (a patch on snapshot ' || base_col || ' in every node cache; the table holds a chain of '
+                   || chain_n || ' snapshots, ' || chain_b // 1048576 || ' MB of patches since the whole copy ' || SPLIT_PART(chain, ',', 1) || ')';
+        ELSE
+            t_note := 'sent ' || sent // 1048576 || ' MB of ' || n_bytes // 1048576 || ' MB (whole' || CASE WHEN why IS NULL AND send = 'patch' THEN ': the layout had no room for the appended rows' WHEN why IS NULL THEN ': the patches outweighed the whole copy' ELSE '' END || ')';
+        END IF;
         secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
         IF why IS NULL THEN
             r_note := 'refreshed: snapshot ' || sid || ', incremental from snapshot ' || prev || ' (' || ((n_vec + n_tomb) - (prev_vec + prev_tomb))
@@ -1115,21 +1184,23 @@ BEGIN
             r_note := 'refreshed: snapshot ' || sid || ', full build (' || why || '), ';
         END IF;
         r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
-               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds' || COALESCE('; ' || bin_note, '') || COALESCE('; ' || j_note, '')
+               || n_bytes // 1048576 || ' MB, ' || secs || ' seconds; ' || t_note || COALESCE('; ' || bin_note, '') || COALESCE('; ' || j_note, '')
                || COALESCE('; ' || lag_note, '');
         PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
                        base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
                        graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
                        active_options = opts, incremental_count = CASE WHEN why IS NULL THEN since + 1 ELSE 0 END,
                        boundary_rows = rows_next, boundary_digest = digest_next::NUMERIC(38,0),
-                       refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = LEFT(r_note, 1000)
+                       refreshes_since_verify = CASE WHEN verify OR why IS NOT NULL THEN 0 ELSE v_since + 1 END, refresh_note = LEFT(r_note, 1000),
+                       snapshot_chain = chain, chain_bytes = chain_b, sent_bytes = sent, transfer = xfer, capacity = n_cap
                 WHERE index_name = nm;
         PERFORM COMMIT;
         PERFORM CALL vvector.make_views(nm);
 
-        -- 7. Keep the active and the previous snapshot. Others go too: the chunks of a refresh that
-        -- failed after storing them (a node could not load it) belong to no manifest row.
-        PERFORM DELETE FROM vvector.snapshot WHERE index_name = nm AND snapshot_id <> sid AND snapshot_id <> COALESCE(prev, sid);
+        -- 7. Keep the active chain: the last whole copy and the patch sets after it (the previous
+        -- snapshot is among them, or nothing older is needed). Others go: the pieces of a refresh that
+        -- failed after storing them (a node could not load it) belong to no chain.
+        EXECUTE 'DELETE FROM vvector.snapshot WHERE index_name = ' || QUOTE_LITERAL(nm) || ' AND snapshot_id NOT IN (' || chain || ')';
         PERFORM COMMIT;
     END IF;
 

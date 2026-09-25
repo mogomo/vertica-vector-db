@@ -17,12 +17,14 @@ struct Sq8Layout {
     std::uint64_t codes, sums, total;
 };
 
-Sq8Layout sq8_layout(std::uint64_t count, std::uint32_t row_stride)
+// The parts are sized by the layout's capacity (the snapshot's, FLAG_CAPACITY), so appended rows
+// do not move the sums.
+Sq8Layout sq8_layout(std::uint64_t capacity, std::uint32_t row_stride)
 {
     Sq8Layout l;
     l.codes = SQ8_HEADER_BYTES;
-    l.sums = align64(l.codes + count * row_stride);
-    l.total = align64(l.sums + count * 4);
+    l.sums = align64(l.codes + capacity * row_stride);
+    l.total = align64(l.sums + capacity * 4);
     return l;
 }
 
@@ -30,9 +32,9 @@ void sq8_fail(const std::string &why) { throw std::runtime_error("bad snapshot s
 
 } // namespace
 
-std::uint64_t sq8_section_bytes(std::uint64_t count, std::uint32_t row_stride)
+std::uint64_t sq8_section_bytes(std::uint64_t capacity, std::uint32_t row_stride)
 {
-    return sq8_layout(count, row_stride).total;
+    return sq8_layout(capacity, row_stride).total;
 }
 
 Sq8Range sq8_train(const VectorSet &s)
@@ -76,7 +78,7 @@ std::uint32_t sq8_encode(const Sq8Range &r, const float *v, std::uint32_t dims, 
 
 void sq8_fill(const VectorSet &s, const Sq8Range &r, std::uint8_t *section, std::uint64_t first)
 {
-    const Sq8Layout l = sq8_layout(s.count, s.row_stride);
+    const Sq8Layout l = sq8_layout(s.capacity, s.row_stride);
     Sq8Header h{};
     h.scale = r.scale;
     h.offset = r.offset;
@@ -93,24 +95,26 @@ void sq8_fill(const VectorSet &s, const Sq8Range &r, std::uint8_t *section, std:
 CodeSection sq8_code_section()
 {
     CodeSection c;
-    c.bytes = [](std::uint64_t n, std::uint32_t row_stride) { return sq8_section_bytes(n, row_stride); };
+    c.bytes = [](std::uint64_t capacity, std::uint32_t row_stride) { return sq8_section_bytes(capacity, row_stride); };
     c.fill = [](const VectorSet &s, std::uint8_t *section) { sq8_fill(s, sq8_train(s), section, 0); };
     return c;
 }
 
-void sq8_extend(const Sq8Codes &base, const VectorSet &s, std::uint8_t *section)
+void sq8_extend(const Sq8Codes &base, const VectorSet &s, std::uint8_t *section, bool in_place)
 {
     if (base.stride != s.row_stride || base.count > s.count) throw std::logic_error("sq8_extend: the snapshot does not extend the base");
-    const Sq8Layout l = sq8_layout(s.count, s.row_stride);
-    std::memcpy(section + l.codes, base.codes, base.count * base.stride);
-    std::memcpy(section + l.sums, base.sums, base.count * 4);
+    if (!in_place) {
+        const Sq8Layout l = sq8_layout(s.capacity, s.row_stride);
+        std::memcpy(section + l.codes, base.codes, base.count * base.stride);
+        std::memcpy(section + l.sums, base.sums, base.count * 4);
+    }
     sq8_fill(s, base.range, section, base.count);
 }
 
 Sq8Codes sq8_open(const VectorSet &s, bool verify)
 {
     if (!(s.flags & FLAG_SQ8) || !s.sq8) sq8_fail("the snapshot has no sq8 section");
-    const Sq8Layout l = sq8_layout(s.count, s.row_stride);
+    const Sq8Layout l = sq8_layout(s.capacity, s.row_stride);
     if (s.sq8_bytes != l.total) sq8_fail("size does not match the vectors");
     Sq8Header h;
     std::memcpy(&h, s.sq8, sizeof(h));

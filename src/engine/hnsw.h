@@ -39,7 +39,8 @@ struct HnswHeader {
     std::uint64_t count;           // positions, as in the snapshot header
     std::uint64_t level_seed;      // levels are a function of (level_seed, id)
     std::uint64_t upper_blocks;    // blocks in the upper part: the sum of all levels
-    std::uint64_t reserved[2];
+    std::uint64_t upper_capacity;  // blocks the upper part has room for (snapshot FLAG_CAPACITY); else 0
+    std::uint64_t reserved1;
 };
 static_assert(sizeof(HnswHeader) == HNSW_HEADER_BYTES, "graph header must be 64 bytes");
 
@@ -57,6 +58,7 @@ std::uint32_t hnsw_level(std::int64_t id, std::uint32_t m, std::uint64_t seed = 
 struct HnswGraph {
     std::uint32_t m = 0, m0 = 0, ef_construction = 0, max_level = 0, entry_point = 0;
     std::uint64_t count = 0, upper_blocks = 0;
+    std::uint64_t capacity = 0, upper_capacity = 0;   // what the layout has room for (= count, upper_blocks without FLAG_CAPACITY)
     const std::uint8_t *levels = nullptr;
     const std::uint32_t *level0 = nullptr;
     const std::uint32_t *upper_index = nullptr;
@@ -70,8 +72,13 @@ struct HnswGraph {
     }
 };
 
-// Bytes of the graph section for these ids (in position order). Throws when m is out of range.
-std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::uint32_t m);
+// Blocks the upper part is laid out for: the blocks of the levels plus room for slack more
+// positions (2 x their expected levels, at least 64 blocks); blocks when slack is 0.
+std::uint64_t hnsw_upper_capacity(std::uint64_t blocks, std::uint64_t slack, std::uint32_t m);
+
+// Bytes of the graph section for these ids (in position order) in a layout with room for capacity
+// positions (n = no slack). Throws when m is out of range.
+std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::uint32_t m, std::uint64_t capacity);
 
 // Builds the graph of the vectors of s into section (hnsw_section_bytes bytes, zero-filled).
 // Nodes are inserted in parallel as in hnswlib: a lock per group of link lists, a global lock only
@@ -84,15 +91,21 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p,
 GraphSection hnsw_graph_section(const HnswParams &p, const std::function<bool()> &poll = std::function<bool()>());
 
 // Incremental build (delta.h): bytes of the graph section of base extended by n_new positions with
-// these ids.
-std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new);
+// these ids, in a layout with room for capacity positions.
+std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new,
+                                  std::uint64_t capacity);
+// True when the base's layout has room for n_new more positions with these ids: then the extended
+// graph fits into the base's section unchanged in size and place (hnsw_extend in place).
+bool hnsw_fits_in_place(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new, std::uint64_t capacity);
 
 // Incremental build: writes the base graph into section (hnsw_extended_bytes bytes, zero-filled) and
 // inserts the positions base.count .. s.count - 1 of s with the insertion code of hnsw_build.
 // s is the new snapshot: the base's positions first, same order. Tombstoned positions of s stay in
 // the graph and are passed through, but new nodes are not linked to them. p.m must be base.m.
+// in_place: section already holds the base graph in the base's layout, which is kept
+// (hnsw_fits_in_place): nothing is copied, the new positions are appended into the slack.
 void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *section, const HnswParams &p,
-                 const std::function<bool()> &poll = std::function<bool()>());
+                 const std::function<bool()> &poll = std::function<bool()>(), bool in_place = false);
 
 // Opens the graph of a snapshot with FLAG_HNSW. Throws std::runtime_error with the cause. verify
 // reads every link (vload); without it only the header is checked (every query).

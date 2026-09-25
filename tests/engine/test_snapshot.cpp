@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>
 
 using namespace vvector;
 
@@ -55,7 +56,7 @@ int main()
     CHECK(a.buffer.size() == b.buffer.size() && std::memcmp(a.buffer.data(), b.buffer.data(), a.buffer.size()) == 0);
     CHECK(a.buffer.size() == c.buffer.size() && std::memcmp(a.buffer.data(), c.buffer.data(), a.buffer.size()) == 0);
     CHECK(a.set.count == 1000 && a.set.dims == 7 && a.set.row_stride == 16 && a.set.metric == Metric::L2);
-    CHECK(a.set.max_ver == 4711 && a.set.flags == 0 && !a.set.has_graph() && !a.set.normalised());
+    CHECK(a.set.max_ver == 4711 && (a.set.flags & ~FLAG_CAPACITY) == 0 && !a.set.has_graph() && !a.set.normalised());
     CHECK(a.set.id_index == nullptr && a.set.tombstone_bits == nullptr && a.set.base_snapshot == 0);
     CHECK(reinterpret_cast<std::uintptr_t>(a.set.vectors) % 64 == 0);
     bool sorted = true, padded = true;
@@ -98,7 +99,7 @@ int main()
         TestSet t;
         x.finish(0, t.buffer);
         t.set = snapshot_open(t.buffer.data(), t.buffer.size(), true);
-        CHECK(t.set.normalised() && t.set.flags == FLAG_NORMALISED);
+        CHECK(t.set.normalised() && (t.set.flags & ~FLAG_CAPACITY) == FLAG_NORMALISED);
         CHECK(t.set.ids[0] == 1 && t.set.vector(0)[0] == 0.0f && t.set.vector(0)[2] == 0.0f);
         CHECK(std::fabs(t.set.vector(1)[0] - 0.6f) < 1e-7f && std::fabs(t.set.vector(1)[2] - 0.8f) < 1e-7f);
     }
@@ -138,7 +139,7 @@ int main()
         // Ids out of order are found by the full check (vload), with a valid checksum.
         TestSet t;
         build(t, 10, 4);
-        std::int64_t *ids = reinterpret_cast<std::int64_t *>(t.buffer.data() + 256 + 10 * 64);
+        std::int64_t *ids = const_cast<std::int64_t *>(t.set.ids);        // where the header put them
         std::swap(ids[3], ids[4]);
         reseal(t.buffer);
         CHECK(throws([&] { snapshot_open(t.buffer.data(), t.buffer.size(), true); }, "not unique and ascending"));
@@ -200,8 +201,8 @@ int main()
         t.set = snapshot_open(t.buffer.data(), t.buffer.size(), true);
         SnapshotHeader h;
         std::memcpy(&h, t.buffer.data(), sizeof(h));
-        CHECK(h.flags == FLAG_HNSW && h.off_graph > h.off_ids && h.off_graph % 64 == 0);
-        CHECK(h.graph_bytes == hnsw_section_bytes(t.set.ids, 300, 4));
+        CHECK((h.flags & ~FLAG_CAPACITY) == FLAG_HNSW && h.off_graph > h.off_ids && h.off_graph % 64 == 0);
+        CHECK(h.graph_bytes == hnsw_section_bytes(t.set.ids, 300, 4, t.set.capacity));
         CHECK(h.total_bytes == h.off_graph + h.graph_bytes);
         CHECK(t.set.ids[0] == 1 && t.set.ids[299] == 300);
         t.buffer.data()[h.off_graph + h.graph_bytes / 2] ^= 1;

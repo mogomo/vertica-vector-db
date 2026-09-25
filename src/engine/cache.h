@@ -74,7 +74,13 @@ public:
     // to read the file ahead; compact (memory_mode compact, an index with sq8 codes): everything but
     // the float rows, which only rescoring reads, a few rows per query. prewarm false: no read-ahead
     // advice (vinfo, which must not load a file just to report how much of it is in memory).
-    void open(const std::string &path, bool verify, bool compact = false, bool prewarm = true);
+    // writable_copy: a private copy-on-write mapping (MAP_PRIVATE, read-write) for an incremental
+    // build in place (delta.h): writes change the mapping, never the file, and cost memory for the
+    // pages written only. No read-ahead, never kept.
+    void open(const std::string &path, bool verify, bool compact = false, bool prewarm = true, bool writable_copy = false);
+    // The bytes of a writable copy (open with writable_copy), else null.
+    std::uint8_t *writable() { return writable_ ? static_cast<std::uint8_t *>(map_) : nullptr; }
+    const std::uint8_t *data() const { return static_cast<const std::uint8_t *>(map_); }
     // Opens the active snapshot of an index. The mapping is kept by the process and shared by later
     // calls: a new mapping of a large file pays a page fault for every page a search touches, which
     // costs several times the search. What ACTIVE and OPTIONS say is trusted for ACTIVE_CHECK_MS;
@@ -97,6 +103,7 @@ public:
 private:
     void *map_ = nullptr;
     std::uint64_t size_ = 0;
+    bool writable_ = false;
     std::uint64_t dev_ = 0, ino_ = 0;     // the file that is mapped
     std::shared_ptr<void> kept_;          // open_active: the mapping is shared and outlives this object
     std::int64_t snapshot_id_ = 0;
@@ -111,8 +118,10 @@ private:
 // file mapped for the life of an unfenced process. Returns how many were given back.
 std::size_t release_idle_mappings(std::int64_t idle_ms);
 
-// Writes one snapshot file from pieces that may arrive in any order, then
-// makes it the active one. A failed or abandoned load leaves the cache as it was.
+// Writes one snapshot file from pieces that may arrive in any order, then makes it the active one.
+// A piece is "these bytes at this offset": a whole 8 MB chunk of a whole copy, or a run of changed
+// bytes of a patch (milestone M7), which is written over a copy of the base snapshot. A failed or
+// abandoned load leaves the cache as it was.
 class CacheWriter {
 public:
     CacheWriter() = default;
@@ -120,31 +129,45 @@ public:
     CacheWriter(const CacheWriter &) = delete;
     CacheWriter &operator=(const CacheWriter &) = delete;
 
-    void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id);
+    // base_snapshot > 0: the file starts as a copy of <index>/<base_snapshot>.vv in the same
+    // directory (a reflink where the file system has it, else a copy), which must be a regular file
+    // of this user; the pieces are then written over it. Throws when the base is missing.
+    void begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot = 0);
     // A load in several passes (a large snapshot): every pass writes its pieces into the partial file
-    // <snapshot>.vv.part.<part> (part: letters and digits naming the load); the first pass creates it,
-    // later passes (resume) continue it, keep() ends a pass without verifying, commit() the last one.
+    // <snapshot>.vv.part.<part> (part: letters and digits naming the load); the first pass creates it
+    // (from the base, if given), later passes (resume) continue it, keep() ends a pass without
+    // verifying, commit() the last one.
     void begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
-                    const std::string &part, bool resume);
-    // Pieces may arrive in any order. Together they must cover the file exactly once.
+                    const std::string &part, bool resume, std::int64_t base_snapshot = 0);
+    // Pieces may arrive in any order, 1 to CHUNK_BYTES bytes each. A piece written twice is fine
+    // (the same bytes); a missing piece is found by the checksum, unless it was all zero (a whole
+    // copy leaves such chunks out: the file is sized from its header).
     void write_at(std::int64_t byte_offset, const char *data, std::uint64_t len);
     // Ends a pass of a load in several passes: the partial file stays for the next pass.
     void keep();
 
-    // Verifies the file (size, structure, checksum, id order), renames it into place,
-    // flips ACTIVE (write temp, rename), syncs the directory, and removes snapshot files other
-    // than the new and the previously active one. Only files in the index's directory that start
-    // with the vvector magic are ever removed. Returns the snapshot size in bytes.
+    // Sizes the file from its header, verifies it (structure, checksum, id order, links), renames it
+    // into place, flips ACTIVE (write temp, rename), syncs the directory, gives the previous
+    // snapshot's pages back to the kernel, and removes snapshot files other than the new and the
+    // previously active one. Only files in the index's directory that start with the vvector magic
+    // are ever removed. Returns the snapshot size in bytes.
     std::uint64_t commit();
 
 private:
     void discard();
+    void start_from_base(std::int64_t base_snapshot);
     int fd_ = -1;
     std::string cache_dir_, index_, dir_, tmp_path_, final_path_;
     std::int64_t snapshot_id_ = 0;
     std::uint64_t bytes_written_ = 0, end_offset_ = 0;
     bool in_parts_ = false;
 };
+
+// Copies the content of one file into another (a reflink clone where the file system supports it:
+// xfs with reflink=1, btrfs; else copy_file_range, else read and write). Both must be open; to_fd
+// is truncated first. Throws std::runtime_error with the cause. Returns how it was done: "reflink",
+// "copy_file_range" or "copy".
+const char *clone_file(int from_fd, int to_fd, const std::string &what);
 
 } // namespace vvector
 

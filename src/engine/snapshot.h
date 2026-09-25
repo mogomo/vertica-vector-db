@@ -22,13 +22,28 @@ constexpr std::uint32_t FLAG_NORMALISED = 2u;    // vectors have unit length (co
 constexpr std::uint32_t FLAG_SQ8 = 4u;           // int8 codes section present (sq8.h)
 constexpr std::uint32_t FLAG_ID_INDEX = 8u;      // id_index section present; ids are then in any order
 constexpr std::uint32_t FLAG_TOMBSTONES = 16u;   // tombstones bitset present
-constexpr std::uint32_t KNOWN_FLAGS = 31u;
+constexpr std::uint32_t FLAG_CAPACITY = 32u;     // sections sized by capacity, not count: room to grow in place (milestone M7)
+constexpr std::uint32_t KNOWN_FLAGS = 63u;
 
 constexpr std::uint64_t HEADER_BYTES = 256;
 constexpr std::uint64_t SECTION_ALIGN = 64;      // one cache line: every vector row starts on one
 constexpr std::uint32_t LANES = 16;              // floats per SIMD block; row_stride is a multiple of it
 constexpr std::uint32_t MAX_DIMS = 32768;
 constexpr std::uint64_t MAX_COUNT = 0xFFFFFFFFull;   // positions are uint32
+
+// Room to grow (FLAG_CAPACITY): a build lays the sections out for count + growth positions, so an
+// incremental build can append into the slack and keep every section where it is (only the changed
+// bytes then travel to the nodes, milestone M7). growth is a percentage of count with a floor;
+// 0 = no slack and no flag (the layout of milestone M1 to M6).
+constexpr std::uint32_t DEFAULT_GROWTH_PERCENT = 5;
+constexpr std::uint32_t MAX_GROWTH_PERCENT = 1000;
+constexpr std::uint64_t MIN_GROWTH_ROWS = 4096;
+inline std::uint64_t growth_rows(std::uint64_t count, std::uint32_t percent)
+{
+    if (percent == 0) return 0;
+    const std::uint64_t rows = count / 100 * percent + count % 100 * percent / 100;
+    return rows < MIN_GROWTH_ROWS ? MIN_GROWTH_ROWS : rows;
+}
 
 // Floats per stored row: dims rounded up to a multiple of 16. The padding is zero.
 inline std::uint32_t row_stride_for(std::uint32_t dims) { return (dims + LANES - 1) / LANES * LANES; }
@@ -68,13 +83,15 @@ struct SnapshotHeader {
     std::uint64_t sq8_bytes;
     std::uint64_t off_graph;      // FLAG_HNSW
     std::uint64_t graph_bytes;
-    std::uint64_t reserved[14];
+    std::uint64_t capacity;       // FLAG_CAPACITY: positions the sections have room for (>= count); else 0
+    std::uint64_t reserved[13];
 };
 static_assert(sizeof(SnapshotHeader) == HEADER_BYTES, "snapshot header must be 256 bytes");
 
 // A snapshot opened for reading. Points into bytes owned by someone else.
 struct VectorSet {
     std::uint64_t count = 0;
+    std::uint64_t capacity = 0;   // positions the sections have room for: count without FLAG_CAPACITY
     std::uint32_t dims = 0;
     std::uint32_t row_stride = 0;
     Metric metric = Metric::L2;
@@ -93,6 +110,7 @@ struct VectorSet {
 
     const float *vector(std::uint64_t i) const { return vectors + i * row_stride; }
     bool has_graph() const { return (flags & FLAG_HNSW) != 0; }
+    bool has_capacity() const { return (flags & FLAG_CAPACITY) != 0; }
     bool normalised() const { return (flags & FLAG_NORMALISED) != 0; }
     bool dead(std::uint64_t i) const { return tombstone_bits && (tombstone_bits[i >> 6] >> (i & 63) & 1u); }
     // Position of id, or -1. Binary search over ids, or over id_index when present.
@@ -143,8 +161,13 @@ private:
     std::string dir_;             // and its directory
 };
 
-// Fills the section offsets and total_bytes of h from count, row_stride, flags, sq8_bytes and graph_bytes.
+// Fills the section offsets and total_bytes of h from count (capacity with FLAG_CAPACITY), row_stride,
+// flags, sq8_bytes and graph_bytes. With FLAG_CAPACITY the id_index and tombstones sections are always
+// placed (FLAG_ID_INDEX and FLAG_TOMBSTONES say whether they hold content), so adding them later moves
+// nothing.
 void snapshot_layout(SnapshotHeader &h);
+// The positions a layout is made for: capacity with FLAG_CAPACITY, else count.
+inline std::uint64_t layout_positions(const SnapshotHeader &h) { return (h.flags & FLAG_CAPACITY) ? h.capacity : h.count; }
 
 // Checksum of a complete snapshot. The stored checksum field counts as 0.
 std::uint64_t snapshot_checksum(const std::uint8_t *data, std::uint64_t size);
@@ -163,20 +186,24 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
 // True if the bytes start with the vvector magic. Used before deleting cache files.
 bool snapshot_has_magic(const std::uint8_t *data, std::uint64_t size);
 
+// True if every byte is 0 (a chunk of the room to grow: not sent, a hole reads as zeros).
+bool all_zero(const std::uint8_t *data, std::uint64_t size);
+
 // A section that SnapshotBuilder::finish builds in place, after the rows are sorted: the HNSW
-// graph (hnsw.h). bytes() gives its size for the ids in position order; fill() writes it into the
-// zero-filled section of the finished snapshot s, or, for a build in a file, into zero-filled
-// memory that is copied there afterwards: fill writes only through its section argument. The
-// checksum is computed after fill.
+// graph (hnsw.h). bytes() gives its size for the ids in position order and the layout's capacity
+// (n without slack); fill() writes it into the zero-filled section of the finished snapshot s, or,
+// for a build in a file, into zero-filled memory that is copied there afterwards: fill writes only
+// through its section argument. The checksum is computed after fill.
 struct GraphSection {
-    std::function<std::uint64_t(const std::int64_t *ids, std::uint64_t n)> bytes;
+    std::function<std::uint64_t(const std::int64_t *ids, std::uint64_t n, std::uint64_t capacity)> bytes;
     std::function<void(const VectorSet &s, std::uint8_t *section)> fill;
 };
 
-// The same for the sq8 codes (sq8.h): bytes() gives the size for n rows of row_stride floats; fill()
-// trains on the finished rows of s and writes the section. Filled before the graph.
+// The same for the sq8 codes (sq8.h): bytes() gives the size for a layout of capacity rows of
+// row_stride floats; fill() trains on the finished rows of s and writes the section. Filled before
+// the graph.
 struct CodeSection {
-    std::function<std::uint64_t(std::uint64_t n, std::uint32_t row_stride)> bytes;
+    std::function<std::uint64_t(std::uint64_t capacity, std::uint32_t row_stride)> bytes;
     std::function<void(const VectorSet &s, std::uint8_t *section)> fill;
 };
 
@@ -203,6 +230,8 @@ public:
     // Builds in a file in dir instead of anonymous memory (SnapshotBuffer::back_with_file). Call it
     // before the first row.
     void build_in_file(const std::string &dir) { buffer_.back_with_file(dir); }
+    // Room to grow, in percent of the count (growth_rows above); 0 = none. Default DEFAULT_GROWTH_PERCENT.
+    void set_growth(std::uint32_t percent);
 
     // Sorts by id, writes ids, header, the sq8 and graph sections if given, and the checksum into
     // the buffer and hands it over to out. Throws std::runtime_error on a repeated id or no vectors,
@@ -213,6 +242,7 @@ public:
 private:
     Metric metric_;
     std::uint32_t dims_ = 0, stride_ = 0;
+    std::uint32_t growth_ = DEFAULT_GROWTH_PERCENT;
     bool ordered_ = true, open_row_ = false;
     std::vector<std::int64_t> ids_;
     SnapshotBuffer buffer_;       // header space, then the rows

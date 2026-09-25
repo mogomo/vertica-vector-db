@@ -128,7 +128,7 @@ CALL vvector.sizing(1000000, 128, 'hnsw', 'none');"
 expect_as "vbuild is refused" "$DENIED" "$NO_ROLE
 SELECT COUNT(*) FROM (SELECT vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name='$IX', base_snapshot=1) OVER() FROM $SCHEMA.journal) b;"
 expect_as "vload is refused" "$DENIED" "$NO_ROLE
-SELECT COUNT(*) FROM (SELECT vvector_admin.vload(0, 'x'::LONG VARBINARY USING PARAMETERS index_name='$IX', snapshot_id=1) OVER(PARTITION NODES)) l;"
+SELECT COUNT(*) FROM (SELECT vvector_admin.vload(0, 'x'::LONG VARBINARY, NULL::INT USING PARAMETERS index_name='$IX', snapshot_id=1) OVER(PARTITION NODES)) l;"
 expect_as "vconfig is refused" "$DENIED" "$NO_ROLE
 SELECT COUNT(*) FROM (SELECT vvector_admin.vconfig(k USING PARAMETERS index_name='$IX', options='') OVER(PARTITION NODES) FROM vvector.probe) c;"
 expect_as "vnode is refused" "$DENIED" "$NO_ROLE

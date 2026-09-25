@@ -2,12 +2,14 @@
 #include "check.h"
 
 #include "../../src/engine/cache.h"
+#include "../../src/engine/delta.h"
 
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,16 +17,19 @@ using namespace vvector;
 
 static bool exists(const std::string &path) { return access(path.c_str(), F_OK) == 0; }
 
-// Loads the buffer as snapshot `id`, chunks in reverse order. chunk_bytes is small to get many chunks.
+// Loads the buffer as snapshot `id`, chunks in reverse order. drop_chunk: that chunk is left out
+// (a missing piece); skip_zero: all-zero chunks are left out (what vbuild does with the room to grow).
 static void load(const std::string &dir, const std::string &name, std::int64_t id, const SnapshotBuffer &b,
-                 bool drop_last_chunk = false)
+                 std::int64_t drop_chunk = -1, bool skip_zero = false)
 {
     CacheWriter w;
     w.begin(dir, name, id);
     const std::int64_t chunks = static_cast<std::int64_t>((b.size() + CHUNK_BYTES - 1) / CHUNK_BYTES);
-    for (std::int64_t c = chunks - 1 - (drop_last_chunk ? 1 : 0); c >= 0; --c) {
+    for (std::int64_t c = chunks - 1; c >= 0; --c) {
+        if (c == drop_chunk) continue;
         const std::uint64_t off = c * CHUNK_BYTES;
         const std::uint64_t len = std::min<std::uint64_t>(CHUNK_BYTES, b.size() - off);
+        if (skip_zero && c > 0 && all_zero(b.data() + off, len)) continue;
         w.write_at(static_cast<std::int64_t>(off), reinterpret_cast<const char *>(b.data()) + off, len);
     }
     w.commit();
@@ -61,15 +66,81 @@ int main()
         CHECK(m.resident_bytes() > 0 && m.resident_bytes() <= m.size());
     }
 
-    // A load with a missing chunk fails and leaves the cache as it was.
+    // A load with a missing chunk (one with data) fails and leaves the cache as it was.
     thrown = false;
-    try { load(dir, "g", 2, big.buffer, true); } catch (const std::runtime_error &) { thrown = true; }
+    try { load(dir, "g", 2, big.buffer, 1); } catch (const std::runtime_error &) { thrown = true; }
     CHECK(thrown);
     CHECK(read_active(dir, "g", active) && active == 1);
     CHECK(!exists(snapshot_path(dir, "g", 2)));
+    // Without the header piece nothing can be sized.
+    CHECK(throws([&] { load(dir, "g", 2, big.buffer, 0); }, "no header received"));
 
     // Reload of the same snapshot is fine (vload is idempotent).
     load(dir, "g", 1, big.buffer);
+
+    // A whole copy leaves all-zero chunks out (the room to grow); the file is sized from the header
+    // and the missing chunks read as zeros (milestone M7).
+    {
+        SnapshotBuilder sb(Metric::L2);
+        sb.set_growth(1000);                    // 10 x the count of room: chunks of zeros in the middle
+        std::vector<float> v(32);
+        for (std::int64_t i = 0; i < 20000; ++i) { for (float &x : v) x = static_cast<float>(i % 7 + 1); sb.add(i, v.data(), 32); }
+        SnapshotBuffer roomy;
+        sb.finish(5, roomy);
+        std::int64_t zero_chunks = 0;
+        for (std::uint64_t off = CHUNK_BYTES; off < roomy.size(); off += CHUNK_BYTES)
+            zero_chunks += all_zero(roomy.data() + off, std::min<std::uint64_t>(CHUNK_BYTES, roomy.size() - off));
+        CHECK(zero_chunks >= 2);
+        load(dir, "roomy", 1, roomy, -1, true);
+        MappedSnapshot m;
+        m.open(snapshot_path(dir, "roomy", 1), true);
+        CHECK(m.size() == roomy.size() && std::memcmp(m.data(), roomy.data(), roomy.size()) == 0);
+        CHECK(m.vectors().capacity == 20000 + 200000 && m.vectors().count == 20000);
+        std::system(("rm -rf " + dir + "/roomy").c_str());
+    }
+
+    // A patch (milestone M7): the pieces are the changed bytes, written over a copy of the base.
+    {
+        SnapshotBuffer changed;
+        changed.allocate(big.buffer.size());
+        std::memcpy(changed.data(), big.buffer.data(), big.buffer.size());
+        float *row50 = reinterpret_cast<float *>(changed.data() + 256) + 50 * 32;
+        row50[3] += 1.0f;                       // one row of the vectors, away from the header's block
+        std::int64_t mv = 78;
+        std::memcpy(changed.data() + offsetof(SnapshotHeader, max_ver), &mv, 8);
+        const std::uint64_t sum = snapshot_checksum(changed.data(), changed.size());
+        std::memcpy(changed.data() + offsetof(SnapshotHeader, checksum), &sum, 8);
+        std::vector<ByteRange> runs = snapshot_diff(big.buffer.data(), changed.data(), changed.size(), {{0, changed.size()}}, CHUNK_BYTES);
+        CHECK(runs.size() == 2 && runs[0].offset == 0 && runs[0].bytes == DIFF_BLOCK && runs[1].offset == (256 + 50 * 128) / DIFF_BLOCK * DIFF_BLOCK);
+        auto patch = [&](std::int64_t id, std::int64_t base) {
+            CacheWriter w;
+            w.begin(dir, "g", id, base);
+            for (const ByteRange &r : runs) w.write_at(static_cast<std::int64_t>(r.offset), reinterpret_cast<const char *>(changed.data()) + r.offset, r.bytes);
+            return w.commit();
+        };
+        CHECK(patch(12, 1) == changed.size());
+        MappedSnapshot m;
+        m.open(snapshot_path(dir, "g", 12), true);
+        CHECK(m.vectors().max_ver == 78 && std::memcmp(m.data(), changed.data(), changed.size()) == 0);
+        // A missing base, and a base that is not the one the patch was made for (the checksum refuses).
+        CHECK(throws([&] { patch(13, 999); }, "base snapshot 999 is not in the cache"));
+        TestSet other;
+        build(other, 3, 2);
+        load(dir, "g", 14, other.buffer);
+        CHECK(throws([&] { patch(15, 14); }, "checksum"));
+        CHECK(read_active(dir, "g", active) && active == 14 && !exists(snapshot_path(dir, "g", 15)));
+        load(dir, "g", 1, big.buffer);          // back to the state the tests below expect
+        // clone_file's fallbacks all work: a plain copy through read and write.
+        const int from = ::open(snapshot_path(dir, "g", 1).c_str(), O_RDONLY);
+        const std::string to_path = dir + "/g/clone.tmp";
+        const int to = ::open(to_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+        CHECK(from >= 0 && to >= 0);
+        const std::string how = clone_file(from, to, to_path);
+        struct stat st;
+        CHECK(fstat(to, &st) == 0 && static_cast<std::uint64_t>(st.st_size) == big.buffer.size());
+        std::printf("  clone_file: %s\n", how.c_str());
+        ::close(from); ::close(to); ::unlink(to_path.c_str());
+    }
 
     // A load in passes (a large snapshot, vvector.load_on_nodes): each pass writes its chunks into
     // the partial file, the last one verifies and activates it. Chunk c goes in pass c % passes + 1.

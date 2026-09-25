@@ -173,7 +173,7 @@ static void test_layout_and_validity()
         blocks += g.levels[i];
     }
     CHECK(blocks == g.upper_blocks);
-    CHECK(t.set.graph_bytes == hnsw_section_bytes(t.set.ids, t.set.count, 6));
+    CHECK(t.set.graph_bytes == hnsw_section_bytes(t.set.ids, t.set.count, 6, t.set.capacity));
     // Level distribution: P(level >= 1) = 1 / m.
     std::uint64_t upper = 0;
     for (std::uint64_t i = 0; i < t.set.count; ++i) upper += g.levels[i] >= 1;
@@ -219,8 +219,8 @@ static void test_layout_and_validity()
     TestSet f;
     build(f, 10, 4);
     CHECK(throws([&] { hnsw_open(f.set, false); }, "no graph section"));
-    CHECK(throws([] { hnsw_section_bytes(nullptr, 0, 1); }, "m must be 2 to 256"));
-    CHECK(throws([] { hnsw_section_bytes(nullptr, 0, 257); }, "m must be 2 to 256"));
+    CHECK(throws([] { hnsw_section_bytes(nullptr, 0, 1, 0); }, "m must be 2 to 256"));
+    CHECK(throws([] { hnsw_section_bytes(nullptr, 0, 257, 0); }, "m must be 2 to 256"));
 }
 
 static void test_small()

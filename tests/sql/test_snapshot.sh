@@ -45,9 +45,9 @@ CD=", cache_dir='$CACHE_DIR'"
 NODES=1
 [ "$ECHO_ONLY" = yes ] || NODES=$(vsql -X -A -t -c "SELECT COUNT(*) FROM nodes WHERE node_state = 'UP'" 2>/dev/null || echo 1)
 if [ "${NODES:-1}" -gt 1 ]; then
-    CHUNKS="SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE"
+    CHUNKS="SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk, s.base_snapshot FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE"
 else
-    CHUNKS="SELECT s.byte_offset, s.chunk FROM vvector.probe p JOIN vvector.snapshot s ON TRUE"
+    CHUNKS="SELECT s.byte_offset, s.chunk, s.base_snapshot FROM vvector.probe p JOIN vvector.snapshot s ON TRUE"
 fi
 # Input shape of vsearch: (qid, qvec, id, vec, del, ver, snapshot_id)
 Q="1, $(random_vector "$DIMS")::ARRAY[FLOAT], NULL::INT, NULL::ARRAY[FLOAT], NULL::BOOLEAN, NULL::INT"
@@ -73,8 +73,8 @@ CROSS JOIN (SELECT CASE WHEN MIN(is_segmented::INT) = 1 THEN 'segmented' ELSE 'n
             FROM v_catalog.projections WHERE projection_schema = 'vvector' AND anchor_table_name = 'probe') b;"
 expect "vbuild into vvector.snapshot" "^chunks: [1-9]" "
 DELETE FROM vvector.snapshot WHERE index_name = 'vvtest';
-INSERT INTO vvector.snapshot
-SELECT 'vvtest', 1, byte_offset, chunk FROM (
+INSERT INTO vvector.snapshot (index_name, snapshot_id, byte_offset, chunk, base_snapshot)
+SELECT 'vvtest', 1, byte_offset, chunk, base_snapshot FROM (
   SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='vvtest', metric='cosine', max_ver=4711) OVER()
   FROM $SCHEMA.vectors) b;
 COMMIT;
@@ -83,14 +83,14 @@ SELECT 'chunks: ' || COUNT(*) FROM vvector.snapshot WHERE index_name = 'vvtest';
 expect "vload on every node" "^loaded on all nodes" "
 SELECT CASE WHEN l.loaded = u.up THEN 'loaded on all nodes' ELSE 'loaded on ' || l.loaded || ' of ' || u.up || ' nodes' END
 FROM (SELECT COUNT(DISTINCT node_name) AS loaded
-      FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
+      FROM (SELECT vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
             FROM ($CHUNKS
                   WHERE s.index_name = 'vvtest' AND s.snapshot_id = 1
                     AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) g WHERE status = 'loaded') l
 CROSS JOIN (SELECT COUNT(*) AS up FROM nodes WHERE node_state = 'UP') u;"
 
 expect "vload again (idempotent)" "^loaded$" "
-SELECT DISTINCT status FROM (SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
+SELECT DISTINCT status FROM (SELECT vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='vvtest'$CD, snapshot_id=1) OVER(PARTITION NODES)
       FROM ($CHUNKS
                   WHERE s.index_name = 'vvtest' AND s.snapshot_id = 1
                     AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c) l;"

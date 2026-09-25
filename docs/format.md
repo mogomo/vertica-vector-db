@@ -11,6 +11,13 @@ cache file on every node, which queries map read-only.
   whose section offsets differ from what the layout rule below gives. A
   version 1 file (written by milestone M0) is refused with "refresh the index
   to rebuild its snapshot".
+- Since milestone M7 a snapshot is laid out with room to grow (FLAG_CAPACITY):
+  every section that holds one entry per position is sized for `capacity`
+  positions, not `count`, and the bytes beyond count are zero. An incremental
+  build then appends into that room and changes no section offset, so only the
+  bytes that changed travel to the nodes (a patch), and every node assembles
+  the new file from its copy of the previous one. A file without the flag
+  (built before M7) reads as before: capacity = count.
 
 ## Header (256 bytes)
 
@@ -37,7 +44,8 @@ cache file on every node, which queries map read-only.
 | 120 | uint64 | sq8_bytes | size of the sq8 section |
 | 128 | uint64 | off_graph | offset of the graph section, 0 = absent |
 | 136 | uint64 | graph_bytes | size of the graph section |
-| 144 | uint64[14] | reserved | 0 |
+| 144 | uint64 | capacity | FLAG_CAPACITY: positions the sections have room for, >= count; else 0 |
+| 152 | uint64[13] | reserved | 0 |
 
 Flags:
 
@@ -48,10 +56,17 @@ Flags:
 | 4 | FLAG_SQ8 | int8 codes section present (milestone M4) |
 | 8 | FLAG_ID_INDEX | id_index section present; ids are then in any order (incremental builds, milestone M3) |
 | 16 | FLAG_TOMBSTONES | tombstones section present (incremental builds, milestone M3) |
+| 32 | FLAG_CAPACITY | sections sized by `capacity`; the id_index and tombstones sections are always placed (milestone M7) |
 
 ## Sections
 
-In this order, each starting on the next 64-byte boundary after the one before:
+In this order, each starting on the next 64-byte boundary after the one before.
+With FLAG_CAPACITY read `capacity` for `count` in every size below (the sections
+have room for capacity positions; positions count to capacity - 1 are zero), and
+the `id_index` and `tombstones` sections are always placed: FLAG_ID_INDEX and
+FLAG_TOMBSTONES then only say whether they hold content. A full build takes
+capacity = count + growth (vbuild parameter `growth`, percent of count, default
+5, at least 4096 rows; 0 = no room and no flag).
 
 1. `vectors`: float32[count x row_stride], row i = position i. Elements
    dims to row_stride - 1 of every row are 0. Vertica FLOAT is 64-bit; the
@@ -104,7 +119,7 @@ sq8 header (64 bytes):
 | 16 | uint64 | count | positions, equal to the snapshot's count |
 | 24 | uint64[5] | reserved | 0 |
 
-Parts, in this order:
+Parts, in this order (sized by the snapshot's capacity with FLAG_CAPACITY):
 
 1. `codes`: uint8[count x code_stride], row i = position i. Codes of the
    elements dims to code_stride - 1 are 0 (not the code of 0.0), so the
@@ -153,9 +168,12 @@ Graph header (64 bytes):
 | 24 | uint64 | count | positions, equal to the snapshot's count |
 | 32 | uint64 | level_seed | seed of the level function |
 | 40 | uint64 | upper_blocks | number of blocks in `upper`: the sum of all levels |
-| 48 | uint64[2] | reserved | 0 |
+| 48 | uint64 | upper_capacity | FLAG_CAPACITY: blocks `upper` has room for, >= upper_blocks; else 0 |
+| 56 | uint64 | reserved1 | 0 |
 
-Parts, in this order:
+Parts, in this order (`levels`, `level0` and `upper_index` sized by the
+snapshot's capacity with FLAG_CAPACITY, `upper` by upper_capacity: upper_blocks
+plus twice the expected levels of the room to grow, at least 64 blocks):
 
 1. `levels`: uint8[count], the top level of every position.
 2. `level0`: count blocks of (m0 + 1) uint32, one per position: the number
@@ -186,8 +204,15 @@ the headers only.
 ## Incremental builds
 
 `base_snapshot` in the header names the snapshot an incremental build
-started from (0 = a full build). Such a build copies the sections of the
-base, then:
+started from (0 = a full build). Such a build keeps the base's layout when it
+has room for the appended positions (FLAG_CAPACITY: count + appended <=
+capacity, and the new upper blocks fit in upper_capacity) and then works in
+place on a copy-on-write view of the base's file: every section stays where
+it is and only the changed bytes are written (vbuild returns them as a patch:
+runs of changed 512-byte blocks, and vload writes them over the node's copy
+of the base). Without room (or without the flag) the snapshot is laid out
+anew with room to grow, and the whole snapshot travels. In both cases the
+build:
 
 - appends the new and the changed vectors (in id order) as positions
   `count_base` to `count - 1`, with their ids;
@@ -205,4 +230,19 @@ base, then:
   tombstoned ones; a base node's list can change when a new node links back
   to it. The entry point and max_level can change.
 
-A full rebuild writes neither tombstones nor an id_index.
+A full rebuild writes neither tombstones nor an id_index (with FLAG_CAPACITY
+the sections are placed, empty).
+
+## Patches (milestone M7)
+
+A patch is the list of byte runs in which the new snapshot differs from its
+base, found by comparing the two over the parts that a build can touch (the
+header, the tails of the appended parts, the id_index, the tombstones, level0
+and upper of the graph) in blocks of 512 bytes; adjacent changed blocks make
+one run, no run crosses a multiple of 8 MB. `vvector.snapshot` stores a run as
+a row (byte_offset, chunk, base_snapshot); a whole copy stores 8 MB chunks with
+base_snapshot NULL and leaves all-zero chunks out (vload sizes the file from
+`total_bytes` of the header; a hole reads as zeros). The checksum of the new
+snapshot follows from the base's and the old and new words of the runs (the
+XOR combines), so the build never reads the whole file for it; vload verifies
+the assembled file in full, as it does a whole copy.

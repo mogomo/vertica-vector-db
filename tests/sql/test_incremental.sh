@@ -177,6 +177,35 @@ expect "status reports the tombstones" "$((ROWS + 1)) live vectors, 1500 tombsto
 CALL vvector.status('vih_l2');"
 expect "status reports the last refresh" "last refresh: refreshed: snapshot [0-9]*, incremental" "CALL vvector.status('vih_l2');"
 
+echo "== incremental transfer: the changed bytes only, a chain in vvector.snapshot, a cache repair by replay"
+for ix in vif_l2 vih_l2; do
+    # expect greps with a basic regex (no alternation): one check per index.
+    expect "$ix: the refresh sent a patch (the changed bytes) over the previous snapshot; the table holds the whole copy and the patch" "^$ix patch, small: t, chain of 2, table: 2 snapshots, patch rows on the base: t$" "
+SELECT m.index_name || ' ' || m.transfer || ', small: ' || (m.sent_bytes < m.index_bytes / CASE WHEN m.index_type = 'flat' THEN 4 ELSE 1 END)::VARCHAR
+       || ', chain of ' || (LENGTH(m.snapshot_chain) - LENGTH(REPLACE(m.snapshot_chain, ',', '')) + 1)
+       || ', table: ' || t.n || ' snapshots'
+       || ', patch rows on the base: ' || (a.b = m.base_snapshot AND a.nulls = 0)::VARCHAR
+FROM vvector.manifest m
+JOIN (SELECT index_name, COUNT(DISTINCT snapshot_id) AS n FROM vvector.snapshot GROUP BY index_name) t ON t.index_name = m.index_name
+JOIN (SELECT index_name, snapshot_id, MAX(base_snapshot) AS b, SUM(CASE WHEN base_snapshot IS NULL THEN 1 ELSE 0 END) AS nulls
+      FROM vvector.snapshot GROUP BY index_name, snapshot_id) a ON a.index_name = m.index_name AND a.snapshot_id = m.active_snapshot
+WHERE m.index_name = '$ix';"
+done
+expect "the refresh note says what was sent" "sent [0-9]* MB of [0-9]* MB (a patch on snapshot [0-9]* in every node cache; the table holds a chain of 2 snapshots" "
+SELECT refresh_note FROM vvector.manifest WHERE index_name = 'vih_l2';"
+expect "status prints the chain and the room to grow" "snapshot pieces in vvector.snapshot: a chain of 2 snapshots from the whole copy [0-9]*, [0-9]* MB of patches after it; the layout has room for [1-9][0-9]* more vectors" "
+CALL vvector.status('vih_l2');"
+expect "vinfo reports the capacity and the file size" "^capacity > count: t, file_bytes > 0: t$" "
+SELECT 'capacity > count: ' || (MIN(capacity) > MAX(vector_count + tombstones))::VARCHAR || ', file_bytes > 0: ' || (MIN(file_bytes) > 0)::VARCHAR
+FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='vih_l2') OVER(PARTITION NODES) FROM vvector.probe) i;"
+[ "$ECHO_ONLY" = yes ] || rm -rf "$CACHE_DIR/vih_l2"
+wait_cache_check
+expect "load_all replays the chain (the whole copy, then the patch) into a cache directory that was removed" "loaded on all nodes (2 of the chain" "
+CALL vvector.load_all('vih_l2');"
+built_equals_live "vih_l2 after the replay" vih_l2
+IX_PREFIX=vih_
+compare "vih_l2 after the replay: precision exact equals the full scan" l2 queries 10 exact ", precision='exact'"
+
 echo "== refreshes that change nothing"
 SID=$(value "SELECT active_snapshot FROM vvector.manifest WHERE index_name = 'vih_l2';")
 refresh "no journal rows since the refresh: the snapshot is kept" vih_l2 "index vih_l2 refreshed: snapshot $SID kept, no vector changed"
@@ -191,8 +220,17 @@ built_equals_live "vih_l2 still holds exactly the live vectors" vih_l2
 
 echo "== full-build triggers"
 refresh "refresh_index(name, 'full')" vih_l2 "index vih_l2 $FULL (mode full)" full
+expect "a full build sends the whole snapshot and the table keeps only it" "^whole, chain of 1, table: 1 snapshots, whole rows: t$" "
+SELECT m.transfer || ', chain of ' || (LENGTH(m.snapshot_chain) - LENGTH(REPLACE(m.snapshot_chain, ',', '')) + 1)
+       || ', table: ' || t.n || ' snapshots, whole rows: ' || (t.patched = 0)::VARCHAR
+FROM vvector.manifest m
+JOIN (SELECT index_name, COUNT(DISTINCT snapshot_id) AS n, SUM(CASE WHEN base_snapshot IS NOT NULL THEN 1 ELSE 0 END) AS patched
+      FROM vvector.snapshot GROUP BY index_name) t ON t.index_name = m.index_name
+WHERE m.index_name = 'vih_l2';"
 change_round
 refresh "refresh_index(name, 'incremental')" vih_l2 "index vih_l2 $INCR" incremental
+expect "the chain grows by the patch" "^patch, chain of 2$" "
+SELECT transfer || ', chain of ' || (LENGTH(snapshot_chain) - LENGTH(REPLACE(snapshot_chain, ',', '')) + 1) FROM vvector.manifest WHERE index_name = 'vih_l2';"
 expect "a bad mode is refused" "mode must be auto, incremental or full" "CALL vvector.refresh_index('vih_l2', 'sometimes');"
 set_opts vih_l2 "NULL, 12, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL"
 change_round

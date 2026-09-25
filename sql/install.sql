@@ -55,8 +55,11 @@ CREATE TABLE IF NOT EXISTS vvector.snapshot (
     index_name   VARCHAR(64) NOT NULL,
     snapshot_id  INT NOT NULL,
     byte_offset  INT NOT NULL,               -- where the piece goes in the snapshot file
-    chunk        LONG VARBINARY(8388608) NOT NULL
+    chunk        LONG VARBINARY(8388608) NOT NULL,
+    base_snapshot INT DEFAULT NULL           -- a patch: the snapshot these bytes are written over (milestone M7); NULL = a whole copy
 ) ORDER BY index_name, snapshot_id, byte_offset SEGMENTED BY HASH(snapshot_id, byte_offset) ALL NODES;
+-- Upgrade from a version without patches: a whole copy has no base.
+ALTER TABLE vvector.snapshot ADD COLUMN IF NOT EXISTS base_snapshot INT DEFAULT NULL;
 
 CREATE TABLE IF NOT EXISTS vvector.manifest (
     index_name        VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -107,6 +110,13 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refreshes_since_verify INT
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_started_at TIMESTAMPTZ DEFAULT NULL; -- set while a refresh runs (at most one at a time)
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_started_by VARCHAR(200) DEFAULT NULL; -- user and session of that refresh
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS refresh_note VARCHAR(1000) DEFAULT NULL;    -- what the last refresh did and why
+-- Incremental transfer (milestone M7): vvector.snapshot holds the active chain, the last whole copy
+-- and the patch sets after it (the changed bytes of each refresh), nothing else.
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS snapshot_chain VARCHAR(4000) DEFAULT NULL;  -- snapshot ids from the whole copy to the active one, comma separated
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS chain_bytes INT DEFAULT NULL;              -- patch bytes in the table since the whole copy
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS sent_bytes INT DEFAULT NULL;               -- bytes the last refresh stored and sent to the nodes
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS transfer VARCHAR(8) DEFAULT NULL;          -- how the last refresh sent its snapshot: whole or patch
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS capacity INT DEFAULT NULL;                 -- positions the active snapshot's layout has room for
 -- Journal replica (set_journal_replica; kept up to date by register_index and refresh_index):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS journal_replica VARCHAR(16) DEFAULT 'auto';     -- auto, on or off
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS replica_projection VARCHAR(256) DEFAULT NULL;   -- schema.projection made by vvector

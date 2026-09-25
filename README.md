@@ -154,7 +154,7 @@ snapshots, which are in schema `vvector_admin`:
 
 | Object | What it is |
 |---|---|
-| `vvector.snapshot` | table (segmented by snapshot_id and byte_offset): the index snapshots in chunks of 8 MB |
+| `vvector.snapshot` | table (segmented by snapshot_id and byte_offset): the index snapshots as pieces of at most 8 MB; a full build stores the whole snapshot, an incremental refresh only the bytes that changed (a patch on the previous snapshot); the table holds the active chain: the last whole copy and the patches after it |
 | `vvector.manifest` | table: one row per index with its source, options and state |
 | `vvector.probe` | table (8192 rows, segmented): makes node-wise functions run once on every node |
 | `vvector.snapshot_seq` | sequence of snapshot ids (never reused) |
@@ -401,12 +401,21 @@ size, each followed by `refresh_index`):
 | 50,000 adds, 25,000 deletes | 5.7 s | 9.5 s |
 | full build of the same 930,550 vectors | 8.8 s | 42.1 s |
 
-An incremental refresh costs a fixed part plus a small part per change. The
-fixed part is the whole snapshot being written to `vvector.snapshot` and
-loaded on every node again (about 4 s for 450 to 600 MB), and the
-verification of the journal (0.4 s here, 0.6 to 0.8 s right after a large
-insert; none with `verify_every` 0); the build itself
-takes 0.25 s for 1000 adds and 500 deletes on 1M vectors. A full build of an
+An incremental refresh costs what changed, not what the index weighs. The
+snapshot is laid out with room to grow (5% of the vectors, at least 4096),
+so an incremental build appends into that room and moves no section; it works
+on a copy-on-write view of the previous snapshot, finds the bytes that
+differ (512-byte blocks: a level-0 link list of the graph is 132 bytes), and
+stores only those in `vvector.snapshot` as a patch. Every node then copies its
+own file of the previous snapshot (a reflink on xfs: instant) and writes the
+patch over it. What stays is one read of the new file per node, because it
+is a new file and its pages are not in memory yet: the verification of its
+checksum and structure is also the prewarming. The verification of the
+journal (0.4 s here, 0.6 to 0.8 s right after a large insert; none with
+`verify_every` 0) and the build itself (0.25 s for 1000 adds and 500 deletes
+on 1M vectors) are the rest. When the room to grow is used up, or the patches
+since the last whole copy weigh more than the copy, the next refresh sends the
+whole snapshot once (no rebuild; `refresh_note` says so). A full build of an
 HNSW index spends most of its time on the graph; the graph after 100
 incremental refreshes finds as much as a new one (recall@10 0.9845 against
 0.9837 at `ef_search` 100 on SIFT1M, `make test DATA_DIR=...`).
@@ -561,7 +570,12 @@ since the last full build), `boundary_rows` and `boundary_digest` (the number
 and the digest of the journal rows up to the boundary, carried forward and
 verified), `verify_every`, `refreshes_since_verify` (refreshes since the last
 verification or full build), `refresh_note` (what the last refresh did and why),
-`refresh_started_at` and `refresh_started_by` (set while a refresh runs)), and
+`refresh_started_at` and `refresh_started_by` (set while a refresh runs),
+`snapshot_chain` (the snapshot ids `vvector.snapshot` holds: the last whole
+copy and the patches after it, up to the active one), `chain_bytes` (the
+patch bytes since that whole copy), `sent_bytes` and `transfer` (what the
+last refresh stored and sent: `whole` or `patch`), `capacity` (the vectors
+the active snapshot's layout has room for)), and
 the journal replica (`journal_replica` = auto, on or off;
 `replica_projection`, the projection vvector made; `replica_note`, what the
 last check did and why).
@@ -1369,7 +1383,9 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   base_snapshot, precision_default, ef_search_default, threads_default,
   cache_file (or why the cache cannot be read), resident_mb (how much of the
   cache file is in the node's memory now: what a query reads without going to
-  disk; vinfo itself reads nothing ahead).
+  disk; vinfo itself reads nothing ahead), capacity (the vectors the layout
+  has room for: an incremental refresh appends into that room and sends only
+  the changed bytes), file_bytes (the size of the cache file).
 - **Cache directory**: `/tmp/vvector` by default. Per index (recommended):
   the option `cache_dir` of [set_index_options](#set_index_options); the
   procedures and every query then use it without further settings. Per
@@ -1420,7 +1436,8 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   space limit of the fenced process, which counts a file mapping too.
 - **Backup**: the snapshots are rows of `vvector.snapshot` and the options
   are rows of `vvector.manifest`: a backup of the database contains them.
-- **Disk space**: a refresh keeps the active and the previous snapshot in the
+- **Disk space**: a refresh keeps the active chain (the last whole copy and
+  the patches after it; a full build starts a new chain) in the
   table and in every cache. The table is segmented: a snapshot is stored once
   across the cluster (with K-safety 1, twice), compressed; every node's cache
   holds the whole snapshot. Every refresh that changes the index writes a
@@ -1468,8 +1485,8 @@ by hand.
 
 | Function | Rights | What it does |
 |---|---|---|
-| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); returns (byte_offset, chunk, vector_count, dims, max_ver, format_version), chunks of 8 MB; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing |
-| `vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its chunks into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
+| `vvector_admin.vbuild(id, vec, del USING PARAMETERS index_name, metric, index_type, max_ver, m, ef_construction, threads, quantization, base_snapshot, cache_dir, build_in, growth, send) OVER()` | vvector_admin | turns (id, vector) rows into a snapshot; `build_in='file'` builds in an unlinked file in the index's cache directory instead of memory, so a build larger than the free memory can finish (slower); `growth` (percent of the vectors, default 5, at least 4096 vectors; 0 = none) is the room to grow of the layout; returns (byte_offset, chunk, base_snapshot, vector_count, dims, max_ver, format_version): the pieces of the snapshot, chunks of 8 MB (all-zero ones left out) with base_snapshot NULL, or, for an incremental build with `send='patch'` (the default), only the bytes that changed, with base_snapshot set; vector_count counts the live vectors. Rows with `del = true` are left out. No ORDER BY: it sorts by id itself. `metric` l2 (default), cosine, dot, l1; `index_type` flat (default of the function; the procedures pass the index's type) or hnsw with `m` (16), `ef_construction` (200) and `threads` (0 = one per core) for the graph build. With `base_snapshot` it builds incrementally from that snapshot in the cache of the node that runs it: the rows are the changes (one per id; `del = true` deletes), and it returns no rows when they change nothing; `send='whole'`, or a base without room for the appended rows, returns the whole snapshot |
+| `vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name, snapshot_id, cache_dir, part, pass, passes) OVER(PARTITION NODES)` | vvector_admin | writes the snapshot to the cache of the node, verifies it, makes it active; returns (node_name, snapshot_id, bytes, status). Run again at any time. A piece with base_snapshot set is a patch: the file starts as a copy of that snapshot's file in the node's cache (an error when it is missing: run `load_all`), and the pieces are written over it; the file is sized from its header, so chunks left out (all zero) read as zeros. With `part` (letters and digits naming the load), `pass` and `passes` it loads in passes: each pass writes its pieces into a partial file, the last one verifies and activates it (status `loaded`, the others `partial`) |
 | `vvector_admin.vconfig(k USING PARAMETERS index_name, options, cache_dir, index_cache_dir) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | writes the index defaults (`options='precision=best,threads=4'`) to every node; with `index_cache_dir` (the index option; '' = none) into that directory, plus an OPTIONS file that names it in the default directory and in the session's; returns (node_name, status) |
 | `vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe` | vvector_admin | one row per node: (node_name, k); used to send every chunk to every node exactly once |
 | `vvector.vinfo([USING PARAMETERS index_name, cache_dir]) OVER(PARTITION NODES) FROM vvector.probe` | vvector_search | what every node has cached (see above) |
@@ -1480,13 +1497,13 @@ views, the manifest and the checks). vbuild needs one row per id and no
 delete rows, so it reads the live rows (the view `app.docs_live` of
 [Recipes](#recipes)), not the journal:
 
-    INSERT INTO vvector.snapshot
-    SELECT 'docs', 900, byte_offset, chunk FROM (
+    INSERT INTO vvector.snapshot (index_name, snapshot_id, byte_offset, chunk, base_snapshot)
+    SELECT 'docs', 900, byte_offset, chunk, base_snapshot FROM (
       SELECT vvector_admin.vbuild(id, vec, FALSE USING PARAMETERS index_name='docs', metric='cosine') OVER()
       FROM app.docs_live) b;
     COMMIT;
-    SELECT vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
-    FROM (SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE
+    SELECT vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='docs', snapshot_id=900) OVER(PARTITION NODES)
+    FROM (SELECT /*+SYNTACTIC_JOIN*/ s.byte_offset, s.chunk, s.base_snapshot FROM vvector.probe p JOIN /*+DISTRIB(L,B)*/ vvector.snapshot s ON TRUE
           WHERE s.index_name = 'docs' AND s.snapshot_id = 900
             AND p.k IN (SELECT k FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n)) c;
 
@@ -1911,15 +1928,18 @@ Operations:
 - A node that missed a refresh answers "snapshot cache stale ... run vload"
   until `load_all` runs.
 - A new snapshot format needs a refresh of every index; the error says so.
-- An incremental refresh reads only the changes, but writes and loads the
-  whole snapshot again: its cost has a part that grows with the index size
-  (about 6.9 s for 900,000 x 128 HNSW, 5.0 s flat, on the test VM, of which
-  0.4 s is the verification of the journal) besides the part that grows
-  with the changes. A full build of 1M x 128 takes 11 s as a flat index and
-  46 s as an HNSW index. The part that grows with the index also grows with
-  the number of nodes, because every node loads the whole snapshot: on a
-  4-node cluster an incremental refresh of 900,000 x 128 HNSW takes 12.7 s
-  (16.9 s before milestone M6, when every node also stored a copy of it).
+- An incremental refresh reads only the changes and sends only the bytes that
+  changed, but every node still reads the new snapshot file once (its
+  verification, which is also the prewarming: a new file has no pages in
+  memory), and the build compares the parts of the snapshot that can change
+  (the graph, the id index) with the previous one. That read grows with the
+  index: about 90 s for 66 GB from the cluster's disks, under a second at 1M.
+  A full build of 1M x 128 takes 11 s as a flat index and 46 s as an HNSW
+  index. When the room to grow of the layout is used up (5% of the vectors
+  by default), or the patches since the last whole copy weigh more than the
+  copy, one refresh sends the whole snapshot again, as a full build does.
+- The first refresh after an upgrade from a version before milestone M7
+  sends the whole snapshot (the old layout has no room to grow).
 - Tombstones (the old positions of changed and deleted vectors) stay in the
   snapshot until the next full build: they take memory, and an HNSW search
   passes through them. `refresh_mode auto` rebuilds in full at

@@ -1,6 +1,10 @@
 // vload: writes the snapshot cache file on every node and makes it active.
-//   vvector_admin.vload(byte_offset, chunk USING PARAMETERS index_name='docs', snapshot_id=7) OVER(PARTITION NODES)
+//   vvector_admin.vload(byte_offset, chunk, base_snapshot USING PARAMETERS index_name='docs', snapshot_id=7) OVER(PARTITION NODES)
 // Output (node_name, snapshot_id, bytes, status). Idempotent: run it again any time.
+// A piece is "these bytes at this offset": a whole 8 MB chunk (base_snapshot NULL), or a run of
+// changed bytes of a patch (milestone M7): base_snapshot names the snapshot the patch was made on,
+// and the file starts as a copy of that snapshot's file in the node's cache (a reflink where the
+// file system has it). Every piece of one load carries the same base_snapshot.
 // A large snapshot is loaded in passes (vvector.load_on_nodes: a broadcast join holds its inner in
 // memory): parameters part (letters and digits naming the load), pass and passes; pass 1 creates a
 // partial file, every pass writes its pieces into it, the last one verifies and activates it
@@ -37,14 +41,20 @@ class VLoad : public TransformFunction
             }
 
             vvector::CacheWriter writer;
+            // The base comes with the first piece; every piece must name the same one.
+            const vint base = inputReader.isNull(2) ? 0 : inputReader.getIntRef(2);
+            if (base < 0) fail("index '" + name + "': base_snapshot must be a snapshot id");
+            if (base == snapshot_id) fail("index '" + name + "': a snapshot cannot be its own base");
             if (in_parts)
                 writer.begin_part(resolve_cache_dir(srvInterface), name, snapshot_id,
-                                  params.getStringRef("part").str(), pass > 1);
+                                  params.getStringRef("part").str(), pass > 1, base);
             else
-                writer.begin(resolve_cache_dir(srvInterface), name, snapshot_id);
+                writer.begin(resolve_cache_dir(srvInterface), name, snapshot_id, base);
             do {
                 if (inputReader.isNull(0) || inputReader.getStringRef(1).isNull())
                     fail("index '" + name + "': NULL byte_offset or chunk");
+                if ((inputReader.isNull(2) ? 0 : inputReader.getIntRef(2)) != base)
+                    fail("index '" + name + "': the pieces of snapshot " + std::to_string(snapshot_id) + " name different base snapshots");
                 const VString &chunk = inputReader.getStringRef(1);
                 writer.write_at(inputReader.getIntRef(0), chunk.data(), chunk.length());
                 if (isCanceled()) return;
@@ -72,6 +82,7 @@ class VLoadFactory : public TransformFunctionFactory
     {
         argTypes.addInt();
         argTypes.addLongVarbinary();
+        argTypes.addInt();                 // base_snapshot
         returnType.addVarchar();
         returnType.addInt();
         returnType.addInt();

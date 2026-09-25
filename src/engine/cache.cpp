@@ -16,6 +16,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#endif
 
 namespace vvector {
 
@@ -275,18 +279,44 @@ std::map<std::string, IndexState> states;      // by <cache_dir>/<index>
 
 } // namespace
 
-// Read-ahead advice for a query mapping. compact: the float rows (the first section) are read at
-// random by rescoring only; the sections after them (ids, codes, graph) are read ahead.
+// Read-ahead advice for a query mapping, over the used bytes of every section only: the slack of a
+// layout with room to grow (FLAG_CAPACITY) is never read, so it costs no memory. compact: the float
+// rows are read at random by rescoring only; the sections after them (ids, codes, graph) are read ahead.
 static void prewarm(void *m, std::uint64_t size, bool compact)
 {
-    SnapshotHeader h;
-    if (!compact || size < sizeof(h)) { madvise(m, size, MADV_WILLNEED); return; }
-    std::memcpy(&h, m, sizeof(h));
+    const std::uint8_t *data = static_cast<const std::uint8_t *>(m);
     const std::uint64_t page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
-    const std::uint64_t rest = h.off_ids / page * page;
-    if (h.off_ids == 0 || h.off_ids >= size) { madvise(m, size, MADV_WILLNEED); return; }
-    madvise(m, rest, MADV_RANDOM);
-    madvise(static_cast<std::uint8_t *>(m) + rest, size - rest, MADV_WILLNEED);
+    auto advise = [&](const void *at, std::uint64_t bytes, int what) {
+        if (bytes == 0) return;
+        const std::uint64_t off = static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - data);
+        if (off >= size) return;
+        const std::uint64_t from = off / page * page, to = std::min(size, off + bytes);
+        madvise(static_cast<std::uint8_t *>(m) + from, to - from, what);
+    };
+    try {
+        const VectorSet s = snapshot_open(data, size, false);
+        const std::uint64_t vector_bytes = s.count * s.row_stride * 4;
+        advise(data, HEADER_BYTES + vector_bytes, compact ? MADV_RANDOM : MADV_WILLNEED);
+        advise(s.ids, s.count * 8, MADV_WILLNEED);
+        if (s.id_index) advise(s.id_index, s.count * 4, MADV_WILLNEED);
+        if (s.tombstone_bits) advise(s.tombstone_bits, (s.count + 63) / 64 * 8, MADV_WILLNEED);
+        if (s.flags & FLAG_SQ8) {
+            const Sq8Codes c = sq8_open(s, false);
+            advise(s.sq8, SQ8_HEADER_BYTES, MADV_WILLNEED);
+            advise(c.codes, c.count * c.stride, MADV_WILLNEED);
+            advise(c.sums, c.count * 4, MADV_WILLNEED);
+        }
+        if (s.has_graph()) {
+            const HnswGraph g = hnsw_open(s, false);
+            advise(s.graph, HNSW_HEADER_BYTES, MADV_WILLNEED);
+            advise(g.levels, g.count, MADV_WILLNEED);
+            advise(g.level0, g.count * (std::uint64_t(g.m0) + 1) * 4, MADV_WILLNEED);
+            advise(g.upper_index, g.count * 4, MADV_WILLNEED);
+            advise(g.upper, g.upper_blocks * (std::uint64_t(g.m) + 1) * 4, MADV_WILLNEED);
+        }
+    } catch (const std::runtime_error &) {
+        // Not a snapshot this library reads: open() reports it; nothing to read ahead.
+    }
 }
 
 std::uint64_t MappedSnapshot::resident_bytes() const
@@ -310,26 +340,30 @@ MappedSnapshot::~MappedSnapshot()
     if (map_ && !kept_) munmap(map_, size_);
 }
 
-void MappedSnapshot::open(const std::string &path, bool verify, bool compact, bool prewarm_it)
+void MappedSnapshot::open(const std::string &path, bool verify, bool compact, bool prewarm_it, bool writable_copy)
 {
-    int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (fd < 0) fail("cannot open", path);
     struct stat st;
     if (fstat(fd, &st) != 0) { ::close(fd); fail("cannot stat", path); }
     if (!S_ISREG(st.st_mode)) { ::close(fd); fail("not a regular file:", path, false); }
     if (st.st_uid != geteuid()) { ::close(fd); fail("not owned by the database's operating system user (vload writes every cache file):", path, false); }
     if (st.st_size == 0) { ::close(fd); fail("empty snapshot file", path, false); }
-    void *m = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    // A private copy-on-write mapping of a read-only file: writes go to private pages, the file is
+    // never touched (the incremental build in place, delta.h).
+    void *m = writable_copy ? mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)
+                            : mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (m == MAP_FAILED) fail("cannot mmap", path);
     // A mapping for queries: ask the kernel to read the file ahead. It costs nothing measurable when
     // the file is in the page cache (vload reads all of it to verify it), and after a restart it
     // reads the file in large pieces instead of page by page as the search touches it. Pre-mapping
     // every page (MAP_POPULATE) was measured: it makes the first query of a session slower.
-    if (!verify && prewarm_it) prewarm(m, st.st_size, compact);
+    if (!verify && prewarm_it && !writable_copy) prewarm(m, st.st_size, compact);
     if (map_ && !kept_) munmap(map_, size_);
     kept_.reset();
     map_ = m;
+    writable_ = writable_copy;
     size_ = st.st_size;
     dev_ = st.st_dev;
     ino_ = st.st_ino;
@@ -429,6 +463,7 @@ void MappedSnapshot::open_active(const std::string &cache_dir, const std::string
     if (kept_ != st.mapping) {
         if (map_ && !kept_) munmap(map_, size_);
         kept_ = st.mapping;
+        writable_ = false;
         map_ = st.mapping->map;
         size_ = st.mapping->size;
         dev_ = st.mapping->dev;
@@ -453,7 +488,66 @@ void CacheWriter::discard()
     }
 }
 
-void CacheWriter::begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id)
+const char *clone_file(int from_fd, int to_fd, const std::string &what)
+{
+    if (ftruncate(to_fd, 0) != 0) fail("cannot empty", what);
+#if defined(__linux__) && defined(FICLONE)
+    if (ioctl(to_fd, FICLONE, from_fd) == 0) return "reflink";
+#endif
+    struct stat st;
+    if (fstat(from_fd, &st) != 0) fail("cannot stat the base of", what);
+    std::uint64_t left = static_cast<std::uint64_t>(st.st_size), at = 0;
+#if defined(__linux__)
+    // copy_file_range: the kernel copies, in the file system where it can (a server-side copy).
+    bool ranged = true;
+    while (left > 0 && ranged) {
+        off64_t in = static_cast<off64_t>(at), out = static_cast<off64_t>(at);
+        const ssize_t n = copy_file_range(from_fd, &in, to_fd, &out, left, 0);
+        if (n < 0) { ranged = false; break; }
+        if (n == 0) break;
+        at += static_cast<std::uint64_t>(n);
+        left -= static_cast<std::uint64_t>(n);
+    }
+    if (ranged && left == 0) return "copy_file_range";
+#endif
+    std::vector<char> buf(1u << 20);
+    while (left > 0) {
+        const ssize_t n = pread(from_fd, buf.data(), std::min<std::uint64_t>(buf.size(), left), static_cast<off_t>(at));
+        if (n < 0) fail("cannot read the base of", what);
+        if (n == 0) fail("the base of " + what + " is shorter than expected:", what, false);
+        std::uint64_t done = 0;
+        while (done < static_cast<std::uint64_t>(n)) {
+            const ssize_t w = pwrite(to_fd, buf.data() + done, static_cast<std::uint64_t>(n) - done, static_cast<off_t>(at + done));
+            if (w <= 0) fail("cannot write", what);
+            done += static_cast<std::uint64_t>(w);
+        }
+        at += static_cast<std::uint64_t>(n);
+        left -= static_cast<std::uint64_t>(n);
+    }
+    return "copy";
+}
+
+void CacheWriter::start_from_base(std::int64_t base_snapshot)
+{
+    const std::string base = snapshot_path(cache_dir_, index_, base_snapshot);
+    const int from = ::open(base.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (from < 0) fail("base snapshot " + std::to_string(base_snapshot) + " is not in the cache (run vvector.load_all):", base);
+    struct stat st;
+    if (fstat(from, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+        ::close(from);
+        fail("base snapshot is not a regular file of this user:", base, false);
+    }
+    try {
+        clone_file(from, fd_, tmp_path_);
+    } catch (...) {
+        ::close(from);
+        throw;
+    }
+    ::close(from);
+    end_offset_ = static_cast<std::uint64_t>(st.st_size);
+}
+
+void CacheWriter::begin(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id, std::int64_t base_snapshot)
 {
     dir_ = index_dir(cache_dir, index);
     cache_dir_ = cache_dir;
@@ -463,12 +557,13 @@ void CacheWriter::begin(const std::string &cache_dir, const std::string &index, 
     snapshot_id_ = snapshot_id;
     final_path_ = snapshot_path(cache_dir, index, snapshot_id);
     tmp_path_ = final_path_ + temp_suffix();
-    fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd_ < 0) fail("cannot create", tmp_path_);
+    if (base_snapshot > 0) start_from_base(base_snapshot);
 }
 
 void CacheWriter::begin_part(const std::string &cache_dir, const std::string &index, std::int64_t snapshot_id,
-                             const std::string &part, bool resume)
+                             const std::string &part, bool resume, std::int64_t base_snapshot)
 {
     if (part.empty() || part.size() > 64 ||
         part.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos)
@@ -494,6 +589,7 @@ void CacheWriter::begin_part(const std::string &cache_dir, const std::string &in
     } else {
         fd_ = ::open(tmp_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
         if (fd_ < 0) fail("cannot create", tmp_path_);
+        if (base_snapshot > 0) start_from_base(base_snapshot);
     }
 }
 
@@ -523,16 +619,23 @@ void CacheWriter::write_at(std::int64_t byte_offset, const char *data, std::uint
 
 std::uint64_t CacheWriter::commit()
 {
-    // Every byte written exactly once: no piece missing, none twice. (The checksum below catches
-    // the rest: a hole reads as zeros, and zero words do not match the expected checksum.) A load in
-    // passes counts only its last pass here: the file size and the checksum check the whole file.
-    if (in_parts_) {
-        struct stat st;
-        if (fstat(fd_, &st) != 0) fail("cannot stat", tmp_path_);
-        end_offset_ = static_cast<std::uint64_t>(st.st_size);
-    } else if (bytes_written_ != end_offset_)
-        throw std::runtime_error("pieces are missing or duplicated: " + std::to_string(bytes_written_) +
-                                 " bytes received for a file of " + std::to_string(end_offset_));
+    // The file is sized from its header: a whole copy leaves all-zero chunks out (the room to grow
+    // of the layout), and a patch changes the size of its base only when the layout moved. The
+    // verification below reads every byte: a missing piece (a hole reads as zeros) or a wrong base
+    // does not match the checksum, and a piece written twice holds the same bytes.
+    struct stat st;
+    if (fstat(fd_, &st) != 0) fail("cannot stat", tmp_path_);
+    SnapshotHeader h;
+    if (static_cast<std::uint64_t>(st.st_size) < sizeof(h) || pread(fd_, &h, sizeof(h), 0) != static_cast<ssize_t>(sizeof(h)))
+        throw std::runtime_error("no header received for " + tmp_path_);
+    if (!snapshot_has_magic(reinterpret_cast<const std::uint8_t *>(&h), sizeof(h)))
+        throw std::runtime_error("no header received (the piece at offset 0 is missing or is not a vvector snapshot): " + tmp_path_);
+    const std::uint64_t have = std::max<std::uint64_t>(static_cast<std::uint64_t>(st.st_size), end_offset_);
+    if (h.total_bytes < HEADER_BYTES || h.total_bytes > 64 * have + (64u << 20))
+        throw std::runtime_error("the header says " + std::to_string(h.total_bytes) + " bytes, " + std::to_string(have) + " were received: " + tmp_path_);
+    if (h.total_bytes != static_cast<std::uint64_t>(st.st_size) && ftruncate(fd_, static_cast<off_t>(h.total_bytes)) != 0)
+        fail("cannot size", tmp_path_);
+    end_offset_ = h.total_bytes;
     if (::fsync(fd_) != 0) fail("cannot sync", tmp_path_);
     {
         MappedSnapshot check;
@@ -546,6 +649,17 @@ std::uint64_t CacheWriter::commit()
     fd_ = -1;
     write_atomically(dir_ + "/ACTIVE", std::to_string(snapshot_id_) + "\n");
     sync_dir(dir_);
+    // The previous snapshot's pages are dead weight beside the new file: give them back now, so the
+    // new file is not squeezed by a file nobody reads (a query that still maps it keeps its pages).
+#if defined(__linux__)
+    if (had_previous && previous != snapshot_id_) {
+        const int old = ::open(snapshot_path(cache_dir_, index_, previous).c_str(), O_RDONLY | O_NOFOLLOW);
+        if (old >= 0) {
+            posix_fadvise(old, 0, 0, POSIX_FADV_DONTNEED);
+            ::close(old);
+        }
+    }
+#endif
 
     // Keep the new and the previous snapshot. Remove other vvector files only.
     const std::string keep_new = std::to_string(snapshot_id_) + ".vv";

@@ -2,10 +2,12 @@
 //   vvector.vinfo([USING PARAMETERS index_name='docs']) OVER(PARTITION NODES) FROM vvector.probe
 // Output (node_name, index_name, snapshot_id, max_ver, vector_count, dims, metric, index_type,
 // quantization, graph_bytes, tombstones, base_snapshot, precision_default, freshness_default,
-// ef_search_default, threads_default, cache_file, loaded, resident_mb). The defaults are the index
-// defaults of set_index_options (NULL = the built-in default). vector_count counts the live vectors;
-// the snapshot has vector_count + tombstones positions. resident_mb: how much of the cache file is in
-// the node's memory now (page cache; milestone M6).
+// ef_search_default, threads_default, cache_file, loaded, resident_mb, capacity, file_bytes). The
+// defaults are the index defaults of set_index_options (NULL = the built-in default). vector_count
+// counts the live vectors; the snapshot has vector_count + tombstones positions. resident_mb: how much
+// of the cache file is in the node's memory now (page cache; milestone M6). capacity: the positions
+// the layout has room for (milestone M7: an incremental build appends into the room without moving a
+// section); file_bytes: the size of the cache file.
 // Without index_name it lists every index of the cache directory that has an ACTIVE or OPTIONS file.
 #include "udx_common.h"
 
@@ -17,7 +19,7 @@ using namespace vvector_udx;
 static const char *const FN = "vinfo";
 
 enum { C_NODE, C_INDEX, C_SNAPSHOT, C_MAX_VER, C_COUNT, C_DIMS, C_METRIC, C_TYPE, C_QUANT, C_GRAPH, C_TOMB, C_BASE,
-       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_COLUMNS };
+       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_CAPACITY, C_BYTES, C_COLUMNS };
 
 class VInfo : public TransformFunction
 {
@@ -67,12 +69,16 @@ class VInfo : public TransformFunction
                     out.getStringRef(C_FILE).copy(snap.path());
                     out.setBool(C_LOADED, vbool_true);
                     out.setInt(C_RESIDENT, (vint)(snap.resident_bytes() / 1048576));
+                    out.setInt(C_CAPACITY, (vint)s.capacity);
+                    out.setInt(C_BYTES, (vint)snap.size());
                 } catch (std::runtime_error &e) {
                     // Not loaded or damaged: say why in the cache_file column.
                     for (int c = C_SNAPSHOT; c < C_FILE; ++c) out.setNull(c);
                     out.getStringRef(C_FILE).copy(std::string(e.what()).substr(0, 1024));
                     out.setBool(C_LOADED, vbool_false);
                     out.setNull(C_RESIDENT);
+                    out.setNull(C_CAPACITY);
+                    out.setNull(C_BYTES);
                 }
                 out.next();
             }
@@ -82,6 +88,8 @@ class VInfo : public TransformFunction
                 out.getStringRef(C_FILE).copy("no indexes in " + cache_dir);
                 out.setBool(C_LOADED, vbool_false);
                 out.setNull(C_RESIDENT);
+                out.setNull(C_CAPACITY);
+                out.setNull(C_BYTES);
                 out.next();
             }
         } catch (std::exception &e) {
@@ -103,6 +111,8 @@ class VInfoFactory : public TransformFunctionFactory
         returnType.addVarchar();           // cache_file
         returnType.addBool();
         returnType.addInt();               // resident_mb
+        returnType.addInt();               // capacity
+        returnType.addInt();               // file_bytes
     }
 
     virtual void getReturnType(ServerInterface &srvInterface, const SizedColumnTypes &inputTypes,
@@ -127,6 +137,8 @@ class VInfoFactory : public TransformFunctionFactory
         outputTypes.addVarchar(1200, "cache_file");
         outputTypes.addBool("loaded");
         outputTypes.addInt("resident_mb");
+        outputTypes.addInt("capacity");
+        outputTypes.addInt("file_bytes");
     }
 
     virtual void getParameterType(ServerInterface &srvInterface, SizedColumnTypes &parameterTypes)

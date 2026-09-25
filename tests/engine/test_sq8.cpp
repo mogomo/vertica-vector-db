@@ -163,7 +163,7 @@ static void test_section()
     TestSet t;
     build_coded(t, 500, 40, Metric::L2, true);
     CHECK((t.set.flags & FLAG_SQ8) && (t.set.flags & FLAG_HNSW));
-    CHECK(t.set.sq8_bytes == sq8_section_bytes(500, 48));
+    CHECK(t.set.sq8_bytes == sq8_section_bytes(t.set.capacity, 48));
     const Sq8Codes c = sq8_open(t.set, true);
     CHECK(c.count == 500 && c.stride == 48 && c.dims == 40);
     bool coded = true;
@@ -184,7 +184,7 @@ static void test_section()
         hurt(copy.data() + (s.sq8 - copy.data()));
         CHECK(throws([&] { sq8_open(snapshot_open(copy.data(), copy.size(), false), true); }, message));
     };
-    const std::uint64_t sums_at = (64 + 500 * 48 + 63) / 64 * 64;
+    const std::uint64_t sums_at = static_cast<std::uint64_t>(reinterpret_cast<const std::uint8_t *>(c.sums) - t.set.sq8);   // the layout has room to grow
     damaged([&](std::uint8_t *sq) { sq[sums_at] ^= 1; }, "code sum");
     damaged([](std::uint8_t *sq) { sq[64 + 45] = 1; }, "padding codes");
     damaged([](std::uint8_t *sq) { sq[16] ^= 1; }, "count does not match");

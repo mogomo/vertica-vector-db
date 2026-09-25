@@ -1,5 +1,6 @@
 #include "snapshot.h"
 #include "kernels.h"
+#include "parallel.h"
 #include "version.h"
 
 #include <algorithm>
@@ -183,10 +184,15 @@ void snapshot_layout(SnapshotHeader &h)
         at = align_section(at + bytes);
         return off;
     };
-    h.off_vectors = place(h.count * h.row_stride * 4);
-    h.off_ids = place(h.count * 8);
-    h.off_id_index = (h.flags & FLAG_ID_INDEX) ? place(h.count * 4) : 0;
-    h.off_tombstones = (h.flags & FLAG_TOMBSTONES) ? place((h.count + 63) / 64 * 8) : 0;
+    // With FLAG_CAPACITY every per-position section has room for capacity positions, and the id_index
+    // and tombstones sections are always placed: an incremental build that needs them later, or
+    // appends rows, changes no section offset (milestone M7).
+    const bool cap = (h.flags & FLAG_CAPACITY) != 0;
+    const std::uint64_t n = layout_positions(h);
+    h.off_vectors = place(n * h.row_stride * 4);
+    h.off_ids = place(n * 8);
+    h.off_id_index = (cap || (h.flags & FLAG_ID_INDEX)) ? place(n * 4) : 0;
+    h.off_tombstones = (cap || (h.flags & FLAG_TOMBSTONES)) ? place((n + 63) / 64 * 8) : 0;
     h.off_sq8 = (h.flags & FLAG_SQ8) ? place(h.sq8_bytes) : 0;
     h.off_graph = (h.flags & FLAG_HNSW) ? place(h.graph_bytes) : 0;
     h.total_bytes = at;
@@ -210,15 +216,38 @@ std::uint64_t snapshot_checksum_part(const std::uint8_t *data, std::uint64_t siz
 
 std::uint64_t snapshot_checksum(const std::uint8_t *data, std::uint64_t size)
 {
-    // Everything except the checksum field of the header.
+    // Everything except the checksum field of the header. The parts combine by XOR in any order, so
+    // a large file is summed on several threads (the same result whatever their number).
     const std::uint64_t at = offsetof(SnapshotHeader, checksum);
-    return snapshot_checksum_part(data, at, 0) ^
-           snapshot_checksum_part(data + at + 8, size - at - 8, at / 8 + 1);
+    std::uint64_t sum = snapshot_checksum_part(data, at, 0);
+    const std::uint8_t *rest = data + at + 8;
+    const std::uint64_t rest_bytes = size - at - 8, first = at / 8 + 1;
+    const std::uint64_t unit = 16u << 20;
+    if (rest_bytes < 4 * unit) return sum ^ snapshot_checksum_part(rest, rest_bytes, first);
+    const int threads = std::min(8, resolve_threads(0));
+    std::vector<std::uint64_t> sums(static_cast<std::size_t>(threads), 0);
+    parallel_ranges(rest_bytes, unit, threads, [&](int t, std::uint64_t, std::uint64_t b0, std::uint64_t b1) {
+        sums[t] ^= snapshot_checksum_part(rest + b0, b1 - b0, first + b0 / 8);
+    });
+    for (const std::uint64_t x : sums) sum ^= x;
+    return sum;
 }
 
 bool snapshot_has_magic(const std::uint8_t *data, std::uint64_t size)
 {
     return size >= sizeof(SNAPSHOT_MAGIC) && std::memcmp(data, SNAPSHOT_MAGIC, sizeof(SNAPSHOT_MAGIC)) == 0;
+}
+
+bool all_zero(const std::uint8_t *data, std::uint64_t size)
+{
+    std::uint64_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, data + i, 8);
+        if (w) return false;
+    }
+    for (; i < size; ++i) if (data[i]) return false;
+    return true;
 }
 
 static void fail(const std::string &why) { throw std::runtime_error("bad snapshot: " + why); }
@@ -248,6 +277,12 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
     if (!(h.flags & FLAG_HNSW) && h.graph_bytes) fail("graph_bytes without the graph section");
     if (!(h.flags & FLAG_TOMBSTONES) && h.tombstones) fail("tombstones without the tombstones section");
     if (h.tombstones > h.count) fail("more tombstones than vectors");
+    if (h.flags & FLAG_CAPACITY) {
+        if (h.capacity < h.count) fail("capacity is smaller than count");
+        if (h.capacity > MAX_COUNT) fail("capacity above 4,294,967,295");
+    } else if (h.capacity) {
+        fail("capacity without FLAG_CAPACITY");
+    }
     // Before the layout arithmetic: huge section sizes must not wrap it around.
     if (h.sq8_bytes > size || h.graph_bytes > size) fail("a section is larger than the file");
     bool reserved_zero = h.reserved0 == 0;
@@ -263,6 +298,7 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
 
     VectorSet s;
     s.count = h.count;
+    s.capacity = layout_positions(h);
     s.dims = h.dims;
     s.row_stride = h.row_stride;
     s.metric = static_cast<Metric>(h.metric);
@@ -272,8 +308,9 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
     s.tombstones = h.tombstones;
     s.vectors = reinterpret_cast<const float *>(data + h.off_vectors);
     s.ids = reinterpret_cast<const std::int64_t *>(data + h.off_ids);
-    if (h.off_id_index) s.id_index = reinterpret_cast<const std::uint32_t *>(data + h.off_id_index);
-    if (h.off_tombstones) s.tombstone_bits = reinterpret_cast<const std::uint64_t *>(data + h.off_tombstones);
+    // With FLAG_CAPACITY both sections are always placed; the flags say whether they hold content.
+    if (h.off_id_index && (h.flags & FLAG_ID_INDEX)) s.id_index = reinterpret_cast<const std::uint32_t *>(data + h.off_id_index);
+    if (h.off_tombstones && (h.flags & FLAG_TOMBSTONES)) s.tombstone_bits = reinterpret_cast<const std::uint64_t *>(data + h.off_tombstones);
     if (h.off_sq8) { s.sq8 = data + h.off_sq8; s.sq8_bytes = h.sq8_bytes; }
     if (h.off_graph) { s.graph = data + h.off_graph; s.graph_bytes = h.graph_bytes; }
 
@@ -309,6 +346,12 @@ VectorSet snapshot_open(const std::uint8_t *data, std::uint64_t size, bool verif
 }
 
 // ---- SnapshotBuilder
+
+void SnapshotBuilder::set_growth(std::uint32_t percent)
+{
+    if (percent > MAX_GROWTH_PERCENT) throw std::runtime_error("growth must be 0 to " + std::to_string(MAX_GROWTH_PERCENT) + " percent");
+    growth_ = percent;
+}
 
 float *SnapshotBuilder::begin_row(std::int64_t id, std::uint32_t dims)
 {
@@ -410,13 +453,19 @@ void SnapshotBuilder::finish(std::int64_t max_ver, SnapshotBuffer &out, const Gr
     std::memcpy(h.magic, SNAPSHOT_MAGIC, sizeof(h.magic));
     h.format_version = FORMAT_VERSION;
     h.flags = metric_ == Metric::Cosine ? FLAG_NORMALISED : 0;
+    const std::uint64_t slack = growth_rows(n, growth_);
+    const std::uint64_t cap = std::min<std::uint64_t>(n + slack, MAX_COUNT);
+    if (slack) {
+        h.flags |= FLAG_CAPACITY;
+        h.capacity = cap;
+    }
     if (graph) {
         h.flags |= FLAG_HNSW;
-        h.graph_bytes = graph->bytes(ids_.data(), n);
+        h.graph_bytes = graph->bytes(ids_.data(), n, cap);
     }
     if (codes) {
         h.flags |= FLAG_SQ8;
-        h.sq8_bytes = codes->bytes(n, stride_);
+        h.sq8_bytes = codes->bytes(cap, stride_);
     }
     h.count = n;
     h.dims = dims_;

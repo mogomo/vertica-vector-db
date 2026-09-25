@@ -51,8 +51,8 @@ struct Sq8Codes {
     const std::uint8_t *row(std::uint64_t i) const { return codes + i * stride; }
 };
 
-// Bytes of the sq8 section for count rows of row_stride elements.
-std::uint64_t sq8_section_bytes(std::uint64_t count, std::uint32_t row_stride);
+// Bytes of the sq8 section of a layout with room for capacity rows of row_stride elements.
+std::uint64_t sq8_section_bytes(std::uint64_t capacity, std::uint32_t row_stride);
 
 // Trains the range on the float rows of s: lo and hi are the 0.001 and 0.999 quantiles of all
 // elements of about SQ8_SAMPLE / dims evenly spaced rows (in position order). The same rows give
@@ -74,7 +74,9 @@ CodeSection sq8_code_section();
 // Incremental build (delta.h): writes the sq8 section of s (sq8_section_bytes bytes, zero-filled):
 // the codes and sums of the base's positions copied, the positions base.count .. s.count - 1
 // coded with the base's range. s is the new snapshot: the base's positions first, same order.
-void sq8_extend(const Sq8Codes &base, const VectorSet &s, std::uint8_t *section);
+// in_place: the section already holds the base's codes and sums at the same offsets (a build on
+// a copy of the base, milestone M7): only the header and the new positions are written.
+void sq8_extend(const Sq8Codes &base, const VectorSet &s, std::uint8_t *section, bool in_place = false);
 
 // Opens the sq8 section of a snapshot with FLAG_SQ8. Throws std::runtime_error with the cause.
 // verify reads every row (vload): padding codes 0, sums right; without it only the header is checked.

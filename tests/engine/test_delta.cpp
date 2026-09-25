@@ -14,6 +14,8 @@
 #include "../../src/engine/hnsw.h"
 #include "../../src/engine/kernels.h"
 #include "../../src/engine/parallel.h"
+#include "../../src/engine/cache.h"
+#include "../../src/engine/sq8.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +24,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unistd.h>
 
 using namespace vvector;
 
@@ -285,16 +288,16 @@ static void test_flags_and_nothing()
     // Only new ids above the largest: ids stay ascending, no id_index, no tombstones.
     TestSet a;
     CHECK(incremental(a, base, {Change{2000, false, v}, Change{1500, false, v}}, nullptr, 9));
-    CHECK(a.set.count == 102 && a.set.flags == 0 && a.set.id_index == nullptr && a.set.tombstone_bits == nullptr);
+    CHECK(a.set.count == 102 && (a.set.flags & ~FLAG_CAPACITY) == 0 && a.set.id_index == nullptr && a.set.tombstone_bits == nullptr);
     CHECK(a.set.ids[100] == 1500 && a.set.ids[101] == 2000 && a.set.find(1500) == 100 && a.set.find(40) == 3);
     // A delete only: tombstones, no id_index.
     TestSet b;
     CHECK(incremental(b, base, {Change{40, true, {}}}, nullptr, 9));
-    CHECK(b.set.count == 100 && b.set.tombstones == 1 && b.set.flags == FLAG_TOMBSTONES && b.set.find(40) == -1);
+    CHECK(b.set.count == 100 && b.set.tombstones == 1 && (b.set.flags & ~FLAG_CAPACITY) == FLAG_TOMBSTONES && b.set.find(40) == -1);
     // A new id between: id_index.
     TestSet c;
     CHECK(incremental(c, base, {Change{45, false, v}}, nullptr, 9));
-    CHECK(c.set.flags == FLAG_ID_INDEX && c.set.find(45) == 100 && c.set.find(50) == 4);
+    CHECK((c.set.flags & ~FLAG_CAPACITY) == FLAG_ID_INDEX && c.set.find(45) == 100 && c.set.find(50) == 4);
 
     // Nothing changes: the same vector again, a delete of an absent id. out is left alone.
     TestSet d;
@@ -550,6 +553,159 @@ static void test_incremental_in_file()
     std::system(("rm -rf " + dir).c_str());
 }
 
+// Milestone M7: the build in place on a copy-on-write mapping of the base file gives byte for byte
+// the snapshot of the copying build; snapshot_diff finds exactly the changed blocks; the runs
+// written over a copy of the base (what vload does) give the same file; seal_in_place gives the
+// checksum without reading the file.
+static void in_place_case(const std::string &dir, const char *name, Metric metric, bool graph, bool codes, bool ascending_ids,
+                          std::uint32_t growth)
+{
+    Live live;
+    for (std::int64_t i = 0; i < 4000; ++i) live[i * 10] = dup_vector(i, 12, 21);
+    HnswParams hp;
+    hp.m = 8;
+    hp.threads = 1;
+    TestSet base;
+    {
+        SnapshotBuilder b(metric);
+        b.set_growth(growth);
+        for (const auto &x : live) b.add(x.first, x.second.data(), 12);
+        const CodeSection cs = sq8_code_section();
+        const GraphSection gs = hnsw_graph_section(hp);
+        b.finish(0, base.buffer, graph ? &gs : nullptr, codes ? &cs : nullptr);
+        base.set = snapshot_open(base.buffer.data(), base.buffer.size(), true);
+    }
+    // The base in a cache directory, as on a node.
+    const std::string index = std::string("ip_") + name;
+    {
+        CacheWriter w;
+        w.begin(dir, index, 1);
+        for (std::uint64_t off = 0; off < base.buffer.size(); off += CHUNK_BYTES)
+            w.write_at(static_cast<std::int64_t>(off), reinterpret_cast<const char *>(base.buffer.data()) + off,
+                       std::min<std::uint64_t>(CHUNK_BYTES, base.buffer.size() - off));
+        w.commit();
+    }
+    std::vector<Change> ch;
+    for (std::int64_t i = 0; i < 150; ++i) ch.push_back(Change{(i + 1) * 70, true, {}});                        // deletes
+    for (std::int64_t i = 0; i < 100; ++i) ch.push_back(Change{20000 + i * 30, false, dup_vector(9000 + i, 12, 21)}); // changes
+    for (std::int64_t i = 0; i < 300; ++i)                                                                // adds
+        ch.push_back(Change{ascending_ids ? 100000 + i : 5 + i * 20, false, dup_vector(7000 + i, 12, 21)});
+    auto feed = [&](IncrementalBuilder &b) {
+        for (const Change &c : ch) {
+            if (c.del) { b.remove(c.id); continue; }
+            float *row = b.begin_add(c.id, 12);
+            std::memcpy(row, c.vec.data(), 12 * 4);
+            b.end_add();
+        }
+    };
+    const std::string path = snapshot_path(dir, index, 1);
+    MappedSnapshot shared, copy;
+    shared.open(path, true);
+    copy.open(path, false, false, false, true);
+    CHECK(copy.writable() != nullptr && copy.size() == base.buffer.size());
+
+    // The copying build (the base's layout is kept when it has room).
+    TestSet by_copy;
+    {
+        IncrementalBuilder b(shared.vectors());
+        feed(b);
+        CHECK(b.finish(77, 1, by_copy.buffer, graph ? &hp : nullptr));
+        by_copy.set = snapshot_open(by_copy.buffer.data(), by_copy.buffer.size(), true);
+    }
+    // The build in place.
+    IncrementalBuilder b(shared.vectors());
+    feed(b);
+    std::vector<ByteRange> cand;
+    const InPlace r = b.finish_in_place(77, 1, copy.writable(), copy.size(), graph ? &hp : nullptr, cand);
+    if (growth == 0) {
+        CHECK(r == InPlace::NoRoom && cand.empty());
+        CHECK(by_copy.set.has_capacity() && by_copy.set.capacity > by_copy.set.count);   // laid out anew, with room
+        std::system(("rm -rf " + dir + "/" + index).c_str());
+        return;
+    }
+    CHECK(r == InPlace::Built);
+    CHECK(by_copy.buffer.size() == copy.size());
+    const std::vector<ByteRange> runs = snapshot_diff(shared.data(), copy.data(), copy.size(), cand, CHUNK_BYTES);
+    CHECK(!runs.empty() && runs.front().offset == 0);
+    seal_in_place(shared.data(), copy.writable(), copy.size(), runs);
+    CHECK(std::memcmp(by_copy.buffer.data(), copy.data(), copy.size()) == 0);
+    // The runs hold every changed block and only changed blocks (after the seal the header run differs too).
+    std::uint64_t sent = 0;
+    bool minimal = true;
+    for (const ByteRange &x : runs) {
+        sent += x.bytes;
+        minimal = minimal && x.offset % DIFF_BLOCK == 0 && x.bytes <= CHUNK_BYTES && x.offset / CHUNK_BYTES == (x.offset + x.bytes - 1) / CHUNK_BYTES;
+        for (std::uint64_t blk = x.offset; blk < x.offset + x.bytes; blk += DIFF_BLOCK)
+            minimal = minimal && std::memcmp(shared.data() + blk, copy.data() + blk, std::min(DIFF_BLOCK, x.offset + x.bytes - blk)) != 0;
+    }
+    CHECK(minimal && sent < copy.size() / 2);
+    std::printf("  in place %-12s %5zu runs, %8llu of %8llu bytes\n", name, runs.size(),
+                static_cast<unsigned long long>(sent), static_cast<unsigned long long>(copy.size()));
+    // What vload does: the runs over a copy of the base give the new file, verified in full.
+    {
+        CacheWriter w;
+        w.begin(dir, index, 2, 1);
+        for (const ByteRange &x : runs) w.write_at(static_cast<std::int64_t>(x.offset), reinterpret_cast<const char *>(copy.data()) + x.offset, x.bytes);
+        CHECK(w.commit() == copy.size());
+        MappedSnapshot loaded;
+        loaded.open(snapshot_path(dir, index, 2), true);
+        CHECK(loaded.size() == copy.size() && std::memcmp(loaded.data(), copy.data(), copy.size()) == 0);
+        CHECK(loaded.vectors().base_snapshot == 1 && loaded.vectors().count == by_copy.set.count);
+        if (graph) hnsw_open(loaded.vectors(), true);
+    }
+    // The live vectors are those of a full build of the changed set.
+    Live after = live;
+    for (const Change &c : ch) { if (c.del) after.erase(c.id); else after[c.id] = c.vec; }
+    TestSet full;
+    full_build(full, after, metric, graph ? &hp : nullptr);
+    CHECK(same_live(by_copy, full, after));
+    // No change at all: Unchanged, the copy untouched.
+    {
+        MappedSnapshot again;
+        again.open(path, false, false, false, true);
+        IncrementalBuilder none(shared.vectors());
+        none.remove(123456789);
+        std::vector<ByteRange> c2;
+        CHECK(none.finish_in_place(78, 1, again.writable(), again.size(), graph ? &hp : nullptr, c2) == InPlace::Unchanged);
+        CHECK(std::memcmp(again.data(), shared.data(), shared.size()) == 0);
+    }
+    std::system(("rm -rf " + dir + "/" + index).c_str());
+}
+
+static void test_in_place()
+{
+    // snapshot_diff on small arrays: blocks, joins, chunk borders, overlapping candidates.
+    {
+        std::vector<std::uint8_t> a(DIFF_BLOCK * 20 + 64, 1), b = a;
+        b[DIFF_BLOCK * 2 + 5] = 2;                 // block 2
+        b[DIFF_BLOCK * 3] = 2;                     // block 3: joined with 2
+        b[DIFF_BLOCK * 7 + 100] = 2;               // block 7
+        b[DIFF_BLOCK * 8 + 1] = 2;                 // block 8: a chunk border between 7 and 8 with chunk = 8 blocks
+        b[DIFF_BLOCK * 20 + 10] = 2;               // the last, short block
+        std::vector<ByteRange> cand = {{DIFF_BLOCK * 2 + 10, DIFF_BLOCK}, {0, DIFF_BLOCK * 4}, {DIFF_BLOCK * 6, 100000}, {DIFF_BLOCK * 3, 10}};
+        const std::vector<ByteRange> runs = snapshot_diff(a.data(), b.data(), a.size(), cand, DIFF_BLOCK * 8);
+        CHECK(runs.size() == 4);
+        CHECK(runs.size() == 4 && runs[0].offset == DIFF_BLOCK * 2 && runs[0].bytes == DIFF_BLOCK * 2);
+        CHECK(runs.size() == 4 && runs[1].offset == DIFF_BLOCK * 7 && runs[1].bytes == DIFF_BLOCK);
+        CHECK(runs.size() == 4 && runs[2].offset == DIFF_BLOCK * 8 && runs[2].bytes == DIFF_BLOCK);
+        CHECK(runs.size() == 4 && runs[3].offset == DIFF_BLOCK * 20 && runs[3].bytes == 64);
+        // Outside the candidates nothing is seen (block 5 is in none of them).
+        b[DIFF_BLOCK * 5] = 2;
+        CHECK(snapshot_diff(a.data(), b.data(), a.size(), cand, DIFF_BLOCK * 8).size() == 4);
+        CHECK(snapshot_diff(a.data(), b.data(), a.size(), {{0, a.size()}}, DIFF_BLOCK * 8).size() == 5);
+    }
+    char tmpl[] = "/tmp/vvector_inplace_XXXXXX";
+    const std::string dir = mkdtemp(tmpl);
+    in_place_case(dir, "flat", Metric::L2, false, false, true, 5);
+    in_place_case(dir, "flat_rnd", Metric::L2, false, false, false, 5);
+    in_place_case(dir, "hnsw", Metric::L2, true, false, true, 5);
+    in_place_case(dir, "hnsw_rnd", Metric::Cosine, true, false, false, 5);
+    in_place_case(dir, "sq8", Metric::L2, false, true, true, 5);
+    in_place_case(dir, "hnsw_sq8", Metric::Dot, true, true, false, 5);
+    in_place_case(dir, "no_room", Metric::L2, true, false, true, 0);
+    std::system(("rm -rf " + dir).c_str());
+}
+
 int main(int argc, char **argv)
 {
     std::string dir;
@@ -563,6 +719,7 @@ int main(int argc, char **argv)
     rounds("hnsw dot", Metric::Dot, true);
     test_parallel_duplicates();
     test_incremental_in_file();
+    test_in_place();
     test_sift(dir);
     return finish("test_delta");
 }

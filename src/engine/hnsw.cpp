@@ -34,15 +34,30 @@ struct GraphLayout {
     std::uint64_t levels, level0, upper_index, upper, bytes;
 };
 
-GraphLayout graph_layout(std::uint64_t count, std::uint32_t m, std::uint64_t upper_blocks)
+// The parts are sized by what the layout has room for (capacity positions, upper_capacity blocks;
+// without FLAG_CAPACITY count and upper_blocks), so appended positions move nothing.
+GraphLayout graph_layout(std::uint64_t capacity, std::uint32_t m, std::uint64_t upper_capacity)
 {
     GraphLayout l;
     l.levels = HNSW_HEADER_BYTES;
-    l.level0 = align64(l.levels + count);
-    l.upper_index = align64(l.level0 + count * (2 * std::uint64_t(m) + 1) * 4);
-    l.upper = align64(l.upper_index + count * 4);
-    l.bytes = align64(l.upper + upper_blocks * (std::uint64_t(m) + 1) * 4);
+    l.level0 = align64(l.levels + capacity);
+    l.upper_index = align64(l.level0 + capacity * (2 * std::uint64_t(m) + 1) * 4);
+    l.upper = align64(l.upper_index + capacity * 4);
+    l.bytes = align64(l.upper + upper_capacity * (std::uint64_t(m) + 1) * 4);
     return l;
+}
+
+// Levels of n new ids, and the blocks they add.
+std::uint64_t levels_of(const std::int64_t *ids, std::uint64_t n, std::uint32_t m, std::uint8_t *levels, std::uint32_t *first,
+                        std::uint64_t blocks)
+{
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::uint32_t l = hnsw_level(ids[i], m);
+        if (levels) levels[i] = static_cast<std::uint8_t>(l);
+        if (first) first[i] = l == 0 ? HNSW_NO_UPPER : static_cast<std::uint32_t>(blocks);
+        blocks += l;
+    }
+    return blocks;
 }
 
 void check_m(std::uint32_t m)
@@ -573,13 +588,21 @@ std::uint32_t hnsw_level(std::int64_t id, std::uint32_t m, std::uint64_t seed)
     return level >= HNSW_MAX_LEVEL ? HNSW_MAX_LEVEL : static_cast<std::uint32_t>(level);
 }
 
-std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::uint32_t m)
+std::uint64_t hnsw_upper_capacity(std::uint64_t blocks, std::uint64_t slack, std::uint32_t m)
+{
+    if (slack == 0) return blocks;
+    // The expected level sum of slack positions is slack / (m - 1): twice that, and at least 64.
+    const std::uint64_t room = std::max<std::uint64_t>(64, 2 * slack / (std::uint64_t(m) - 1));
+    return std::min<std::uint64_t>(blocks + room, HNSW_NO_UPPER - 1);
+}
+
+std::uint64_t hnsw_section_bytes(const std::int64_t *ids, std::uint64_t n, std::uint32_t m, std::uint64_t capacity)
 {
     check_m(m);
-    std::uint64_t blocks = 0;
-    for (std::uint64_t i = 0; i < n; ++i) blocks += hnsw_level(ids[i], m);
+    if (capacity < n) throw std::logic_error("hnsw_section_bytes: capacity below the count");
+    const std::uint64_t blocks = levels_of(ids, n, m, nullptr, nullptr, 0);
     if (blocks >= HNSW_NO_UPPER) throw std::runtime_error("too many vectors for an HNSW graph with m = " + std::to_string(m));
-    return graph_layout(n, m, blocks).bytes;
+    return graph_layout(capacity, m, hnsw_upper_capacity(blocks, capacity - n, m)).bytes;
 }
 
 void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, const std::function<bool()> &poll)
@@ -590,16 +613,11 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, 
     const std::uint64_t n = s.count;
 
     // Levels and the upper part's index first: they fix the layout before the first insert.
-    std::uint64_t blocks = 0;
     std::vector<std::uint32_t> first(n);
     std::vector<std::uint8_t> levels(n);
-    for (std::uint64_t i = 0; i < n; ++i) {
-        const std::uint32_t l = hnsw_level(s.ids[i], p.m);
-        levels[i] = static_cast<std::uint8_t>(l);
-        first[i] = l == 0 ? HNSW_NO_UPPER : static_cast<std::uint32_t>(blocks);
-        blocks += l;
-    }
-    const GraphLayout layout = graph_layout(n, p.m, blocks);
+    const std::uint64_t blocks = levels_of(s.ids, n, p.m, levels.data(), first.data(), 0);
+    const std::uint64_t upper_cap = hnsw_upper_capacity(blocks, s.capacity - n, p.m);
+    const GraphLayout layout = graph_layout(s.capacity, p.m, upper_cap);
     std::memcpy(section + layout.levels, levels.data(), n);
     std::memcpy(section + layout.upper_index, first.data(), n * 4);
     std::vector<std::uint8_t>().swap(levels);
@@ -628,41 +646,57 @@ void hnsw_build(const VectorSet &s, std::uint8_t *section, const HnswParams &p, 
     h.count = n;
     h.level_seed = HNSW_LEVEL_SEED;
     h.upper_blocks = blocks;
+    h.upper_capacity = s.has_capacity() ? upper_cap : 0;
     std::memcpy(section, &h, sizeof(h));
 }
 
-std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new)
+// The upper part of an extended graph: the base's room when the base's layout is kept (it fits),
+// else room for the slack of the new layout. Used by hnsw_extended_bytes and hnsw_extend alike.
+static std::uint64_t extended_upper_capacity(const HnswGraph &base, std::uint64_t blocks, std::uint64_t n_new, std::uint64_t capacity)
 {
-    std::uint64_t blocks = base.upper_blocks;
-    for (std::uint64_t i = 0; i < n_new; ++i) blocks += hnsw_level(new_ids[i], base.m);
+    const std::uint64_t n = base.count + n_new;
+    if (capacity < n) throw std::logic_error("hnsw_extend: capacity below the count");
     if (blocks >= HNSW_NO_UPPER) throw std::runtime_error("too many vectors for an HNSW graph with m = " + std::to_string(base.m));
-    return graph_layout(base.count + n_new, base.m, blocks).bytes;
+    if (capacity == base.capacity && blocks <= base.upper_capacity) return base.upper_capacity;
+    return hnsw_upper_capacity(blocks, capacity - n, base.m);
+}
+
+std::uint64_t hnsw_extended_bytes(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new, std::uint64_t capacity)
+{
+    const std::uint64_t blocks = levels_of(new_ids, n_new, base.m, nullptr, nullptr, base.upper_blocks);
+    return graph_layout(capacity, base.m, extended_upper_capacity(base, blocks, n_new, capacity)).bytes;
+}
+
+bool hnsw_fits_in_place(const HnswGraph &base, const std::int64_t *new_ids, std::uint64_t n_new, std::uint64_t capacity)
+{
+    if (capacity != base.capacity || base.count + n_new > capacity) return false;
+    const std::uint64_t blocks = levels_of(new_ids, n_new, base.m, nullptr, nullptr, base.upper_blocks);
+    return blocks <= base.upper_capacity;
 }
 
 void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *section, const HnswParams &p,
-                 const std::function<bool()> &poll)
+                 const std::function<bool()> &poll, bool in_place)
 {
     if (p.m != base.m) throw std::runtime_error("m is " + std::to_string(p.m) + ", the base graph has " + std::to_string(base.m));
     if (s.count < base.count) throw std::logic_error("hnsw_extend: fewer positions than the base graph");
     const std::uint64_t n0 = base.count, n = s.count;
 
     // The base parts at the same place in the new layout, then the levels of the new positions.
-    std::uint64_t blocks = base.upper_blocks;
     std::vector<std::uint32_t> first(n - n0);
     std::vector<std::uint8_t> levels(n - n0);
-    for (std::uint64_t i = n0; i < n; ++i) {
-        const std::uint32_t l = hnsw_level(s.ids[i], p.m);
-        levels[i - n0] = static_cast<std::uint8_t>(l);
-        first[i - n0] = l == 0 ? HNSW_NO_UPPER : static_cast<std::uint32_t>(blocks);
-        blocks += l;
+    const std::uint64_t blocks = levels_of(s.ids + n0, n - n0, p.m, levels.data(), first.data(), base.upper_blocks);
+    const std::uint64_t upper_cap = extended_upper_capacity(base, blocks, n - n0, s.capacity);
+    if (in_place && (s.capacity != base.capacity || upper_cap != base.upper_capacity))
+        throw std::logic_error("hnsw_extend: the base layout has no room");
+    const GraphLayout layout = graph_layout(s.capacity, p.m, upper_cap);
+    if (!in_place) {
+        std::memcpy(section + layout.levels, base.levels, n0);
+        std::memcpy(section + layout.level0, base.level0, n0 * (2 * std::uint64_t(p.m) + 1) * 4);
+        std::memcpy(section + layout.upper_index, base.upper_index, n0 * 4);
+        std::memcpy(section + layout.upper, base.upper, base.upper_blocks * (std::uint64_t(p.m) + 1) * 4);
     }
-    const GraphLayout layout = graph_layout(n, p.m, blocks);
-    std::memcpy(section + layout.levels, base.levels, n0);
     std::memcpy(section + layout.levels + n0, levels.data(), n - n0);
-    std::memcpy(section + layout.level0, base.level0, n0 * (2 * std::uint64_t(p.m) + 1) * 4);
-    std::memcpy(section + layout.upper_index, base.upper_index, n0 * 4);
     std::memcpy(section + layout.upper_index + n0 * 4, first.data(), (n - n0) * 4);
-    std::memcpy(section + layout.upper, base.upper, base.upper_blocks * (std::uint64_t(p.m) + 1) * 4);
 
     Builder b(s, section, layout, p);
     // A tombstoned entry point costs every search a hop through a dead node: a live node of the same
@@ -694,6 +728,7 @@ void hnsw_extend(const HnswGraph &base, const VectorSet &s, std::uint8_t *sectio
     h.count = n;
     h.level_seed = HNSW_LEVEL_SEED;
     h.upper_blocks = blocks;
+    h.upper_capacity = s.has_capacity() ? upper_cap : 0;
     std::memcpy(section, &h, sizeof(h));
 }
 
@@ -701,7 +736,7 @@ GraphSection hnsw_graph_section(const HnswParams &p, const std::function<bool()>
 {
     GraphSection g;
     const std::uint32_t m = p.m;
-    g.bytes = [m](const std::int64_t *ids, std::uint64_t n) { return hnsw_section_bytes(ids, n, m); };
+    g.bytes = [m](const std::int64_t *ids, std::uint64_t n, std::uint64_t capacity) { return hnsw_section_bytes(ids, n, m, capacity); };
     g.fill = [p, poll](const VectorSet &s, std::uint8_t *section) { hnsw_build(s, section, p, poll); };
     return g;
 }
@@ -717,7 +752,11 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
     if (h.count == 0 || h.entry_point >= h.count) graph_fail("entry point outside the vectors");
     if (h.max_level > HNSW_MAX_LEVEL) graph_fail("max_level out of range");
     if (h.upper_blocks >= HNSW_NO_UPPER) graph_fail("too many upper blocks");
-    const GraphLayout l = graph_layout(h.count, h.m, h.upper_blocks);
+    if (h.reserved0 || h.reserved1) graph_fail("reserved header fields are not 0");
+    if (s.has_capacity() ? h.upper_capacity < h.upper_blocks || h.upper_capacity >= HNSW_NO_UPPER : h.upper_capacity != 0)
+        graph_fail("upper_capacity does not fit the snapshot");
+    const std::uint64_t upper_cap = s.has_capacity() ? h.upper_capacity : h.upper_blocks;
+    const GraphLayout l = graph_layout(s.capacity, h.m, upper_cap);
     if (l.bytes != s.graph_bytes) graph_fail("section size does not match its header");
 
     HnswGraph g;
@@ -728,6 +767,8 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
     g.entry_point = h.entry_point;
     g.count = h.count;
     g.upper_blocks = h.upper_blocks;
+    g.capacity = s.capacity;
+    g.upper_capacity = upper_cap;
     g.levels = s.graph + l.levels;
     g.level0 = reinterpret_cast<const std::uint32_t *>(s.graph + l.level0);
     g.upper_index = reinterpret_cast<const std::uint32_t *>(s.graph + l.upper_index);
@@ -735,25 +776,33 @@ HnswGraph hnsw_open(const VectorSet &s, bool verify)
     if (g.levels[g.entry_point] != g.max_level) graph_fail("the entry point is not on the top level");
     if (!verify) return g;
 
+    // The levels and the upper index in one pass (a running sum), the links of every position on
+    // several threads (a 100M graph has 13 GB of links).
     std::uint64_t blocks = 0;
     for (std::uint64_t i = 0; i < g.count; ++i) {
         const std::uint32_t level = g.levels[i];
         if (level > g.max_level) graph_fail("a level above max_level");
         if (level == 0 ? g.upper_index[i] != HNSW_NO_UPPER : g.upper_index[i] != blocks) graph_fail("upper_index is not consistent with the levels");
         blocks += level;
-        for (std::uint32_t lv = 0; lv <= level; ++lv) {
-            const std::uint32_t *x = g.links(static_cast<std::uint32_t>(i), lv);
-            if (x[0] > (lv == 0 ? g.m0 : g.m)) graph_fail("a link list is too long");
-            for (std::uint32_t j = 1; j <= x[0]; ++j)
-                if (x[j] >= g.count || x[j] == i || g.levels[x[j]] < lv) graph_fail("a link points to a wrong position");
-            // Lists are short (at most 2m) and in cache: a pairwise check is cheaper than a lookup table.
-            std::uint32_t dup = 0;
-            for (std::uint32_t j = 2; j <= x[0]; ++j)
-                for (std::uint32_t k = 1; k < j; ++k) dup |= x[k] == x[j];
-            if (dup) graph_fail("a link list holds a position twice");
-        }
     }
     if (blocks != g.upper_blocks) graph_fail("upper_blocks does not match the levels");
+    const int threads = g.count < 1000000 ? 1 : std::min(8, resolve_threads(0));
+    parallel_ranges(g.count, 65536, threads, [&](int, std::uint64_t, std::uint64_t p0, std::uint64_t p1) {
+        for (std::uint64_t i = p0; i < p1; ++i) {
+            const std::uint32_t level = g.levels[i];
+            for (std::uint32_t lv = 0; lv <= level; ++lv) {
+                const std::uint32_t *x = g.links(static_cast<std::uint32_t>(i), lv);
+                if (x[0] > (lv == 0 ? g.m0 : g.m)) graph_fail("a link list is too long");
+                for (std::uint32_t j = 1; j <= x[0]; ++j)
+                    if (x[j] >= g.count || x[j] == i || g.levels[x[j]] < lv) graph_fail("a link points to a wrong position");
+                // Lists are short (at most 2m) and in cache: a pairwise check is cheaper than a lookup table.
+                std::uint32_t dup = 0;
+                for (std::uint32_t j = 2; j <= x[0]; ++j)
+                    for (std::uint32_t k = 1; k < j; ++k) dup |= x[k] == x[j];
+                if (dup) graph_fail("a link list holds a position twice");
+            }
+        }
+    });
     return g;
 }
 

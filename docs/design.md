@@ -919,6 +919,61 @@ default precision against the exact search of 1000 queries passed (>= 0.95). The
 disk use of the database stayed within 7 GB of its start: the Tuple Mover purged the
 deleted snapshot rows by itself.
 
+### Incremental transfer (milestone M7)
+
+Before M7 an incremental refresh built a new snapshot by copying every section
+of the base into a new buffer, stored all of it in `vvector.snapshot`, and every
+node read and wrote all of it: 12.7 s for 900k x 128 HNSW with 1,500 changes on
+the 4-node cluster, 144 s at 10M, and at 100M the flat file alone is 50 GB.
+Three things made the size of the index the cost of every refresh, and M7
+removes each:
+
+- Every section after the vectors moved when rows were appended: the format
+  placed the ids, the id index, the sums of the codes and the link lists of
+  the graph by count, so one appended row shifted them all. Now a snapshot is
+  laid out for `capacity` positions (count plus 5% room, at least 4096;
+  `docs/format.md`, FLAG_CAPACITY), the id index and the tombstones have their
+  place from the first build on, and the graph's upper part has room too. An
+  incremental build appends into the room and moves nothing.
+- The build copied the whole base. Now it maps the base's file copy-on-write
+  (MAP_PRIVATE): memory for the pages it writes only, no second copy, and no
+  file-backed build for an incremental refresh at any size.
+- The whole snapshot travelled. Now vbuild compares the copy with the base
+  over the parts a build can touch (the header, the tails of the appended
+  parts, the id index, the tombstones, level 0 and the upper part of the
+  graph; never the base rows of the vectors) in blocks of 512 bytes, because a
+  level-0 link list is 132 bytes and 4 KB pages would send thirty times the
+  change, and stores the changed runs as a patch. vload clones the node's file
+  of the base (FICLONE: a reflink on xfs with reflink=1, which the cluster's
+  /scratch_b, the VM and RHEL 8 have; else copy_file_range, else a copy) and
+  writes the runs over it. The checksum of the new file comes from the base's
+  and the runs (the checksum is an XOR over words), so the build reads no more
+  than it compares; vload verifies the assembled file in full, as always.
+
+`vvector.snapshot` holds the active chain: the last whole copy and the patches
+after it (`manifest.snapshot_chain`). `load_all` replays it: a whole load of
+the first member, then every patch over the one before, so a node that lost
+its cache gets the active snapshot back without a rebuild. When the patches
+weigh more than the copy, or the chain reaches 200 members, or the room to
+grow is used up, the next refresh sends the whole snapshot once (an
+incremental build, no rebuild), and a full build starts a new chain.
+
+What no design removes: the new snapshot is a new file, and its pages are not
+in memory. Reading it once per node (the verification, which is the prewarming
+too) is the floor: about 90 s for 66 GB from the cluster's disks (722 MB/s),
+9 s at 10M, under a second at 1M. Changing the active file in place was
+considered and rejected: queries map it (a torn link list or header), and a
+crash in the middle would leave a corrupt active file. The checksum and the
+graph's link check run on several threads now (the result does not depend on
+their number), and the previous snapshot's pages are given back to the kernel
+when the new one is active (`posix_fadvise DONTNEED`), so the two files do not
+compete for memory. The id index of random (non-ascending) ids shifts from the
+first inserted id on: up to 4 bytes per vector travel then; ascending ids (the
+usual journal) change its tail only.
+
+Measured (session 17): see "Incremental transfer measured" below, filled when
+the 10M and 100M runs of this milestone are in.
+
 ### Journal digest (M3 follow-up)
 
 Carrying the digest forward costs a scan of the rows between the two
