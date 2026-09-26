@@ -22,14 +22,16 @@ using namespace vvector_udx;
 
 static const char *const FN = "vload";
 // A patch starts from a reflink of the base when its runs are few for the base's size: a write into
-// a reflink unshares a copy-on-write extent, about 3 ms each on xfs, while a plain copy of the base
-// by read and write costs about 10 ms per MB on a 100 MB/s disk (copy_file_range would be a reflink
-// again on xfs: cache.h). So a reflink up to one run per MB of the base, at least PATCH_REFLINK_RUNS
-// (a 620 MB base: 620 runs; a 66 GB base: 66,000 runs, where the copy took 704 s on the 100M proof).
+// a reflink unshares a copy-on-write extent, 3 to 8 ms each on the xfs disks measured, while a plain
+// copy of the base by read and write costs about 10 ms per MB on a 100 MB/s disk (copy_file_range
+// would be a reflink again on xfs: cache.h). So a reflink up to one run per 4 MB of the base, at
+// least PATCH_REFLINK_RUNS: measured on the 4-node cluster, an HNSW patch of 1000 adds and 500
+// deletes loads in 35 s from a copy of a 6.7 GB base and 62 s from a reflink, and in 161 s from a
+// reflink of a 66.7 GB base against 704 s from a copy.
 static const std::uint64_t PATCH_REFLINK_RUNS = 64;
 static bool reflink_for(std::uint64_t runs, std::uint64_t base_bytes)
 {
-    return runs <= std::max<std::uint64_t>(PATCH_REFLINK_RUNS, base_bytes >> 20);
+    return runs <= std::max<std::uint64_t>(PATCH_REFLINK_RUNS, base_bytes >> 22);
 }
 
 class VLoad : public TransformFunction

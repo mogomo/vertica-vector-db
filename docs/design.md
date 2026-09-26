@@ -402,14 +402,17 @@ beside the generated 1M; one run at 100M):
 
 | Rows | built-in, one query | `vscan`, one query | `vsearch` exact, one query | built-in, ten queries | `vscan`, ten queries | `vsearch` exact, ten queries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1M | 14.1 to 20.1 s | 0.51 to 0.60 s | 32 to 38 ms (0.9 s the first call) | 16.5 s | VSCAN10_1M | 51 ms |
-| 10M | 37 to 80 s | 3.6 to 3.7 s | 132 ms (7.5 s the first call) | 163 s | VSCAN10_10M | 328 ms |
-| 100M | 364 s | 18.9 s | 1.25 s | not run | VSCAN10_100M | 3.2 s |
+| 1M | 14.1 to 20.1 s | 0.51 to 0.60 s | 32 to 38 ms (0.9 s the first call) | 16.5 s | 0.63 s | 51 ms |
+| 10M | 37 to 80 s | 3.6 to 3.7 s | 132 ms (7.5 s the first call) | 163 s | 3.7 s | 328 ms |
+| 100M | 364 s | 18.9 s | 1.25 s | not run | 20.1 s | 3.1 s |
 
 vscan reads the 100M rows (51 GB of float arrays over 4 nodes) in 19 s: about
-5.3 million rows per second on 40 cores, 19 times the built-in. The flat
-index answers one query 15 times faster still (the file is mapped, no row is
-converted) and a batch of ten in a third of the time of ten vscan runs. The
+5.3 million rows per second on 40 cores, 19 times the built-in, and ten
+queries cost the same scan at every size (the rows are read and converted
+once). The flat index answers one query 15 times faster still (the file is
+mapped, no row is converted) and ten queries in a sixth of a scan. A scan
+after the page cache was flushed reads the table from disk first (31 s at
+1M, 103 s at 10M here, once). The
 100M journal was loaded on one day, so both scans read all of it; a journal
 partitioned by day lets vscan (any predicate before the function) skip
 partitions that a query does not need.
@@ -1090,7 +1093,7 @@ removes each:
   there). vload starts the new file from the node's file of the base: a
   reflink (FICLONE on xfs with reflink=1, which the cluster's /scratch_b, the
   VM and RHEL 8 have) when the patch has few runs for the base's size, at
-  most one per MB of the base and at least 64, because every write into a
+  most one per 4 MB of the base and at least 64, because every write into a
   reflinked file unshares an extent (copy-on-write: 3 ms per scattered
   512-byte write measured on xfs, 300 s for 100,000, against 1.3 s into a
   plain copy that cost 0.35 s); a copy by read and write for a patch of more
@@ -1099,7 +1102,8 @@ removes each:
   of 0.7 s; session 19). The copy costs the base's bytes at the disk's speed:
   704 s for a 66.7 GB HNSW base on the 100M proof (the rule was "at most 64
   runs" then, so every graph patch copied), where a reflink with 8 MB of
-  scattered writes costs under a minute. The runs are
+  scattered writes costs 161 s with the verification; at 6.7 GB the copy
+  (35 s) beats the reflink (62 s), which sets the rule's 4 MB per run. The runs are
   then written over it. The checksum of the new file comes from the base's
   and the runs (the checksum is an XOR over words), so the build reads no more
   than it compares; vload verifies the assembled file in full, as always.
@@ -1161,9 +1165,9 @@ deletes; fenced; the "before" from milestone M6 with the same journals):
 | 10M, flat | 99 s | 18.8 s (5.7 / 7.3) | under 1 MB |
 | 10M, HNSW | 144 s | 47.1 s (5.2 / 35.4) | 8 MB |
 | 10M, HNSW with sq8 | 157 s | 47.5 s (7.0 / 34.0) | 8 MB |
-| 100M, flat | 1,156 s | M7_100M_FLAT | M7_100M_FLAT_MB |
-| 100M, HNSW | 1,739 s | M7_100M_HNSW | M7_100M_HNSW_MB |
-| 100M, HNSW with sq8 | 2,766 s | M7_100M_SQ8 | M7_100M_SQ8_MB |
+| 100M, flat | 1,156 s | 146 s (59 / 70) | under 1 MB |
+| 100M, HNSW | 1,739 s | 301 s (123 / 161) | 8 MB |
+| 100M, HNSW with sq8 | 2,766 s | 390 s (217 / 154) | 8 MB |
 
 At 1M on these nodes nothing is gained: the whole path was already 13 s
 (the fixed part of a refresh is 3.5 to 5 s on this cluster: a refresh with
@@ -1173,10 +1177,15 @@ the transfer is the cost: vbuild falls from 35 to 79 s to 5 to 7 s (the
 build in place), vload of a flat patch to the verification alone (the
 1000 appended rows are one run, so the file is a reflink of the base), and
 vload of an HNSW patch to a copy of the base (the graph changes are
-scattered, so the copy is by read and write) plus the verification: 35 s
-for 6.7 GB here, the disk's speed. A first refresh after the upgrade
-sends the whole snapshot once (the old layout has no room to grow), at the
-cost of an incremental build before M7.
+scattered: thousands of runs) plus the verification, 35 s for 6.7 GB here,
+or, above one run per 4 MB of the base, to a reflink of the base with the
+runs written into it, 161 s for 66.7 GB (a copy would take 704 s at the
+disk's 95 MB/s). At 100M what remains of a patch refresh is the base
+verification in vbuild (59 to 217 s: the file read once) and the
+verification of the new file in vload (70 to 154 s); a refresh with nothing
+changed takes 5.5 s. A first refresh after the upgrade sends the whole
+snapshot once (the old layout has no room to grow), at the cost of an
+incremental build before M7: 1,190 / 1,716 / 2,340 s at 100M.
 
 ### Journal digest (M3 follow-up)
 
@@ -1592,8 +1601,8 @@ What the numbers say:
   file that fits in the node's available memory is left to the read-around, which is the fastest
   way to warm it (measured with MADV_RANDOM on those sections instead: the file stayed cold, 1.2 GB
   resident after 15 searches, but the cold searches took the same 12 to 39 s, some 20,000 random
-  pages each at the disk's latency, and a cold batch of 1000 queries ran for over 30 minutes
-  against 98 to 129 s with the reload); a file that cannot fit gets MADV_RANDOM there, because a
+  pages each at the disk's latency, and a cold batch of 1000 queries took 25 minutes against
+  98 to 129 s with the reload); a file that cannot fit gets MADV_RANDOM there, because a
   reload would thrash and evict every other index. A cold search at this size is bound by random
   read latency either way; reading a node's neighbours in parallel (a beam over the disk, as
   DiskANN does) would be the lever, not planned.
