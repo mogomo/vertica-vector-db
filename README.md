@@ -1522,11 +1522,13 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   the next search then reads them from disk (on the test VM: one search of
   0.3 s for a 632 MB index, then normal speed). A new mapping asks the
   kernel to read ahead the ids, codes and graph before the float rows, at
-  most 8 GB in all, and marks the rest of a larger file for random access,
-  so a search on a cold file reads the pages it touches and no more (on the
-  100M test, 63 GB, disks with a 4 MB read-around per page fault, the first
-  search read the whole file, 46 s, before this); a flat index reads all its
-  rows at every search, so they are always read ahead;
+  most 8 GB in all; the rest of a file that fits in the node's memory comes
+  in as searches touch it, at the disk's read-around speed (on the 100M
+  test the first search on a cold 63 GB HNSW file took 46 s, a cold batch of
+  1000 queries about two minutes, and everything was fast after that); a
+  file larger than the node's available memory is marked for random access
+  beyond the 8 GB instead, so its searches read only the pages they need; a
+  flat index reads all its rows at every search, so they are always read ahead;
   and `load_all` reads all of it. A search reads the file on one node only, in the tests the node the
   client was connected to: on the 4-node test cluster, after a benchmark
   whose sessions all used node 1, the indexes were fully resident there and

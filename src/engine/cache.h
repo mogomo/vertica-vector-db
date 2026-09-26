@@ -66,13 +66,17 @@ IndexOptions read_index_options(const std::string &cache_dir, const std::string 
 // needs, in the order it needs them: ids, id index, tombstones, sq8 header, codes and sums, graph
 // header, levels, level 0, upper index and upper levels, and the float rows last; every section is
 // asked for whole or not at all, within PREWARM_BUDGET_BYTES per mapping. The advice is served before
-// the first search of the mapping runs, so the budget bounds that wait to a few seconds of disk. A
-// section beyond the budget is marked MADV_RANDOM: a search reads it at random, page by page, and
-// without the mark every page fault also reads the disk's read-around (read_ahead_kb: 4 MB on the
-// test cluster), which made one search on a cold 63 GB file read all of it (46 s; the 100M proof,
-// docs/design.md). What every search reads whole is always asked for: the rows of a flat index, the
-// codes of a flat coded index. vload and load_all read the whole file. compact (memory_mode compact):
-// the float rows get MADV_RANDOM whatever the budget (rescoring reads a few of them per query).
+// the first search of the mapping runs, so the budget bounds that wait to a few seconds of disk.
+// Beyond the budget: a file that fits in the node's available memory is left to the kernel, whose
+// read-around (read_ahead_kb, 4 MB per page fault on the test cluster) warms it at sequential speed
+// as searches touch it (a cold 63 GB HNSW file: the first search 46 s, a cold batch of 1000 queries
+// 98 to 129 s, then everything resident; the 100M proof, docs/design.md); a file that cannot fit
+// gets MADV_RANDOM on those sections, so a search reads the pages it needs and nothing around them
+// (a reload would thrash and evict every other index; with the mark a cold search reads some
+// 20,000 pages at the disk's latency, 12 to 39 s there, and a cold batch takes far longer than the
+// reload). What every search reads whole is always asked for: the rows of a flat index, the codes of
+// a flat coded index. vload and load_all read the whole file. compact (memory_mode compact): the
+// float rows get MADV_RANDOM whatever the budget (rescoring reads a few of them per query).
 constexpr std::uint64_t PREWARM_BUDGET_BYTES = 8ull << 30;
 
 struct PrewarmRange {
@@ -82,9 +86,15 @@ struct PrewarmRange {
 };
 
 // The ranges prewarm asks for, in order, for the sections of `set` mapped at `data` (a file of
-// `size` bytes). Pure, so tests can check the order and the budget without a file.
+// `size` bytes). random_beyond: sections beyond the budget are marked MADV_RANDOM (the file does not
+// fit in memory); else they are left out (no advice). Pure, so tests can check the order and the
+// budget without a file.
 std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t size, const VectorSet &set,
-                                       bool compact, std::uint64_t budget = PREWARM_BUDGET_BYTES);
+                                       bool compact, std::uint64_t budget = PREWARM_BUDGET_BYTES,
+                                       bool random_beyond = true);
+// The memory a new file could occupy now: MemAvailable of /proc/meminfo (free plus reclaimable page
+// cache); the largest value where it cannot be read.
+std::uint64_t memory_available();
 
 // A snapshot file mapped read-only. Throws std::runtime_error with the cause.
 class MappedSnapshot {

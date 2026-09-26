@@ -102,10 +102,16 @@ static void test_prewarm_plan()
     std::vector<PrewarmRange> cut = prewarm_plan(cd, csize, coded.set, false, total - plan[6].bytes);
     CHECK(cut.size() == 10);
     for (std::size_t i = 0; i < cut.size(); ++i) CHECK(cut[i].offset == plan[i].offset && cut[i].willneed == (i != 6));
-    // Budget 0 on a graph index: every section MADV_RANDOM.
+    // Budget 0 on a graph index: every section MADV_RANDOM when the file does not fit in memory;
+    // nothing at all when it does (the kernel's read-around warms it).
     cut = prewarm_plan(cd, csize, coded.set, false, 0);
     CHECK(cut.size() == 10);
     for (const PrewarmRange &r : cut) CHECK(!r.willneed);
+    CHECK(prewarm_plan(cd, csize, coded.set, false, 0, false).empty());
+    cut = prewarm_plan(cd, csize, coded.set, false, total - plan[6].bytes, false);
+    CHECK(cut.size() == 9);
+    for (std::size_t i = 0; i < cut.size(); ++i) CHECK(cut[i].willneed && cut[i].offset == plan[i < 6 ? i : i + 1].offset);
+    CHECK(memory_available() > 0);
     // compact: the rows MADV_RANDOM, even with the full budget.
     plan = prewarm_plan(cd, csize, coded.set, true);
     CHECK(plan.size() == 10 && plan[9].offset == 0 && !plan[9].willneed && plan[6].willneed);
@@ -124,6 +130,8 @@ static void test_prewarm_plan()
     }
     cut = prewarm_plan(fcoded.buffer.data(), fcoded.buffer.size(), fcoded.set, false, 0);
     CHECK(cut.size() == 5 && !cut[0].willneed && cut[1].willneed && cut[2].willneed && cut[3].willneed && !cut[4].willneed);
+    cut = prewarm_plan(fcoded.buffer.data(), fcoded.buffer.size(), fcoded.set, false, 0, false);
+    CHECK(cut.size() == 3 && cut[0].willneed && cut[1].willneed && cut[2].willneed);
 }
 
 int main()

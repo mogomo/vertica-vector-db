@@ -598,13 +598,15 @@ results of session 12).
   thousand random faults turns into the whole file. Since milestone M7
   `prewarm_plan` (cache.h) asks for the sections in the order a search needs
   them, ids, id index, tombstones, codes, graph, float rows, each whole or not
-  at all, at most 8 GB per mapping, and marks every section beyond the budget
-  MADV_RANDOM (a fault reads its page only); the rows of a flat index and the
-  codes of a flat coded index are always asked for, a search reads them all
-  anyway. At 100M HNSW that is the ids and the upper graph levels (2.3 GB)
-  read ahead, level 0 (13 GB) and the rows (51 GB) page by page as searches
-  touch them. Below 8 GB nothing changes. The next two points are for indexes
-  that must never be evicted.
+  at all, at most 8 GB per mapping; the rows of a flat index and the codes
+  of a flat coded index are always asked for, a search reads them all anyway.
+  Beyond the budget a file that fits in the node's available memory is left
+  to the kernel's read-around (it warms the file at sequential speed: the
+  63 GB HNSW file in 45 to 130 s, then every search is fast), and a file
+  that cannot fit is marked MADV_RANDOM there, so its searches read their
+  pages only instead of thrashing the cache ("100 million vectors" below has
+  the measurements). Below 8 GB nothing changes. The next two points are for
+  indexes that must never be evicted.
 - A cache directory on tmpfs (`/dev/shm`, the index option `cache_dir`):
   the same warm speed (median 5 to 6 ms) and immune to eviction: after the
   page cache was emptied the index stayed resident and the first search took
@@ -1585,6 +1587,13 @@ What the numbers say:
   search's reads, and a tmpfs `cache_dir` pins an index that fits. What the numbers ask for is the
   right advice per section (milestone M7, `prewarm_plan` in cache.h): MADV_WILLNEED section by
   section in the order the walk needs them, ids, id index, tombstones, codes, graph, float rows, up
-  to a budget of 8 GB per mapping, and MADV_RANDOM on every section beyond it, so a fault reads its
-  page and nothing around it; what every search reads whole (the rows of a flat index, the codes of
-  a flat coded index) is always asked for. Measured again below.
+  to a budget of 8 GB per mapping; what every search reads whole (the rows of a flat index, the
+  codes of a flat coded index) is always asked for. Beyond the budget the file's size decides: a
+  file that fits in the node's available memory is left to the read-around, which is the fastest
+  way to warm it (measured with MADV_RANDOM on those sections instead: the file stayed cold, 1.2 GB
+  resident after 15 searches, but the cold searches took the same 12 to 39 s, some 20,000 random
+  pages each at the disk's latency, and a cold batch of 1000 queries ran for over 30 minutes
+  against 98 to 129 s with the reload); a file that cannot fit gets MADV_RANDOM there, because a
+  reload would thrash and evict every other index. A cold search at this size is bound by random
+  read latency either way; reading a node's neighbours in parallel (a beam over the disk, as
+  DiskANN does) would be the lever, not planned.

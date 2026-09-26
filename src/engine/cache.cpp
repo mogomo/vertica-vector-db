@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 
@@ -279,17 +280,29 @@ std::map<std::string, IndexState> states;      // by <cache_dir>/<index>
 
 } // namespace
 
+std::uint64_t memory_available()
+{
+    std::ifstream in("/proc/meminfo");
+    std::string key;
+    std::uint64_t kb = 0;
+    while (in >> key >> kb) {
+        if (key == "MemAvailable:") return kb * 1024;
+        in.ignore(256, '\n');
+    }
+    return ~std::uint64_t(0);
+}
+
 std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t size, const VectorSet &s,
-                                       bool compact, std::uint64_t budget)
+                                       bool compact, std::uint64_t budget, bool random_beyond)
 {
     // Over the used bytes of every section only: the slack of a layout with room to grow
     // (FLAG_CAPACITY) is never read, so it costs no memory.
     std::vector<PrewarmRange> plan;
     std::uint64_t left = budget;
     // whole: the section is asked for whether it fits or not (a search reads all of it anyway).
-    // Otherwise it is asked for when it fits the budget that is left, else marked MADV_RANDOM: a
-    // search reads it at random, and without the mark every page fault reads the disk's read-around
-    // (read_ahead_kb, 4 MB on the test cluster), which loaded a whole 63 GB file in one search.
+    // Otherwise it is asked for when it fits the budget that is left; beyond the budget it is marked
+    // MADV_RANDOM when the file does not fit in memory (random_beyond), else left to the kernel's
+    // read-around, which warms a file that fits at sequential speed (cache.h).
     auto want = [&](const void *at, std::uint64_t bytes, bool whole = false) {
         if (bytes == 0 || at == nullptr) return;
         const std::uint64_t off = static_cast<std::uint64_t>(static_cast<const std::uint8_t *>(at) - data);
@@ -297,7 +310,8 @@ std::vector<PrewarmRange> prewarm_plan(const std::uint8_t *data, std::uint64_t s
         bytes = std::min(bytes, size - off);
         const bool fits = bytes <= left;
         if (fits) left -= bytes;
-        plan.push_back(PrewarmRange{off, bytes, whole || fits});
+        if (whole || fits) plan.push_back(PrewarmRange{off, bytes, true});
+        else if (random_beyond) plan.push_back(PrewarmRange{off, bytes, false});
     };
     const bool flat = !s.has_graph();
     want(s.ids, s.count * 8);
@@ -336,7 +350,7 @@ static void prewarm(void *m, std::uint64_t size, bool compact)
     const std::uint64_t page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
     try {
         const VectorSet s = snapshot_open(data, size, false);
-        for (const PrewarmRange &r : prewarm_plan(data, size, s, compact)) {
+        for (const PrewarmRange &r : prewarm_plan(data, size, s, compact, PREWARM_BUDGET_BYTES, size > memory_available())) {
             const std::uint64_t from = r.offset / page * page, to = std::min(size, r.offset + r.bytes);
             madvise(static_cast<std::uint8_t *>(m) + from, to - from, r.willneed ? MADV_WILLNEED : MADV_RANDOM);
         }
