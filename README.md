@@ -2134,5 +2134,12 @@ provided "as is", without warranty of any kind, as the MIT license says.
 Please try it on your own systems and data before you rely on it, and take
 special care with unfenced mode, where the code runs inside the Vertica process.
 
+This repository was tested on several different clusters (one node, a 3-node
+Eon cluster and a 4-node Enterprise cluster), with the software versions and
+settings named in [Performance and results](#performance-and-results). The
+benchmark results are not a statement about any product in general, and your
+results will differ. The scripts are included so that you can repeat every
+measurement yourself.
+
 Vertica, Rocket Software and all other product and company names are
 trademarks or registered trademarks of their respective owners.
