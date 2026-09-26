@@ -6,7 +6,7 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M7 done (incremental transfer, exact search without an index, Eon subclusters); no further milestone is planned.** Two index
+**Status: complete (2026-09-26). Milestones M1 to M7 are done and tested; no further work is planned. Issues and pull requests are welcome.** Two index
 types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
 each optionally with int8 codes (`sq8`) that make searches faster while the
 returned scores stay exact. k-nearest-neighbour search works for the metrics
