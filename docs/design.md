@@ -390,11 +390,14 @@ Measured on the 3-node Eon cluster (2 cores per node; 1M random vectors of
 | `vsearch` precision exact on the flat index | 77 to 84 ms (1.2 s the first call of a session) | 165 ms |
 
 All three return the same ids; the scores agree to float32. Ten queries
-cost vscan what one costs: its time is reading the rows and converting the
-arrays to float32, not the distances, which is why the `vpack` idea (a
-packed VARBINARY column read with one memcpy) is the lever if a larger
-machine shows the same ratio. An index is another order of magnitude for
-one query because the file is mapped and no row is converted.
+cost vscan what one costs: its time is reading the rows, not the distances.
+A packed VARBINARY column (the vector as doubles plus its norm, read with
+one memcpy by a transform function) was measured against it on the 4-node
+cluster at 10M x 128: 3.9 to 4.2 s against 3.5 to 3.6 s for vscan over
+ARRAY[FLOAT], and a plain read of either column costs 3.1 s. The cost is
+the column read itself, not the array decoding, so a packed column gains
+nothing and is not offered. An index is another order of magnitude for one
+query because the file is mapped and no row is read from the table.
 
 On the 4-node Enterprise cluster (10 cores and 78 GB per node, AVX-512; the
 same statements, k 10, l2, fenced; BIGANN prefixes of 10M and 100M rows
