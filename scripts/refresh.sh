@@ -2,9 +2,10 @@
 # Refresh the snapshot of a vector index and load it on every node, or only repair the node caches.
 #
 #   scripts/refresh.sh --index=NAME [--mode=auto|incremental|full] [--load_only] [--schedule='CRON'] [--status] [--echo_only]
+#   scripts/refresh.sh --load_only [--echo_only]        every index (vvector.load_all() without an argument)
 #
 #   --mode        refresh_index with this mode (default: the index's refresh_mode)
-#   --load_only   vvector.load_all: load the active snapshot again on every node
+#   --load_only   vvector.load_all: load the active snapshot again on every node; without --index every index
 #   --schedule    vvector.schedule_refresh with a cron expression, for example '0 * * * *'
 #   --status      vvector.status: pending changes, open writers, warnings
 #
@@ -20,17 +21,17 @@ for arg in "$@"; do
         --schedule=*) MODE=schedule; CRON="${arg#*=}" ;;
         --status)     MODE=status ;;
         --echo_only)  ECHO_ONLY=yes ;;
-        -h|--help)    sed -n '2,11p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "refresh.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
-[ -n "$INDEX" ] || { echo "refresh.sh: --index is required" >&2; exit 2; }
+[ -n "$INDEX" ] || [ "$MODE" = load ] || { echo "refresh.sh: --index is required" >&2; exit 2; }
 case "$INDEX" in *[!A-Za-z0-9_]*) echo "refresh.sh: --index must be letters, digits or underscores" >&2; exit 2 ;; esac
 case "$RMODE" in ''|auto|incremental|full) ;; *) echo "refresh.sh: --mode must be auto, incremental or full" >&2; exit 2 ;; esac
 
 case "$MODE" in
     refresh)  SQL="CALL vvector.refresh_index('$INDEX'${RMODE:+, '$RMODE'});" ;;
-    load)     SQL="CALL vvector.load_all('$INDEX');" ;;
+    load)     SQL="CALL vvector.load_all(${INDEX:+'$INDEX'});" ;;
     schedule) SQ="'"; SQL="CALL vvector.schedule_refresh('$INDEX', '${CRON//$SQ/$SQ$SQ}');" ;;
     status)   SQL="CALL vvector.status('$INDEX');" ;;
 esac

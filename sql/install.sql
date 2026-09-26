@@ -196,6 +196,6 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vvector_admin TO vvector_admin;
 GRANT ALL ON vvector.snapshot, vvector.manifest TO vvector_admin;
 GRANT SELECT ON SEQUENCE vvector.snapshot_seq TO vvector_admin;
 
--- Stored procedures: register_index, set_index_options, refresh_index, load_all, status, sizing,
+-- Stored procedures: register_index, set_index_options, refresh_index, load_all (one index or all), status, sizing,
 -- schedule_refresh, unregister_index.
 \i sql/procedures.sql

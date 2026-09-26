@@ -7,6 +7,7 @@
 --   vvector.refresh_index(index_name [, mode])
 --   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
+--   vvector.load_all()                 every registered index with an active snapshot
 --   vvector.status(index_name)
 --   vvector.sizing(vectors, dims, index_type, quantization)
 --   vvector.schedule_refresh(index_name, cron_expr)
@@ -733,6 +734,52 @@ BEGIN
     END IF;
     PERFORM CALL vvector.load_all_core(nm);
     RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes% (% of the chain %)', nm, sid, here, REGEXP_COUNT(chain, ',') + 1, chain;
+END;
+$$;
+
+-- load_all(): every registered index with an active snapshot, in name order, each as load_all(name)
+-- does (one vinfo call, a load only when a node of the session's subcluster lacks the active
+-- snapshot, the index defaults written). One cron line per subcluster instead of one per index.
+-- An error of one index stops the call and names it: fix it and run load_all(name) for it.
+-- Indexes without a snapshot are counted, not loaded. Never an error when nothing is registered
+-- (the fetch of the next name uses MAX(): a subquery with no row is an error in an assignment).
+CREATE OR REPLACE PROCEDURE vvector.load_all() LANGUAGE PLvSQL AS $$
+DECLARE
+    nm VARCHAR(128); sid INT; chain VARCHAR(4000); want INT; got INT; cd VARCHAR(1100); here VARCHAR(200);
+    i INT; n_loaded INT; n_fine INT; n_none INT;
+BEGIN
+    here := (SELECT CASE WHEN MAX(subcluster_name) IS NULL THEN '' ELSE ' of subcluster ' || MAX(subcluster_name) END
+             FROM v_catalog.nodes WHERE node_name = local_node_name());
+    want := (SELECT COUNT(*) FROM (SELECT vvector_admin.vnode(k) OVER(PARTITION NODES) FROM vvector.probe) n);
+    n_none := (SELECT COUNT(*) FROM vvector.manifest WHERE active_snapshot IS NULL);
+    n_loaded := 0;
+    n_fine := 0;
+    i := 1;
+    nm := (SELECT MAX(index_name) FROM (SELECT index_name, ROW_NUMBER() OVER (ORDER BY index_name) AS rn
+                                   FROM vvector.manifest WHERE active_snapshot IS NOT NULL) t WHERE rn = i);
+    WHILE nm IS NOT NULL LOOP
+        SELECT active_snapshot, snapshot_chain INTO sid, chain FROM vvector.manifest WHERE index_name = nm;
+        IF chain IS NULL OR NOT REGEXP_LIKE(chain, '^[0-9]+(,[0-9]+)*$') THEN
+            chain := sid::VARCHAR;
+        END IF;
+        cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
+               FROM vvector.manifest WHERE index_name = nm);
+        got := EXECUTE 'SELECT COUNT(DISTINCT node_name) FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd
+            || ') OVER(PARTITION NODES) FROM vvector.probe) v WHERE loaded AND snapshot_id = ' || sid;
+        IF COALESCE(got, 0) >= want THEN
+            PERFORM CALL vvector.push_options(nm);
+            n_fine := n_fine + 1;
+            RAISE NOTICE 'vvector: index %: snapshot % is already in the cache of all % nodes%: nothing to load', nm, sid, want, here;
+        ELSE
+            PERFORM CALL vvector.load_all_core(nm);
+            n_loaded := n_loaded + 1;
+            RAISE NOTICE 'vvector: index %: snapshot % loaded on all nodes% (% of the chain %)', nm, sid, here, REGEXP_COUNT(chain, ',') + 1, chain;
+        END IF;
+        i := i + 1;
+        nm := (SELECT MAX(index_name) FROM (SELECT index_name, ROW_NUMBER() OVER (ORDER BY index_name) AS rn
+                                       FROM vvector.manifest WHERE active_snapshot IS NOT NULL) t WHERE rn = i);
+    END LOOP;
+    RAISE NOTICE 'vvector.load_all: % indexes: % loaded, % already in the cache of all % nodes%, % without a snapshot', n_loaded + n_fine + n_none, n_loaded, n_fine, want, here, n_none;
 END;
 $$;
 
@@ -1508,6 +1555,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.load_all() FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all_core(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM PUBLIC;
@@ -1536,6 +1584,7 @@ REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) FROM vvector
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_core(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index_run(VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.load_all() FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_all_core(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.status(VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) FROM vvector_search;
@@ -1552,6 +1601,7 @@ GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.load_all(VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.load_all() TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.status(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.schedule_refresh(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.unregister_index(VARCHAR) TO vvector_admin;

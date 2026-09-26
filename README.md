@@ -162,7 +162,7 @@ snapshots, which are in schema `vvector_admin`:
 | role `vvector_search` | may search (the functions in `vvector`) |
 | functions in `vvector` | `vsearch`, `vknn`, `vscan`, `vinfo`, `vversion` (search and information) |
 | functions in `vvector_admin` | `vbuild`, `vload`, `vconfig`, `vnode` (build and load; `refresh_index` and `load_all` call them) |
-| procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all`, `status`, `sizing`, `schedule_refresh`, `unregister_index` |
+| procedures | `register_index`, `set_index_options`, `set_journal_replica`, `refresh_index`, `load_all` (one index, or all without an argument), `status`, `sizing`, `schedule_refresh`, `unregister_index` |
 
 Rights:
 
@@ -533,6 +533,7 @@ may call it:
 ### load_all, unregister_index
 
     CALL vvector.load_all('docs');          -- load the active snapshot and the defaults again on every node
+    CALL vvector.load_all();                -- the same for every registered index
     CALL vvector.unregister_index('docs');  -- remove schedule, views, snapshots and manifest row
 
 `load_all` repairs node caches (a node that was down during a refresh, a
@@ -540,7 +541,11 @@ deleted cache directory) and, in Eon, loads a subcluster that did not run the
 refresh (see [Operations](#operations)). It first asks every node whether it
 already holds the active snapshot and then only rewrites the index defaults
 ("already in the cache of all N nodes: nothing to load", milliseconds), so it
-can run as often as wanted. `unregister_index` leaves the cache files on the
+can run as often as wanted. Without an argument it does this for every
+registered index that has a snapshot, in name order, prints one line per
+index and a summary ("3 indexes: 1 loaded, 2 already in the cache of all 3
+nodes, 0 without a snapshot"); an error of one index stops the call and names
+it. `unregister_index` leaves the cache files on the
 nodes: remove `<cache_dir>/<index_name>` by hand. An index with a schedule
 can be unregistered by a superuser only (Vertica lets only a superuser drop a
 trigger); for anyone else `unregister_index` stops before it removes anything.
@@ -555,6 +560,7 @@ The same from the shell:
     scripts/refresh.sh --index=docs --schedule='0 * * * *' # schedule_refresh
     scripts/refresh.sh --index=docs --status               # status
     scripts/refresh.sh --index=docs --load_only            # load_all
+    scripts/refresh.sh --load_only                         # load_all() for every index
 
 `scripts/demo.sh` walks through everything on a table of its own (schema
 VVDEMO, removed at the end unless `--keep`): it loads generated vectors
@@ -1422,6 +1428,7 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   searches the index loads it with
 
       CALL vvector.load_all('docs');    -- in a session on that subcluster, after each refresh
+      CALL vvector.load_all();          -- or every index at once: one cron line per subcluster
 
   from the application after a refresh, or from a cron job with vsql every
   minute: `load_all` first asks every node of the subcluster whether it has the
@@ -2072,9 +2079,9 @@ Operations:
 - A node that missed a refresh answers "snapshot cache stale ... run vload"
   until `load_all` runs.
 - Eon: a refresh loads the subcluster it runs in (a scheduled one the
-  primary subcluster); every other subcluster runs `load_all` in a session
-  of its own after each refresh, and `vknn` there has no stale check
-  (see [Operations](#operations)).
+  primary subcluster); every other subcluster runs `load_all` (one index,
+  or all without an argument) in a session of its own after each refresh,
+  and `vknn` there has no stale check (see [Operations](#operations)).
 - A new snapshot format needs a refresh of every index; the error says so.
 - An incremental refresh reads only the changes and sends only the bytes that
   changed, but every node still reads the new snapshot file once (its

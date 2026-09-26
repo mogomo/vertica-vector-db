@@ -8,7 +8,7 @@
 # Checks: a search on the other subcluster before a load (no cache), load_all there, the same results
 # on both subclusters, load_all with nothing to load, a refresh on the primary followed by the stale
 # error on the secondary and a load_all that applies the patch, a refresh from the secondary and the
-# same on the primary, the status and refresh messages that name the subcluster.
+# same on the primary with load_all() (every index), the status and refresh messages that name the subcluster.
 #   tests/sql/test_subcluster.sh --secondary=CMD [--rows=N] [--dims=N] [--schema=NAME] [--echo_only]
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -89,12 +89,17 @@ P1=$(run_sql "search on the primary" "$SEARCH;")
 expect "the primary answers" "^rows: 5$" "SELECT 'rows: ' || COUNT(*) FROM ($SEARCH) s;"
 
 echo "== the secondary before a load"
-expect_sec "vsearch on the secondary before a load: no cache" "no snapshot cache for index '$IX'" "$SEARCH;"
-expect_sec "vknn on the secondary before a load: no cache" "no snapshot cache for index '$IX'" "$KNN;"
-expect_sec "vinfo on the secondary lists its own nodes, none loaded" "^loaded: 0 of [1-9][0-9]* nodes of $THERE" "
-SELECT 'loaded: ' || SUM(CASE WHEN loaded THEN 1 ELSE 0 END) || ' of ' || COUNT(*) || ' nodes of ' || MAX(n.subcluster_name)
+# The refresh on the primary never touches the secondary's caches. Its nodes have no cache of the
+# index, or the cache of an earlier run of this test (unregister_index leaves cache files, and this
+# session cannot remove files on another subcluster): then vsearch says "stale" instead of "no cache",
+# vknn answers from that old snapshot (no stale check), and vinfo shows no node on the active snapshot.
+expect_sec "vsearch on the secondary before a load: no cache, or the stale cache of an earlier run" "no snapshot cache for index '$IX'\|snapshot cache stale on v_[a-z0-9_]*: run vload" "$SEARCH;"
+expect_sec "vknn on the secondary before a load: no cache, or an earlier run's snapshot (no stale check)" "no snapshot cache for index '$IX'\|^[0-9]*|[0-9.e-]*|5$" "$KNN;"
+expect_sec "vinfo on the secondary lists its own nodes, none on the active snapshot" "^on the active snapshot: 0 of [1-9][0-9]* nodes of $THERE" "
+SELECT 'on the active snapshot: ' || SUM(CASE WHEN loaded AND snapshot_id = m.active_snapshot THEN 1 ELSE 0 END) || ' of ' || COUNT(*) || ' nodes of ' || MAX(n.subcluster_name)
 FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) i
-JOIN v_catalog.nodes n ON n.node_name = i.node_name;"
+JOIN v_catalog.nodes n ON n.node_name = i.node_name
+CROSS JOIN (SELECT active_snapshot FROM vvector.manifest WHERE index_name = '$IX') m;"
 expect_sec "status on the secondary names its subcluster and the missing cache" "cache of 0 of [1-9][0-9]* nodes of subcluster $THERE" "CALL vvector.status('$IX');"
 
 echo "== load_all on the secondary"
@@ -126,7 +131,8 @@ echo "== a refresh from the secondary, the primary is behind"
 expect_sec "10 more rows and a refresh from the secondary" "incremental from snapshot" "$NEW
 CALL vvector.refresh_index('$IX');"
 expect "vsearch on the primary: stale" "snapshot cache stale on v_[a-z0-9_]*: run vload" "$SEARCH;"
-expect "load_all on the primary applies the chain" "loaded on all nodes of subcluster $HERE (3 of the chain" "CALL vvector.load_all('$IX');"
+expect "load_all() without an argument on the primary applies the chain" "index $IX: snapshot [0-9]* loaded on all nodes of subcluster $HERE (3 of the chain" "CALL vvector.load_all();"
+expect "load_all() names the subcluster in its summary" "vvector.load_all: [1-9][0-9]* indexes: [0-9]* loaded, [1-9][0-9]* already in the cache of all [1-9][0-9]* nodes of subcluster $HERE, [0-9]* without a snapshot" "CALL vvector.load_all();"
 P3=$(run_sql "search on the primary" "$SEARCH;")
 S3=$(run_sec "search on the secondary" "$SEARCH;")
 same "the same results on both subclusters after a refresh from the secondary" "$P3" "$S3"

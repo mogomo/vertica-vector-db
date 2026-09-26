@@ -472,8 +472,9 @@ shards; Vertica 26.2.0-2):
   wherever the schedule was created (two every-minute schedules, one made
   from each subcluster, both ran on primary node 2). A scheduled refresh
   therefore loads the primary subcluster only. A secondary subcluster is kept
-  current by a client job that runs `CALL vvector.load_all('<index>')` in a
-  session on that subcluster (cron with vsql, or the application after each
+  current by a client job that runs `CALL vvector.load_all('<index>')`, or
+  `CALL vvector.load_all()` for every registered index, in a session on that
+  subcluster (cron with vsql, or the application after each
   refresh): load_all first asks vinfo whether every node of the subcluster
   already has the active snapshot (one call, about 70 ms) and then only
   rewrites the index defaults, so a load_all every minute costs nothing

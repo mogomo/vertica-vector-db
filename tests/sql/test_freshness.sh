@@ -173,7 +173,9 @@ SELECT 'nodes behind: ' || (u.up - i.ok)
 FROM (SELECT COUNT(DISTINCT node_name) AS ok FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='$IX') OVER(PARTITION NODES) FROM vvector.probe) g
       WHERE loaded AND snapshot_id = $SID) i
 CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u;"
-expect "load_all repairs that too" "loaded on all nodes" "CALL vvector.load_all('$IX');"
+expect "load_all() without an argument repairs that too (every registered index)" "index $IX: snapshot [0-9]* loaded on all nodes" "CALL vvector.load_all();"
+expect "load_all() prints a summary" "vvector.load_all: [1-9][0-9]* indexes: [0-9]* loaded, [1-9][0-9]* already in the cache of all [1-9][0-9]* nodes.*, [0-9]* without a snapshot" "CALL vvector.load_all();"
+expect "load_all() again: nothing to load for this index" "index $IX: snapshot [0-9]* is already in the cache of all [1-9][0-9]* nodes.*: nothing to load" "CALL vvector.load_all();"
 expect "vsearch works again after the repairs" "^rows: 5$" "$COUNT5"
 
 echo "== schedule and unregister"
