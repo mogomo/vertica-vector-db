@@ -6,7 +6,7 @@ k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
-**Status: milestone M6 done (memory and cache placement, scale tests up to 100M vectors).** Two index
+**Status: milestone M7 done (incremental transfer, exact search without an index, Eon subclusters); no further milestone is planned.** Two index
 types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
 each optionally with int8 codes (`sq8`) that make searches faster while the
 returned scores stay exact. k-nearest-neighbour search works for the metrics
@@ -1787,8 +1787,11 @@ there. One statement with
 threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
 Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
 (87 s with sq8), an incremental one of 900,000 vectors after 1000 adds and 500
-deletes 12.7 s: every node loads the whole snapshot (see Restrictions; 16.9 s
-before the snapshot table was segmented, docs/design.md). A range
+deletes 12.7 s at milestone M6, when every node loaded the whole snapshot,
+and 15 s (flat: 7 s) since M7, when only the changed bytes travel: at this
+size the fixed part of a refresh (4 to 5 s here) and the verification of the
+patched file weigh as much as the whole load did; the gain shows from 10M on
+(docs/design.md, "Incremental transfer"). A range
 search (k 16384, the radius of the query's 10th neighbour) costs 15.6 ms
 fenced and 7.1 ms mixed; filtered searches: see
 [Filtered search](#filtered-search).
