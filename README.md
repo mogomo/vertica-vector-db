@@ -1,15 +1,17 @@
 # vertica-vector-db (vvector)
 
-Nearest-neighbour vector search inside Vertica. vvector is a C++ UDx library
+Nearest-neighbour vector search inside Vertica, approximate (ANN) or exact
+(kNN). vvector is a C++ UDx library
 that keeps an index of the vectors stored in a Vertica table and answers "the
 k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
 on every node, and every query can see the rows written since the last
 refresh.
 
 **Status: complete (2026-09-26). Milestones M1 to M7 are done and tested; no further work is planned. Issues and pull requests are welcome.** Two index
-types: `hnsw` (a graph index, approximate, the default) and `flat` (exact),
-each optionally with int8 codes (`sq8`) that make searches faster while the
-returned scores stay exact. k-nearest-neighbour search works for the metrics
+types: `hnsw` (a graph index, approximate: ANN, the default) and `flat`
+(exact: kNN), each optionally with int8 codes (`sq8`) that make searches
+faster while the returned scores stay exact; any search can be made exact
+with `precision='exact'` (see [Terms](#terms)). Search works for the metrics
 l2, cosine, dot and l1, for one query or thousands in one statement, with or
 without the rows written since the last refresh, limited to a list of
 allowed ids (filtered search) or to a radius (range search). Vector
@@ -23,12 +25,318 @@ cluster and on a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux
 8, g++ 8.5), fenced, unfenced and mixed. Treat this as a preview: try it on
 your own systems before you rely on it.
 
-Contents: [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
+Contents: [Terms](#terms) · [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
 [Prepare a table](#prepare-a-table) · [Register, refresh, schedule](#register-refresh-schedule) ·
 [Search](#search) · [Index types and tuning](#index-types-and-tuning) ·
 [Freshness explained](#freshness-explained) · [Vector functions](#vector-functions) ·
 [Operations](#operations) · [Performance and results](#performance-and-results) ·
 [Restrictions](#restrictions-and-not-supported) · [Files](#files)
+
+## Terms
+
+The words this README uses, in plain language, each with what it gives and
+what it costs. The question most readers ask first comes first.
+
+### Exact (kNN) or approximate (ANN)?
+
+A **k-nearest-neighbour search (kNN)** returns the k vectors closest to a
+query. Strictly, kNN means the true k closest: the same answer you get by
+comparing the query with every vector. An **approximate nearest-neighbour
+search (ANN)** returns most of them, much faster, because it reads only a
+small part of the vectors.
+
+vvector does both. **With the defaults (an `hnsw` index at
+`precision='balanced'`) a search is approximate (ANN).** A search is exact
+(kNN) with a `flat` index, with `precision='exact'` or `exact=true` on any
+index, and with `vscan`. The function names do not tell you which: `vsearch`
+and `vknn` do both, depending on the index and the precision.
+
+The 10 nearest of 1,000,000 vectors of 128 dimensions (SIFT1M), one search
+(the test VM, 8 cores, time at the client, search function not fenced; see
+[Performance and results](#performance-and-results)):
+
+| Search | Exact? | Recall@10 | One search |
+|---|---|---:|---:|
+| Vertica's built-in full scan: `ORDER BY VECTOR_L2(vec, q) LIMIT 10` | exact | 1.0 | 7.7 s |
+| `flat` index (without sq8) | exact (kNN) | 1.0 | 5 ms |
+| `hnsw` index, `precision='exact'` or `exact=true` | exact (kNN) | 1.0 | reads every vector, like `flat` |
+| `hnsw` index, `precision='fast'` | approximate (ANN) | 0.89 | a little less than balanced |
+| `hnsw` index, `precision='balanced'` (the default) | approximate (ANN) | 0.98 | 1.9 ms |
+| `hnsw` index, `precision='best'` | approximate (ANN) | 0.999 | a little more than balanced |
+| `vscan` (no index), on the 4-node test cluster | exact (kNN) | 1.0 | 0.5 to 0.6 s |
+
+(Recall 1.0 means the same ids as the full scan; against the published
+ground truth of SIFT1M an exact search scores 0.999, because some vectors
+tie.)
+
+How each grows with the table, from 1M to 100M vectors of 128 dimensions on
+the 4-node test cluster: the built-in full scan from 14 to 20 s to 364 s,
+`vscan` from 0.5 s to 19 s, an exact search on a `flat` index from 32 ms to
+1.25 s: all three read every vector, so the time grows with the table. One
+HNSW search went from 6.6 ms to 7.6 ms. But its recall at the same setting
+falls with the size: at 100M `balanced` finds 0.90 and `best` 0.98, so a
+large index needs a larger `ef_search`.
+
+Which to use: exact when every answer must be the true one (an audit, a
+legal or financial rule, a test), for small tables (a `flat` search of
+100,000 vectors takes well under a millisecond in the engine), and as the
+reference when you measure recall. Approximate when speed and many queries
+count, and finding 98 of 100 true neighbours is enough (document retrieval,
+recommendations, "more like this").
+
+The word "exact" has two more meanings in vvector, and neither makes a
+search exact: `freshness='exact'` decides which rows are searched (also
+those written since the last refresh, see [Freshness](#terms-freshness)),
+and "exact scores" with sq8 means the returned scores are computed from the
+real vectors (see [sq8](#terms-sq8)).
+
+### The terms
+
+<a id="terms-vector"></a>**Vector.** A list of numbers that describes one
+thing: a document, a picture, a customer. It is stored in an `ARRAY[FLOAT]`
+column (`ARRAY[INT]` and `ARRAY[NUMERIC]` work too). Things that are similar
+get vectors that are close to each other. The number of elements is the
+*dimensions*; every vector of one index has the same number.
+
+<a id="terms-metric"></a>**Metric and score.** How "close" is measured,
+fixed per index: `l2` (the straight-line distance, Vertica's `VECTOR_L2`;
+smaller is closer), `cosine` (the angle, `COSINE_SIMILARITY`; larger is
+closer), `dot` (`DOT_PRODUCT`; larger is closer) or `l1` (the sum of the
+absolute differences; smaller is closer). The *score* of a result is the
+value the built-in function of the metric returns. Use the metric your
+embedding model was made for.
+
+<a id="terms-full-scan"></a>**Full scan.** Vertica's own way, without
+vvector: compute the distance to every row, sort, keep the first k.
+- Gives: exact results with nothing installed; it is the reference the
+  tests of vvector compare with.
+- Costs: the whole table is read and sorted for every query: 7.7 s at 1M
+  vectors on the test VM, 364 s at 100M on the 4-node test cluster.
+
+<a id="terms-knn"></a>**Exact search (kNN).** Returns the true k nearest:
+the same ids as the full scan (two vectors with the same score: the lower
+id first). In vvector: a `flat` index, `precision='exact'` or `exact=true`,
+`vscan`, and always the rows written since the last refresh.
+- Gives: always the right answer, which you can check against the built-in
+  functions.
+- Costs: every vector is read for every query, so the time grows in
+  proportion to the table. vvector reads fast (all cores, all nodes, SIMD
+  instructions: 5 ms for 1M vectors), but it cannot skip the reading: 1.25 s
+  for 100M on the 4-node test cluster.
+
+<a id="terms-ann"></a>**Approximate search (ANN).** Finds most of the true
+k nearest by reading a small part of the vectors: an HNSW search reads a
+few thousand vectors out of a million.
+- Gives: milliseconds, almost independent of the size of the table (one
+  search 6.6 ms at 1M and 7.6 ms at 100M on the 4-node test cluster).
+- Costs: it can miss some of the true neighbours and return the next
+  closest instead. How many it misses depends on your data, the size of the
+  index and the settings: measure it (recall). It needs an index that takes
+  memory and time to build.
+
+<a id="terms-recall"></a>**Recall@k.** The share of the true k nearest that
+a search returns, averaged over many queries, measured against an exact
+search. A recall@10 of 0.98 means 98 of 100 true neighbours were found;
+the 2 missed ones were replaced by vectors that are almost as close. An
+exact search has recall 1.
+
+<a id="terms-index"></a>**Index (snapshot).** vvector's copy of the vectors
+in a compact binary file. `refresh_index` builds it and stores it in the
+Vertica table `vvector.snapshot`; every node keeps it as a cache file and
+searches it from memory.
+- Gives: searches that do not read the table.
+- Costs: memory and disk on every node (`CALL vvector.sizing(...)` estimates
+  it), and a refresh to take in new rows (or `freshness='exact'`, below).
+
+<a id="terms-flat"></a>**`flat` index.** The vectors themselves, 4 bytes per
+number, searched by reading all of them. Exact.
+- Gives: exact answers, the smallest index, the fastest refresh (a full
+  refresh of 1M vectors 12 s against 47 s for HNSW), nothing to tune.
+- Costs: every search reads every vector: 5 ms for one search at 1M, 1.1 s
+  for 1000 queries in one statement (HNSW: 28 ms). Choose it for up to about
+  100,000 vectors, when every answer must be exact, or when refreshes must
+  be as fast as possible.
+
+<a id="terms-hnsw"></a>**`hnsw` index (the default).** A graph: every vector
+is linked to some of its nearest neighbours (HNSW, Malkov and Yashunin
+2018). A search starts at an entry point and walks along the links towards
+the query. Approximate.
+- Gives: 1.9 ms for one search at 1M, 1000 queries in 28 ms, and it stays
+  fast as the table grows.
+- Costs: approximate (recall@10 0.98 at `balanced` on SIFT1M, 0.90 at 100M);
+  the links take memory ((2m + 1) x 4 bytes per vector and more: with the
+  default m = 16 about a quarter more than 128 float numbers); a slower
+  build (a full refresh of 1M vectors 47 s, of 100M 3.6 hours); a vector
+  that no link leads to cannot be found by the walk (counted and reported as
+  `unreachable`, 0 in the tests).
+
+<a id="terms-precision"></a>**`precision` and `ef_search`.** How hard an HNSW
+search looks. `ef_search` is the length of the list of best candidates the
+walk keeps; `precision` is a preset of it: `fast` (2 x k, at least 32;
+recall 0.89 on SIFT1M), `balanced` (100; 0.98; the default), `best` (400;
+0.999), `exact` (no walk: every vector is read).
+- Gives: one setting for the trade between speed and recall, per query,
+  per session or per index.
+- Costs: more recall costs time, most visibly in large batches (1000
+  queries: 14 ms at `fast`, 28 ms at `balanced`). On a `flat` index without
+  sq8 it changes nothing: that is always exact.
+
+<a id="terms-sq8"></a>**sq8 (int8 quantisation), rescoring, oversampling.**
+Every number is also stored as one byte (a code from 0 to 255). A search
+first ranks the candidates by these bytes, then *rescores* the best
+k x *oversampling* of them with the real float vectors and returns the k
+best with their real scores.
+- Gives: faster batches (an HNSW index on SIFT1M: 48,900 to 72,600 queries
+  per second in the engine at the same recall 0.983); with
+  `memory_mode='compact'` a node keeps only the codes, ids and graph in
+  memory.
+- Costs: the codes come in addition to the floats (1M x 128 as HNSW: 631 MB
+  to 757 MB). The candidates are chosen by the bytes, so a `flat` index with
+  sq8 is no longer strictly exact below `precision='exact'` (recall 0.999).
+  At `precision='fast'` nothing is rescored and the scores are approximate
+  too. From 512 dimensions on it loses more recall; at 100M x 128 it was
+  slower than the float index.
+
+<a id="terms-vscan"></a>**`vscan`.** An exact search over any table or
+query result, with no index, spread over all nodes.
+- Gives: nothing to register, refresh or keep in memory; any SQL filter; it
+  always sees the committed rows.
+- Costs: every row is read for every statement: 0.5 to 0.6 s at 1M and 19 s
+  at 100M on the 4-node test cluster (the built-in full scan: 14 to 20 s and
+  364 s).
+
+<a id="terms-journal"></a>**Journal, refresh, delta.** The table is a
+journal: adding or changing a vector is an INSERT, deleting is an INSERT
+with a delete flag, and the newest row per id wins. `refresh_index` builds
+the index from the rows up to a *boundary*; the rows after it are the
+*delta*, returned by the view `<index>_delta`.
+- Gives: writers are never blocked by a refresh; a refresh after a few
+  changes adds only those and sends only the changed bytes to the nodes.
+- Costs: the table grows with every change (partition it by day so that old
+  rows can be dropped); a refresh takes time (above).
+
+<a id="terms-freshness"></a>**Freshness: `snapshot` or `exact`.** Which rows
+a search sees. This is not about exact or approximate neighbours: an HNSW
+search with `freshness='exact'` is still approximate over the index.
+- `snapshot` (the default) searches the index of the last refresh. Gives:
+  the fastest statement. Costs: changes since the refresh are not seen.
+- `exact`, over the `_delta` view, also applies the rows written since the
+  last refresh; those rows are always searched exactly. Gives: every
+  committed change is seen. Costs: the delta view is read (1.1 ms more per
+  statement with an empty delta on the test VM), more as the delta grows
+  until the next refresh.
+
+<a id="terms-range"></a>**Range search.** All vectors closer than a
+`radius`, at most k. On an HNSW index it is approximate like any HNSW
+search; add `exact=true` for a complete answer.
+
+<a id="terms-filtered"></a>**Filtered search.** Only the ids you allow (an
+allow-list, for example the documents of one customer). A small allow-list
+is searched exactly; a large one through the index with the other vectors
+skipped, which is approximate on HNSW.
+
+<a id="terms-fenced"></a>**Fenced, unfenced, mixed.** Where the functions
+run. Fenced: in a separate process. Gives: a fault cannot stop the node.
+Costs: about 6 ms per statement (7.1 ms instead of 1.9 ms for one HNSW
+search). Unfenced: inside the Vertica process, the fastest, but a fault
+stops the node. `mixed`: build and load fenced, search not fenced (see
+[Install](#install)).
+
+### Algorithms: the ones vvector uses and the others you will meet
+
+Vector databases and libraries combine a few families of algorithms: a
+*scan* (exact), an *index* that narrows the search (a graph, clusters, trees
+or hashes; approximate), and *compression* (quantisation) that makes each
+vector cheaper to read. vvector uses a scan, one graph (HNSW) and one
+compression (sq8). The others are listed so that you can compare vvector
+with the systems that use them; they are **not** in vvector.
+
+| Algorithm | Family | Exact? | In vvector | Where you meet it |
+|---|---|---|---|---|
+| Brute-force scan with top-k selection | scan | exact | yes: `flat`, `precision='exact'`, `vscan`, the journal rows | every system (often called "flat" or "exhaustive") |
+| HNSW (hierarchical navigable small world) | graph | approximate | yes: `hnsw`, the default | hnswlib, FAISS, USearch, pgvector, Milvus, most vector databases |
+| Scalar quantisation (int8, "SQ8") with rescoring | compression | approximate candidates | yes: `quantization='sq8'` | FAISS, Milvus, USearch, most vector databases |
+| IVF (inverted file: k-means clusters) | clusters | approximate | no | FAISS, Milvus, pgvector (`ivfflat`) |
+| Product quantisation (PQ), often with IVF (IVF-PQ) | compression | approximate | no | FAISS, Milvus |
+| Binary quantisation (1 bit per number) | compression | approximate | no (`vector_hamming` compares bit vectors) | several vector databases |
+| DiskANN (Vamana graph on SSD) | graph | approximate | no | Microsoft DiskANN, Milvus |
+| ScaNN (anisotropic quantisation) | clusters + compression | approximate | no | Google ScaNN |
+| Trees: KD-tree, random projection trees (Annoy) | trees | KD-tree exact, Annoy approximate | no | scikit-learn, Spotify's Annoy |
+| LSH (locality-sensitive hashing) | hashes | approximate | no | older systems, research |
+
+**In vvector.**
+
+- **Brute-force scan with top-k selection.** Compute the score of every
+  vector, keep the k best in a small heap. vvector reads the vectors in
+  blocks with SIMD instructions on all cores and nodes, and merges the
+  partial lists so that the result does not depend on the number of
+  threads. Gives: exact, simple, no build. Costs: time in proportion to the
+  number of vectors.
+- **HNSW** (Malkov and Yashunin, 2018). Every vector gets links to near
+  vectors on the lowest level; a few vectors also sit on higher levels with
+  longer links, like motorways above local roads. A search enters at the
+  top, moves greedily towards the query, goes down a level, and on the
+  lowest level keeps a list of the `ef_search` best candidates. vvector
+  builds it the way hnswlib does (m = 16, ef_construction = 200) and
+  reaches the same recall and speed (see
+  [Performance and results](#performance-and-results)). Gives: the best
+  known trade between speed and recall in memory, and inserts without a
+  rebuild. Costs: memory for the links, a slow build, recall that falls
+  slowly with the size of the index, and deletes that leave holes (vvector
+  marks them as tombstones and rebuilds when there are too many).
+- **Scalar quantisation (sq8) with rescoring.** Every number becomes one
+  byte in one range for the whole index; candidates are ranked by the bytes
+  and the best k x oversampling of them rescored with the floats. Gives: a
+  quarter of the bytes to read per candidate, integer arithmetic. Costs:
+  stored in addition to the floats in vvector; less recall from about 512
+  dimensions on unless more candidates are rescored.
+- **Cosine by normalisation.** For `cosine` the vectors are scaled to length
+  1 at the build; the search then computes a dot product, which is cheaper.
+
+**Not in vvector** (see [Restrictions](#restrictions-and-not-supported)).
+
+- **IVF (inverted file).** k-means divides the vectors into clusters
+  (`nlist`); a search looks only at the clusters closest to the query
+  (`nprobe`). Gives: little memory beyond the vectors, a fast build. Costs:
+  lower recall than HNSW at the same speed; the clusters are trained once and
+  fit worse as the data changes, so the index needs retraining.
+- **Product quantisation (PQ).** A vector is cut into pieces, and each piece
+  is replaced by the number of its nearest of 256 learned pieces (1 byte):
+  128 floats (512 bytes) become 16 to 64 bytes. Gives: very large indexes in
+  memory. Costs: training, approximate distances, and a lower recall unless
+  the candidates are rescored with the full vectors.
+- **Binary quantisation.** One bit per number (its sign), compared with the
+  Hamming distance: 32 times smaller than floats. Gives: very fast and small.
+  Costs: works well only for some embedding models, needs rescoring.
+- **DiskANN (Vamana).** A graph like HNSW, but one level, built to be read
+  from SSD with compressed vectors in memory. Gives: billions of vectors on
+  one machine. Costs: every hop may read the disk; updates are harder.
+- **ScaNN.** Clusters plus a quantisation tuned to keep the ranking of
+  dot-product scores right. Gives: high throughput for dot-product search.
+  Costs: training and many settings.
+- **Trees (KD-tree, Annoy).** Split the space by planes, again and again.
+  Gives: a KD-tree is exact and fast in few dimensions (up to about 20).
+  Costs: in the hundreds of dimensions of embeddings a KD-tree reads almost
+  everything; Annoy is approximate and its index cannot be updated, only
+  rebuilt.
+- **LSH (locality-sensitive hashing).** Random hash functions that give close
+  vectors the same hash with high probability. Gives: proven bounds, easy to
+  distribute. Costs: many hash tables for a good recall, a lot of memory;
+  graphs and IVF mostly replaced it.
+- **Beyond single dense vectors:** *sparse vectors* (most elements zero, as
+  in keyword-weight models), *several vectors per item* (one per sentence or
+  per token, as in ColBERT), *hybrid search* (keywords and vectors ranked
+  together, for example by reciprocal rank fusion) and *GPU* search. vvector
+  supports none of these; a SQL join or `UNION` of your own can combine a
+  vector search with other conditions.
+
+**Vector analytics in vvector.** Besides search, the vector functions do the
+arithmetic Vertica lacks: sum, difference, scaling, normalisation, the
+average of a group (a *centroid*: the "typical" vector of a customer or a
+topic), l1, squared l2, Hamming and Jaccard distance
+([Vector functions](#vector-functions)). The recipes in [Search](#search)
+use them for recommendation by centroids ("more like these, less like
+that"), the best match per group and near-duplicates.
 
 ## Why
 
@@ -43,10 +351,11 @@ full scan of the table:
 
 On 1,000,000 vectors of 128 dimensions that takes 7.7 seconds on the test
 machine. vvector answers the same query in 1.9 ms with an HNSW index (7.1 ms
-when the search function is fenced), or with exactly the same result in 5 ms
-with a flat index (12 ms fenced). The index is a snapshot of the vectors that
-is stored in Vertica, cached on every node, and kept exact by applying the
-rows written since the last refresh.
+when the search function is fenced), an approximate search that finds 98 of
+100 true neighbours on this data (recall@10 0.98), or with exactly the same
+result in 5 ms with a flat index (12 ms fenced). The index is a snapshot of
+the vectors that is stored in Vertica, cached on every node, and kept
+current: a query can also apply the rows written since the last refresh.
 
 ## Quick start
 
@@ -777,7 +1086,9 @@ With the `query` parameter (used for every row whose vector is NULL):
       1 | 0.980580687522888 |    2
       5 | 0.832050263881683 |    3
 
-Parameters: those of vsearch without `freshness` and `filtered`. `vknn` searches the
+Parameters: those of vsearch without `freshness` and `filtered`. Like vsearch, `vknn`
+is approximate on an HNSW index and exact on a flat index or with
+`precision='exact'`; the name does not make it exact. `vknn` searches the
 snapshot only: it does not apply the journal, and it does not check that the
 node's cache matches the active snapshot (it has no view input that carries
 the snapshot id). Right after a refresh a node may answer from the previous
@@ -1061,7 +1372,8 @@ nearest rows to one or more query vectors, with no index, no registration
 and no refresh. Use it for tables too large or too rarely searched for an
 index, for a filtered search where the filter is any SQL predicate, and as
 the exact reference for an index. It reads every row: a scan of 100 million
-vectors of 128 dimensions takes minutes, not milliseconds. On the 3-node Eon
+vectors of 128 dimensions takes seconds, not milliseconds (19 s on the 4-node
+test cluster). On the 3-node Eon
 test cluster (2 cores per node) a scan of 1M vectors of 128 dimensions takes
 0.6 to 0.7 s against 19 s for `ORDER BY VECTOR_L2(...) LIMIT 10`, and ten
 queries in one statement cost the same 0.6 s; an exact search on a flat
