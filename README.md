@@ -1,29 +1,46 @@
 # vertica-vector-db (vvector)
 
-Nearest-neighbour vector search inside Vertica, approximate (ANN) or exact
-(kNN). vvector is a C++ UDx library
-that keeps an index of the vectors stored in a Vertica table and answers "the
-k vectors closest to this one" from SQL. The index lives in Vertica, is loaded
-on every node, and every query can see the rows written since the last
-refresh.
+Vector search inside Vertica: find the vectors closest to a given vector,
+with one SQL function call.
 
-**Status: complete (2026-09-26). Milestones M1 to M7 are done and tested; no further work is planned. Issues and pull requests are welcome.** Two index
-types: `hnsw` (a graph index, approximate: ANN, the default) and `flat`
-(exact: kNN), each optionally with int8 codes (`sq8`) that make searches
-faster while the returned scores stay exact; any search can be made exact
-with `precision='exact'` (see [Terms](#terms)). Search works for the metrics
-l2, cosine, dot and l1, for one query or thousands in one statement, with or
-without the rows written since the last refresh, limited to a list of
-allowed ids (filtered search) or to a radius (range search). Vector
-functions add the arithmetic Vertica lacks (sum, difference, average,
-normalisation, l1, Hamming and Jaccard distance). A refresh adds only the changes since the
-last one to the index and rebuilds it in full only when that is needed. Exact
-results are tested to equal a full scan with Vertica's built-in functions;
-recall is measured on SIFT1M, also after 100 incremental refreshes. Tested on
-Vertica 26.2 on one node (aarch64, Rocky Linux 9, g++ 11.5), on a 3-node Eon
-cluster and on a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux
-8, g++ 8.5), fenced, unfenced and mixed. Treat this as a preview: try it on
-your own systems before you rely on it.
+vvector is an extension for Vertica (a C++ UDx library). It builds an index
+of the vectors stored in one of your tables, keeps that index inside
+Vertica, and loads it on every node. A search can also see the rows written
+after the index was built.
+
+**Status: complete (2026-09-26).** No further work is planned. Issues and
+pull requests are welcome. Treat it as a preview: test it on your own
+systems before you rely on it.
+
+What it does:
+
+- **Fast approximate search (ANN)** with an HNSW index, the default: the 10
+  nearest of 1 million vectors in 1.9 ms, finding 98 of every 100 true
+  neighbours.
+- **Exact search (kNN)**, the same answer as Vertica's own full scan: with a
+  flat index in 5 ms instead of 7.7 s; also with `precision='exact'` on any
+  index, or with `vscan` on any table, without an index.
+- **Four ways to measure distance:** l2 (straight line), cosine, dot product
+  and l1.
+- **One query or thousands** in one statement.
+- **Always up to date if you want:** a search can include the rows written
+  since the last refresh, and a refresh adds only the changes.
+- **Filtered search** (only the ids you allow) and **range search**
+  (everything closer than a given distance).
+- **Optional compression** of the vectors to one byte per number (sq8) for
+  faster searches.
+- **Vector functions** that Vertica lacks: sum, difference, average,
+  normalisation, l1, Hamming and Jaccard distance.
+
+How it was tested:
+
+- Exact results are compared with a full scan using Vertica's built-in
+  functions; the accuracy (recall) of the approximate search is measured on
+  the SIFT1M benchmark.
+- On Vertica 26.2: one node (aarch64, Rocky Linux 9), a 3-node Eon cluster
+  and a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux 8).
+
+New to vector search? Start with [Terms](#terms).
 
 Contents: [Terms](#terms) · [Why](#why) · [Quick start](#quick-start) · [Install](#install) ·
 [Prepare a table](#prepare-a-table) · [Register, refresh, schedule](#register-refresh-schedule) ·
@@ -55,7 +72,7 @@ The 10 nearest of 1,000,000 vectors of 128 dimensions (SIFT1M), one search
 (the test VM, 8 cores, time at the client, search function not fenced; see
 [Performance and results](#performance-and-results)):
 
-| Search | Exact? | Recall@10 | One search |
+| Search<br><sub>how the 10 nearest are found</sub> | Exact?<br><sub>always the true 10 nearest, or most of them</sub> | Recall@10<br><sub>share of the true 10 nearest found; 1.0 = all</sub> | One search<br><sub>time for one query, seen by the client</sub> |
 |---|---|---:|---:|
 | Vertica's built-in full scan: `ORDER BY VECTOR_L2(vec, q) LIMIT 10` | exact | 1.0 | 7.7 s |
 | `flat` index (without sq8) | exact (kNN) | 1.0 | 5 ms |
@@ -251,7 +268,7 @@ vector cheaper to read. vvector uses a scan, one graph (HNSW) and one
 compression (sq8). The others are listed so that you can compare vvector
 with the systems that use them; they are **not** in vvector.
 
-| Algorithm | Family | Exact? | In vvector | Where you meet it |
+| Algorithm<br><sub>the method</sub> | Family<br><sub>how it avoids reading everything</sub> | Exact?<br><sub>always the true nearest, or most of them</sub> | In vvector<br><sub>whether and where vvector uses it</sub> | Where you meet it<br><sub>well-known libraries and databases</sub> |
 |---|---|---|---|---|
 | Brute-force scan with top-k selection | scan | exact | yes: `flat`, `precision='exact'`, `vscan`, the journal rows | every system (often called "flat" or "exhaustive") |
 | HNSW (hierarchical navigable small world) | graph | approximate | yes: `hnsw`, the default | hnswlib, FAISS, USearch, pgvector, Milvus, most vector databases |
@@ -479,7 +496,7 @@ Rights:
   `vversion` and the vector functions (`GRANT vvector_search TO someone;
   ALTER USER someone DEFAULT ROLE vvector_search;`, or `SET ROLE
   vvector_search` in the session). `make deploy SEARCH=public` opens
-  searching to every user, as it was before milestone M6 (a role granted to
+  searching to every user, as in versions from before 2026-09-25 (a role granted to
   PUBLIC is not enabled for anyone in Vertica, so `GRANT vvector_search TO
   PUBLIC` does not do that). The procedure
   `sizing` is open to everyone. The role covers every index: a search needs
@@ -1904,13 +1921,13 @@ Use Vertica's own functions where they exist: `VECTOR_L2`,
   creates them again (Vertica cannot drop a single function with an ARRAY
   argument); searches running at that moment fail. The first refresh of every
   index after that upgrade is a full build (the digest is new).
-  Upgrading from a version before milestone M6, where `vvector.snapshot` was
+  Upgrading from a version from before 2026-09-25, where `vvector.snapshot` was
   `UNSEGMENTED ALL NODES`: `make deploy` copies its rows once into a segmented
   table of the same name (a table cannot be resegmented in place). Deploy when
   no refresh runs; the copy takes about as long as writing the stored
   snapshots once (2.3 GB: a few seconds on the test VM). The copy does not
   touch the caches on the nodes, which stay valid.
-  Upgrading from a version before milestone M6, where searching was open to
+  Upgrading from a version from before 2026-09-25, where searching was open to
   PUBLIC: `make deploy` moves the search functions to the role
   `vvector_search` and closes the manifest to PUBLIC. Grant the role to the
   users who search, or deploy with `make deploy SEARCH=public` to keep the
@@ -2032,10 +2049,10 @@ Warnings of `status` and `sizing` are explained in their text.
 ## Performance and results
 
 Measured on the test VM: Vertica 26.2.0-1, one node, aarch64, 8 cores, 34 GB,
-g++ 11.5 (milestone M4, 2026-09-24). Data: SIFT1M (1,000,000 vectors of 128
+g++ 11.5 (2026-09-24). Data: SIFT1M (1,000,000 vectors of 128
 dimensions, 10,000 queries with ground truth, TEXMEX corpus), metric l2,
 k = 10. HNSW with m = 16, ef_construction = 200. Three numbers, reported
-separately. Repeated at milestone M6 (the engine tests on SIFT1M and the
+separately. Repeated on 2026-09-25 (the engine tests on SIFT1M and the
 definition-of-done benchmark): the same within the noise.
 
 **Engine alone** (`make bench DATA_DIR=...`, no Vertica, all 10,000 queries):
@@ -2098,7 +2115,7 @@ On the 4-node Enterprise test cluster (x86_64 with AVX-512, 10 cores and 78 GB
 per node, Vertica 26.2.0-3, g++ 8.5; SIFT1M as above, loaded on all 4 nodes) a
 statement costs more, the engine is slower per core and hnswlib and vvector
 are equal there: `SELECT 1` 3.3 to 3.5 ms; HNSW `_snap` 13.8 ms fenced and 6.6
-ms mixed (milestone M6; 13.3 and 6.4 at M4), with sq8 14.4 and 6.1 ms; `vknn`
+ms mixed (13.3 and 6.4 ms in an earlier run), with sq8 14.4 and 6.1 ms; `vknn`
 14.2 and 6.0 ms; the first search of a new session 42 ms fenced and 13 ms
 mixed; an ARRAY literal instead of the `query` parameter costs 23 ms more
 there. One statement with
@@ -2106,8 +2123,8 @@ there. One statement with
 threads, ef_search 100: 35,400 queries/s (hnswlib 34,700), with sq8 59,600.
 Recall through SQL as on the VM. A full refresh of 1M x 128 HNSW takes 80 s
 (87 s with sq8), an incremental one of 900,000 vectors after 1000 adds and 500
-deletes 12.7 s at milestone M6, when every node loaded the whole snapshot,
-and 15 s (flat: 7 s) since M7, when only the changed bytes travel: at this
+deletes 12.7 s when every node still loaded the whole snapshot,
+and 15 s (flat: 7 s) now that only the changed bytes travel: at this
 size the fixed part of a refresh (4 to 5 s here) and the verification of the
 patched file weigh as much as the whole load did; the gain shows from 10M on
 (docs/design.md, "Incremental transfer"). A range
@@ -2116,7 +2133,7 @@ fenced and 7.1 ms mixed; filtered searches: see
 [Filtered search](#filtered-search).
 
 **10 million vectors** (the first 10M of BIGANN / SIFT1B, 128 dimensions, with
-its ground truth for 10M; the 4-node cluster, 1000 queries; milestone M6:
+its ground truth for 10M; the 4-node cluster, 1000 queries;
 fenced build in memory, cache files on a second data disk of each node
 through the index option `cache_dir`):
 
@@ -2124,15 +2141,15 @@ through the index option `cache_dir`):
 |---|---:|---:|---:|
 | snapshot, cache file per node | 4.8 GB | 6.2 GB | 7.4 GB |
 | full build (`refresh_index`; vbuild / vload) | 132 s (65 / 55) | 899 s (828 / 65) | 944 s (843 / 94) |
-| incremental refresh, 1000 adds and 500 deletes (milestone M6) | 99 s | 144 s | 157 s |
-| the same since milestone M7 (only the changed bytes travel; vbuild / vload) | 18.8 s (5.7 / 7.3) | 47.1 s (5.2 / 35.4) | 47.5 s (7.0 / 34.0) |
+| incremental refresh, 1000 adds and 500 deletes, when the whole snapshot was sent | 99 s | 144 s | 157 s |
+| the same now (only the changed bytes travel; vbuild / vload) | 18.8 s (5.7 / 7.3) | 47.1 s (5.2 / 35.4) | 47.5 s (7.0 / 34.0) |
 | recall@10 fast / balanced / best | 1.000 (exact) | 0.826 / 0.953 / 0.995 | 0.818 / 0.952 / 0.995 |
 | one search, fenced / mixed (client ms) | 92 / 87 ms | 14.4 / 7.0 ms | 15.1 / 6.3 ms |
 | 1000 queries in one statement, balanced, fenced / mixed | 17.7 / 17.6 s | 154 / 57 ms | 138 / 52 ms |
 
 At 10M a larger `ef_search` keeps the recall of 1M: 200 gives 0.983 (1000
-queries in 0.4 s). At milestone M6 the incremental refresh stored and loaded
-the whole snapshot on every node (that disk writes 100 MB/s); since M7 a
+queries in 0.4 s). Before, an incremental refresh stored and loaded
+the whole snapshot on every node (that disk writes 100 MB/s); now a
 refresh sends under 1 MB (flat) or 8 MB (HNSW) of changed bytes, and what
 remains of the HNSW time is the copy of the 6.7 GB base file on every node
 plus its verification (docs/design.md, "Incremental transfer").
@@ -2171,7 +2188,7 @@ data disk):
 |---|---:|---:|---:|
 | snapshot, cache file per node | 48 GB | 62 GB | 74 GB |
 | full build (`refresh_index`; vbuild / vload) | 1,628 s (1,162 / 109) | 12,872 s (12,056 / 178) | 13,641 s (12,586 / 260) |
-| incremental refresh, 1000 adds and 500 deletes: milestone M6 / since M7 | 1,156 s / 146 s | 1,739 s / 301 s | 2,766 s / 390 s |
+| incremental refresh, 1000 adds and 500 deletes: whole snapshot sent / only the changed bytes | 1,156 s / 146 s | 1,739 s / 301 s | 2,766 s / 390 s |
 | recall@10 fast / balanced / best | 1.000 (exact) | 0.748 / 0.903 / 0.981 | 0.741 / 0.903 / 0.981 |
 | one search, fenced / mixed (client ms) | 779 / 786 ms | 13.6 / 7.6 ms | 15.5 / 6.6 ms |
 | 1000 queries in one statement, balanced, fenced / mixed | 175 / 176 s | 822 / 452 ms | 1,143 / 918 ms |
@@ -2350,7 +2367,7 @@ Index and search:
   packed 64-bit words), not on sets of values.
 - `vknn` searches the snapshot only: no journal and no stale check (a node
   that missed a refresh answers from its old snapshot until `load_all`).
-- `register_index` creates an HNSW index by default since milestone M2 (it
+- `register_index` creates an HNSW index by default (since 2026-09-23; it
   was flat before). Existing indexes keep their type.
 - At most 4,294,967,295 vectors per index; one snapshot per index, cached
   whole on every node: an index larger than one node's memory works from disk,
@@ -2405,7 +2422,7 @@ Operations:
   index. When the room to grow of the layout is used up (5% of the vectors
   by default), or the patches since the last whole copy weigh more than the
   copy, one refresh sends the whole snapshot again, as a full build does.
-- The first refresh after an upgrade from a version before milestone M7
+- The first refresh after an upgrade from a version from before 2026-09-26
   sends the whole snapshot (the old layout has no room to grow).
 - Tombstones (the old positions of changed and deleted vectors) stay in the
   snapshot until the next full build: they take memory, and an HNSW search
