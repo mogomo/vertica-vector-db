@@ -37,10 +37,18 @@ How it was tested:
 - Exact results are compared with a full scan using Vertica's built-in
   functions; the accuracy (recall) of the approximate search is measured on
   the SIFT1M benchmark.
-- On Vertica 26.2: one node (aarch64, Rocky Linux 9), a 3-node Eon cluster
-  and a 4-node Enterprise cluster (x86_64, Red Hat Enterprise Linux 8); and
-  one node on Ubuntu 26.04 (x86_64: the engine tests, the search and vector
-  function tests, and every example of the [Reference](#reference)).
+- **Performance and the full test suite** ran on three Vertica 26.2 systems:
+  a single-node Enterprise-mode VM (aarch64, Rocky Linux 9, 8 cores), a
+  4-node Enterprise-mode cluster, and an Eon-mode cluster of 3 nodes plus a
+  secondary subcluster of 2 (x86_64, Red Hat Enterprise Linux 8). Every
+  measurement in this README ([Performance and results](#performance-and-results)
+  and the speeds quoted in the text) comes from these three.
+- **Functionality only** for the examples of the [Reference](#reference):
+  they ran on a fourth system, a single node on Ubuntu 26.04 (x86_64), and
+  the two that need a cluster on the Eon cluster. They show that the
+  statements work and what they return; the times and memory figures in
+  their output are from those small runs, not measurements. Nothing was
+  measured on Ubuntu.
 
 New to vector search? Start with [Terms](#terms).
 
@@ -424,9 +432,10 @@ floats, so scores agree to about 7 digits):
 
 ### Prerequisites
 
-- Vertica 26.x (tested: 26.2.0-1 single node, 26.2.0-2 Eon with 3 nodes,
-  26.2.0-3 Enterprise mode with 4 nodes, 26.2.0-3 single node on Ubuntu 26.04,
-  which Vertica does not list as a supported platform) with the C++ SDK in `/opt/vertica/sdk`
+- Vertica 26.x (tested: 26.2.0-1 single node, 26.2.0-2 Eon with 3 nodes and a secondary subcluster of 2,
+  26.2.0-3 Enterprise mode with 4 nodes; the examples of the Reference also on
+  26.2.0-3 single node on Ubuntu 26.04, which Vertica does not list as a
+  supported platform) with the C++ SDK in `/opt/vertica/sdk`
   (another place: `make SDK_HOME=...`).
 - g++ with C++17 (tested: 11.5 on aarch64, 8.5 and 15.2 on x86_64; with 15.2
   the Vertica SDK warns that it was not tested with GCC 14 and later) and GNU make, on a
@@ -568,8 +577,12 @@ entry has the same parts:
 2. **Syntax**: the exact form and every argument or parameter.
 3. **Two examples**: a use case, all the statements it needs, and the
    output. Every example was run on Vertica 26.2.0-3 (one node, Ubuntu,
-   x86_64); the two marked **Eon** ran on the 5-node Eon test cluster. Your
-   snapshot ids, times and memory figures will differ.
+   x86_64); the two marked **Eon** ran on the 5-node Eon test cluster. These
+   runs are functionality tests on small tables, not measurements: the
+   times they print (a refresh of 0.7 seconds, for example) say nothing about
+   speed at scale, and your snapshot ids, times and memory figures will
+   differ. The measurements, from the three test systems named at the top,
+   are in [Performance and results](#performance-and-results).
 
 | Group | Entries |
 |---|---|
@@ -3138,8 +3151,8 @@ estimates an index before you load it.
 
 - **Multi-node**: every refresh loads the snapshot on every node (`vload`
   through `vvector.probe`); every node answers from its own cache file.
-  Tested on one node, on a 3-node Eon cluster and on a 4-node Enterprise
-  cluster. A search runs on the node
+  Tested on one node, on an Eon cluster (3 nodes and a secondary subcluster
+  of 2) and on a 4-node Enterprise cluster. A search runs on the node
   that receives the statement; the index is not split over nodes.
 - **Eon subclusters**: a statement runs on the nodes of the subcluster its
   session is connected to, never on another. So every subcluster keeps node
