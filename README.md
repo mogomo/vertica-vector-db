@@ -45,10 +45,8 @@ How it was tested:
   and the speeds quoted in the text) comes from these three.
 - **Functionality only** for the examples of the [Reference](#reference):
   they ran on a fourth system, a single node on Ubuntu 26.04 (x86_64), and
-  the two that need a cluster on the Eon cluster. They show that the
-  statements work and what they return; the times and memory figures in
-  their output are from those small runs, not measurements. Nothing was
-  measured on Ubuntu.
+  the two that need a cluster on the Eon cluster. They show that every
+  statement works and what it returns, on small example tables.
 
 New to vector search? Start with [Terms](#terms).
 
@@ -578,11 +576,10 @@ entry has the same parts:
 3. **Two examples**: a use case, all the statements it needs, and the
    output. Every example was run on Vertica 26.2.0-3 (one node, Ubuntu,
    x86_64); the two marked **Eon** ran on the 5-node Eon test cluster. These
-   runs are functionality tests on small tables, not measurements: the
-   times they print (a refresh of 0.7 seconds, for example) say nothing about
-   speed at scale, and your snapshot ids, times and memory figures will
-   differ. The measurements, from the three test systems named at the top,
-   are in [Performance and results](#performance-and-results).
+   runs are functionality tests on small example tables: they show how each
+   statement works and what it returns. Your snapshot ids, times and memory
+   figures will differ. The measurements, from the three test systems named
+   at the top, are in [Performance and results](#performance-and-results).
 
 | Group | Entries |
 |---|---|
