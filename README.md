@@ -55,7 +55,7 @@ Contents: [Terms](#terms) · [Why](#why) · [Quick start](#quick-start) · [Inst
 [Search](#search) · [Index types and tuning](#index-types-and-tuning) ·
 [Freshness explained](#freshness-explained) · [Vector functions](#vector-functions) ·
 [Operations](#operations) · [Performance and results](#performance-and-results) ·
-[Restrictions](#restrictions-and-not-supported) · [Files](#files)
+[FAQ](#faq) · [Restrictions](#restrictions-and-not-supported) · [Files](#files)
 
 ## Terms
 
@@ -161,9 +161,11 @@ few thousand vectors out of a million.
 
 <a id="terms-recall"></a>**Recall@k.** The share of the true k nearest that
 a search returns, averaged over many queries, measured against an exact
-search. A recall@10 of 0.98 means 98 of 100 true neighbours were found;
-the 2 missed ones were replaced by vectors that are almost as close. An
-exact search has recall 1.
+search. The number after the @ is k, the number of neighbours asked for:
+recall@10 looks at the 10 results of each query. A recall@10 of 0.98 means
+that those 10 results hold on average 9.8 of the query's 10 true nearest
+neighbours (98 of 100 over ten queries); the missed ones are replaced by
+vectors that are almost as close. An exact search has recall 1.
 
 <a id="terms-index"></a>**Index (snapshot).** vvector's copy of the vectors
 in a compact binary file. `refresh_index` builds it and stores it in the
@@ -3742,6 +3744,129 @@ part of `make test`; `--help` lists the options. Examples:
 Loading alone: `scripts/load_dataset.sh` takes the same `--dir`, `--rows`,
 `--gt`, `--generate` and `--streams` options (parallel COPY streams, one per
 two cores by default).
+
+## FAQ
+
+Short answers; every figure comes from the measurements in
+[Performance and results](#performance-and-results) and every rule from the
+sections linked.
+
+**Unless I ask for exact, is the k-nearest-neighbour search really approximate (ANN)?**
+Yes. With the defaults (an HNSW index at `precision='balanced'`) the search is
+approximate: on SIFT1M it finds about 98 of every 100 true neighbours
+(recall@10 0.98) in 1.9 ms per search. The search is exact (true kNN) when you
+use a `flat` index, set `precision='exact'` (or `exact=true`) on any index, or
+use `vscan`, which needs no index. The function names do not tell you which
+kind runs; the index type and the precision setting decide it.
+`freshness='exact'` is something else: it decides which rows are searched, not
+how exactly (see [Terms](#terms)).
+
+**What does recall@10 = 0.98 mean, and why the 10?**
+The 10 is k, the number of neighbours asked for. For every query the 10
+returned ids are compared with the true 10 nearest (from an exact search);
+0.98 is the average share found, so 9.8 of 10 per query, or 98 of 100 over
+ten queries. Recall falls as an index grows at the same setting (0.90 at
+`balanced` on 100M vectors) and depends on your data: measure it with
+`precision='exact'` or `vscan` as the reference
+(see [Index types and tuning](#index-types-and-tuning)).
+
+**Does vvector change my table?**
+It adds no column and writes no row. The index lives in the table
+`vvector.snapshot` and in a cache file on every node. `register_index`
+creates two views in the schema of your table. On a cluster, an index with a
+version column may get a replicated projection of the journal
+(`<index>_journal_rep`, automatic up to 2048 MB); `set_journal_replica(name,
+'off')` removes it (see [set_journal_replica](#set_journal_replica)).
+
+**I inserted rows and the search does not find them. Why?**
+The default `freshness='snapshot'` searches the last refresh only. Search
+over the `_delta` view with `freshness='exact'` to see every committed row at
+once, or refresh. A refresh takes in the rows up to its boundary, which lies
+`margin` seconds (default 60) behind the refresh; the newer rows stay in the
+delta until the next one (see [Freshness explained](#freshness-explained)).
+
+**How do I change or delete a vector?**
+Insert a new row with the same id (a change) or a row with the delete flag
+set (a delete): the row with the latest version wins. A physical `UPDATE` or
+`DELETE` is allowed too, but becomes visible at the next refresh, which
+notices it and rebuilds in full (see [Prepare a table](#prepare-a-table)).
+
+**Are the scores the same as Vertica's built-in functions return?**
+The score is what `VECTOR_L2`, `COSINE_SIMILARITY` or `DOT_PRODUCT` returns
+for the metric (Manhattan distance for l1). vvector computes in 32-bit
+floats, so the scores agree with the FLOAT built-ins to about 7 digits. Rank
+1 is the best; equal scores are ranked by id.
+
+**Do the results depend on the number of threads, the node or the batch size?**
+No. Results never depend on the threads, the batch size, the CPU or the
+order of the input rows; the tests enforce it (see [Search functions](#search-functions)).
+
+**How much memory does an index need?**
+The index must stay in the page cache of every node. A `flat` index holds 4
+bytes per number (the vector length padded to a multiple of 16) plus 8 bytes
+per id; HNSW adds the links, about a quarter more at 128 dimensions with
+m = 16; sq8 adds one byte per number. For SIFT1M (1M x 128): 496 MB flat,
+631 MB HNSW, 757 MB HNSW with sq8. `CALL vvector.sizing(vectors, dims,
+index_type, quantization)` estimates it before you load (see [sizing](#sizing)).
+
+**How long does a refresh take?**
+On the test VM with 1M vectors of 128 dimensions: a full build 12 s for
+`flat` and 47 s for HNSW (80 s on the 4-node cluster); an incremental
+refresh after 1000 adds and 500 deletes 4.9 s (flat) and 6.8 s (HNSW); a
+refresh with nothing changed 1.0 s. A full HNSW build of 100M vectors took
+3.6 hours (see [refresh_index](#refresh_index)).
+
+**vknn or vsearch?**
+For one search they cost about the same (1.5 ms `vknn`, 1.8 ms `vsearch`,
+unfenced, 1M vectors). For many queries in one statement `vsearch` is much
+faster (1000 queries in 28 ms against 149 ms). `vsearch` also applies the
+journal, checks that the node's cache is current and takes allow-lists;
+`vknn` returns the neighbours beside the columns of each row, without a view
+(see [vsearch](#vsearch), [vknn](#vknn)).
+
+**Why does every statement cost about 6 ms more than the search itself?**
+Because the functions run fenced by default, in a separate process: a fault
+cannot stop the node, but each statement pays about 6 ms (7.1 ms instead of
+1.9 ms for one HNSW search on the test VM). `make deploy FENCED=mixed` runs
+the search functions inside Vertica and keeps build and load fenced (see
+[make deploy](#make-deploy)).
+
+**Does it work on a multi-node cluster and in Eon mode?**
+Yes. A refresh stores the snapshot in Vertica and loads it into the cache of
+every node; the search runs on the node that receives the statement. In Eon
+a refresh loads the nodes of its own subcluster; every other subcluster runs
+`CALL vvector.load_all()` from a session there (see [Operations](#operations)).
+
+**What does "snapshot cache stale on <node>: run vload" mean?**
+That node's cache is older than the active snapshot (it was down during the
+refresh, or its cache directory was cleaned). `CALL vvector.load_all('<index>')`
+loads it; nothing is lost, the snapshot is stored in Vertica
+(see [load_all](#load_all)).
+
+**Can I search only the vectors of one customer, language or category?**
+Yes, three ways: send the allowed ids as allow-list rows beside the query
+(exact for small lists, see [Filtered search](#filtered-search)); use `vscan`
+with any SQL predicate, without an index; or search with a larger k and join
+the results to your tables. vvector cannot read a filter column itself.
+
+**Which array types and sizes are supported?**
+`ARRAY[FLOAT]`, `ARRAY[INT]` and `ARRAY[NUMERIC]`, stored as 32-bit floats.
+Every vector of an index has the same number of elements, at most 32768;
+above 8125 elements the column needs an explicit bound (`ARRAY[FLOAT, 16384]`)
+and is untested. NULL elements, NaN and Infinity are refused. Ids are INT
+and unique per index (see [Restrictions](#restrictions-and-not-supported)).
+
+**Can I change the metric or the index type later?**
+The metric is fixed at registration: unregister and register again. The
+index type, `m`, `ef_construction` and `quantization` are changed with
+`set_index_options`; the next refresh then builds in full
+(see [set_index_options](#set_index_options)).
+
+**Can an HNSW search miss a vector for good?**
+A vector that no link leads to cannot be reached by the graph walk. The build
+counts such vectors and `status` reports them (`unreachable`; 0 in every
+test); a full refresh builds a new graph
+(see [Unreachable vectors](#unreachable-vectors)).
 
 ## Restrictions and not supported
 
