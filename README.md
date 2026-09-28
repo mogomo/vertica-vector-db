@@ -589,6 +589,7 @@ entry has the same parts:
 | [Inspect](#inspect) | [vinfo](#vinfo) · [vversion](#vversion) |
 | [Vector functions](#vector-functions) | [vector_add](#vector_add) · [vector_sub](#vector_sub) · [vector_mul](#vector_mul) · [scalar_vector_mul](#scalar_vector_mul) · [vector_normalize](#vector_normalize) · [vector_l1](#vector_l1) · [vector_l2sq](#vector_l2sq) · [vector_hamming](#vector_hamming) · [vector_jaccard](#vector_jaccard) · [vector_sum](#vector_sum) · [vector_avg](#vector_avg) |
 | [Build and load by hand](#build-and-load-by-hand) | [vnode](#vnode) · [vconfig](#vconfig) · [vbuild](#vbuild) · [vload](#vload) |
+| Shell scripts | [Scripts](#scripts): `register.sh` and `refresh.sh` run the procedures of this reference from the shell; `demo.sh`, `benchmark.sh`, `latency.sh`, `load_dataset.sh` and `scale.sh` are described in [Performance and results](#performance-and-results) |
 
 The procedures that are not listed (`register_index_core`, `refresh_index_core`,
 `refresh_index_run`, `set_index_options_core`, `load_all_core`, `load_on_nodes`,
@@ -710,6 +711,7 @@ and `vvector_admin`, the tables, the roles, the functions and the procedures
 
     make [SDK_HOME=/opt/vertica/sdk]
     make test [DATA_DIR=<directory with SIFT1M>]
+    make bench [DATA_DIR=<directory with SIFT1M>] [HNSWLIB_DIR=<a clone of hnswlib>]
     make deploy [FENCED=yes|no|mixed] [SEARCH=role|public]
     make undeploy
 
@@ -718,10 +720,14 @@ and `vvector_admin`, the tables, the roles, the functions and the procedures
 | FENCED | yes, no, mixed | yes | where the functions run: `yes` every function in a fenced process (a fault cannot stop the node; about 6 ms more per statement); `no` every function inside the Vertica process; `mixed` build and load fenced, search inside the process |
 | SEARCH | role, public | role | who may search: the role `vvector_search`, or every user |
 | SDK_HOME | a directory | /opt/vertica/sdk | the Vertica SDK |
-| DATA_DIR | a directory | none | `make test` also runs the SIFT1M recall test |
+| DATA_DIR | a directory | none | `make test` also runs the SIFT1M recall test, `make bench` the SIFT1M benchmarks of the engine |
+| HNSWLIB_DIR | a directory | none | `make bench` also runs the same benchmark with hnswlib, for comparison |
 
 The connection comes from the environment: `VSQL_HOST`, `VSQL_PORT`,
-`VSQL_USER`, `VSQL_PASSWORD`, `VSQL_DATABASE`.
+`VSQL_USER`, `VSQL_PASSWORD`, `VSQL_DATABASE`. `make deploy` and
+`make undeploy` run `scripts/deploy.sh` (`--fenced=`, `--search=`,
+`--undeploy`); with `--echo_only` the script prints the command it would
+run instead of running it.
 
 **Example 1: install on a new database.** Build, run the engine tests, and
 install with the defaults (fenced, search through the role). The last lines
@@ -1234,7 +1240,10 @@ instead of on every node.
 - **When you need it:** on a cluster, for searches with
   `freshness='exact'`: without the replica a statement over the `_delta`
   view costs 15 to 17 ms more on the 3-node test cluster. `register_index`
-  and every refresh apply the mode, so you call this only to change it.
+  and every refresh apply the mode, so you call this only to change it:
+  `off` before bulk loads into the journal (the replica makes them about
+  2.5 times slower), `on` for a journal above the `auto` limit when the disk
+  allows it, `auto` to let vvector decide again.
 - **Limits:** the replica is a full copy of the journal on every node and
   makes bulk loads into the journal about 2.5 times slower. `auto` makes it
   on more than one node when one copy of the journal is at most 2048 MB and
@@ -1246,8 +1255,11 @@ instead of on every node.
 
     CALL vvector.set_journal_replica(index_name, mode);   -- mode: auto | on | off
 
-**Example 1: on one node.** A replica gains nothing on one node; `on`
-creates it anyway and says so:
+**Example 1: make the replica where `auto` would not.** `auto` makes no
+replica for a journal above its limit (2048 MB, or 10% of the smallest free
+disk); its note then says that `on` makes it anyway. `on` creates the
+projection whatever the size, and every refresh keeps it. Here on one node,
+where `auto` makes none either; the note says what the copy is worth:
 
     CALL vvector.set_journal_replica('articles', 'on');
 
@@ -1348,6 +1360,23 @@ Each problem is a WARNING with the recommended fix.
 **Syntax**
 
     CALL vvector.status(index_name);
+
+Every line of the output is a NOTICE; a problem is a WARNING that names the
+fix. A running refresh, open transactions that write to the table, and a
+node that lacks the active snapshot (with the `load_all` to run) are
+reported as notices. The warnings:
+
+| Check | Warns when | Recommended fix |
+|---|---|---|
+| tombstones | they exceed `tombstone_ratio` and `refresh_mode` is `incremental`, which never rebuilds by itself | `refresh_index(name, 'full')` when the node is quiet |
+| the delta | reading it takes more than 500 ms | partition the journal by the date of its version column |
+| the delta | it holds more than 100,000 rows | refresh more often |
+| versions | rows have a version more than 5 minutes in the future | fill the version column by its default, never from the application |
+| memory | the index takes more than half of the memory of the smallest node, or all indexes together more than 70% of it | `quantization='sq8'` with `memory_mode='compact'`, fewer indexes, or larger nodes |
+| build memory | a refresh needs more than `FencedUDxMemoryLimitMB`, or more than the node has free or in the page cache | raise `FencedUDxMemoryLimitMB`; refresh when the node is quiet |
+| threads | `threads_default` exceeds the cores of the smallest node | set it to 0 (one per core) or lower |
+
+Both examples below are healthy: no WARNING.
 
 **Example 1: a journal index with a row in the delta.**
 
@@ -1476,6 +1505,10 @@ snapshots and its manifest row. The source table is not touched.
 On every node:
 
     rm -rf /tmp/vvector/products
+
+To search the same table with another metric, unregister the index, remove
+its cache files as above, and register the table again with the new metric;
+the first refresh builds it anew.
 
 **Example 2: an index with a schedule.** The ETL account (`vvector_admin`,
 no superuser) cannot remove it; a superuser can:
@@ -1716,7 +1749,8 @@ closest to a travel question, without an index; the filter is a join:
       9 | Databases on the road  | 0.382157862186432
 
 **Example 2: several queries in one statement.** Two queries on the product
-table; `ROW_NUMBER()` keeps the two best per query:
+table, as they would run on a table without any index; `ROW_NUMBER()` keeps
+the two best per query:
 
     SELECT r.qid, r.rank, p.name, r.score
     FROM (SELECT qid, id, score, ROW_NUMBER() OVER(PARTITION BY qid ORDER BY score, id) AS rank
@@ -2064,6 +2098,10 @@ A vector divided by its length, so its length is 1.
        unit    | length
     -----------+--------
      [0.6,0.8] |      1
+
+For a `dot` index, store the unit vector instead of the vector
+(`INSERT INTO ... SELECT id, vvector.vector_normalize(vec) ...`): the dot
+product of two unit vectors is their cosine similarity.
 
 **Example 2: compare the usage mix of customers, not their volume.** acme
 mostly queries, globex mostly loads, whatever the counts:
