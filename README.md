@@ -577,9 +577,12 @@ entry has the same parts:
    output. Every example was run on Vertica 26.2.0-3 (one node, Ubuntu,
    x86_64); the two marked **Eon** ran on the 5-node Eon test cluster. These
    runs are functionality tests on small example tables: they show how each
-   statement works and what it returns. Your snapshot ids, times and memory
-   figures will differ. The measurements, from the three test systems named
-   at the top, are in [Performance and results](#performance-and-results).
+   statement works and what it returns. Every example also ran on the Eon
+   cluster (3 + 2 nodes, Vertica 26.2.0-2, AVX-512 against AVX2 on the PC):
+   the same ids, scores and ranks; only the snapshot ids, times, node lists
+   and replica notes differ. Your snapshot ids, times and memory figures
+   will differ too. The measurements, from the three test systems named at
+   the top, are in [Performance and results](#performance-and-results).
 
 | Group | Entries |
 |---|---|
