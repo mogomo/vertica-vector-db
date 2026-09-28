@@ -28,7 +28,11 @@
 #   into the snapshot; a first refresh with no row up to the boundary stops with a message that says
 #   so; a physical DELETE of such a row before the next refresh never reaches the snapshot; a
 #   physical UPDATE of one is built with its new vector; neither needs a full build;
-# - a refresh whose build estimate exceeds half of the free memory builds in a file (build_in).
+# - the resource check before a build (index option resource_check): strict stops a refresh whose
+#   snapshot cannot fit the smallest node's memory or a node's cache disk, with the figures, and
+#   leaves no refresh mark; warn runs it and records the findings in refresh_note; off checks
+#   nothing; a bad value is refused; a refresh whose build estimate exceeds half of the free memory
+#   builds in a file (build_in).
 # With --sift=SCHEMA (sift_base and sift_query of scripts/load_dataset.sh in that schema) also the
 # acceptance test of milestone M3: an HNSW index on 900,000 SIFT1M vectors, then 100 refreshes of
 # 1000 adds and 500 deletes each, tombstone_ratio 0.03 (a full build must fire on the way); at the
@@ -337,12 +341,38 @@ expect "the tiny index: manifest counts and status" "^vector_count 5, tombstones
 SELECT 'vector_count ' || vector_count || ', tombstones ' || tombstones || ', note: ' || LEFT(refresh_note, 9) FROM vvector.manifest WHERE index_name = 'vi_tiny';"
 expect "status of the tiny index" "5 live vectors, 1 tombstones" "CALL vvector.status('vi_tiny');"
 
-echo "== a build larger than half of the free memory is made in a file"
+echo "== the resource check before a build (resource_check), and a build larger than half of the free memory"
 change_round
-expect "the refresh builds in a file (index_bytes set by hand to 4 PB) and says so" "index vih_l2 $INCR .*; built in a file: the build needs about" "
+OPTS16="NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL"
+expect "strict (the default): a snapshot that cannot fit (index_bytes set by hand to 4 PB) stops the refresh before the build, with the figures" \
+    "index vih_l2: not started, the resource check found: the snapshot needs about [0-9]* MB and the smallest node has [0-9]* MB of memory, so no node can keep it in the page cache" "
 UPDATE vvector.manifest SET index_bytes = 4000000000000000 WHERE index_name = 'vih_l2'; COMMIT;
 CALL vvector.refresh_index('vih_l2');"
+expect "... the node whose cache disk is too small is named, with the build file counted on the initiator" \
+    "node v_[a-z0-9_]* has [0-9]* MB free under the default cache directory and the new cache file needs about [0-9]* MB together with the build file" "
+CALL vvector.refresh_index('vih_l2');"
+expect "... and the stopped refresh leaves no mark" "^mark: none, snapshot unchanged$" "
+SELECT 'mark: ' || COALESCE(refresh_started_at::VARCHAR, 'none') || ', snapshot ' || CASE WHEN index_bytes = 4000000000000000 THEN 'unchanged' ELSE 'changed' END
+FROM vvector.manifest WHERE index_name = 'vih_l2';"
+expect "a bad value is refused" "resource_check must be strict, warn or off" "
+CALL vvector.set_index_options('vih_l2', $OPTS16, 'always');"
+expect "warn: the refresh runs, builds in a file (the estimate exceeds half of the free memory), and the note records the findings" \
+    "index vih_l2 $INCR .*; built in a file: the build needs about .*; resource check (warn): the snapshot needs about [0-9]* MB" "
+CALL vvector.set_index_options('vih_l2', $OPTS16, 'warn');
+CALL vvector.refresh_index('vih_l2');"
 built_equals_live "vih_l2 after the build in a file" vih_l2
+change_round
+expect "off: the refresh runs (a build, so the manifest gets the real index_bytes back) and nothing is checked" "^refreshed, no check note$" "
+UPDATE vvector.manifest SET index_bytes = 4000000000000000 WHERE index_name = 'vih_l2'; COMMIT;
+CALL vvector.set_index_options('vih_l2', $OPTS16, 'off');
+CALL vvector.refresh_index('vih_l2');
+SELECT CASE WHEN refresh_note LIKE 'refreshed%' AND refresh_note NOT LIKE '%resource check%' THEN 'refreshed, no check note' ELSE refresh_note END
+FROM vvector.manifest WHERE index_name = 'vih_l2';"
+expect "back to strict: the real figures pass, the refresh runs" "index vih_l2 refreshed: snapshot [0-9]*" "
+CALL vvector.set_index_options('vih_l2', $OPTS16, 'strict');
+CALL vvector.refresh_index('vih_l2');"
+expect "status prints the cache disk of the smallest node and the check mode" "cache disk: [0-9]* MB free on node v_[a-z0-9_]* under the default cache directory; resource_check strict" "
+CALL vvector.status('vih_l2');"
 
 echo "== rows after the boundary: served by the delta, never built before they are below it"
 # INT versions: the boundary is the highest version minus the margin (10), so a new row with a

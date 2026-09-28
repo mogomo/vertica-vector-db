@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/ioctl.h>
@@ -172,6 +173,43 @@ std::vector<std::string> list_cached_indexes(const std::string &cache_dir)
     closedir(d);
     std::sort(indexes.begin(), indexes.end());
     return indexes;
+}
+
+// One number after a label in a /proc text ("MemAvailable:   123 kB" -> 123), or -1.
+static std::int64_t number_after(const std::string &text, const char *label)
+{
+    const std::size_t at = text.find(label);
+    if (at == std::string::npos) return -1;
+    long long v = 0;
+    return std::sscanf(text.c_str() + at + std::strlen(label), " %lld", &v) == 1 ? v : -1;
+}
+
+NodeFacts node_facts(const std::string &cache_dir, const std::string &index)
+{
+    NodeFacts f;
+    std::string path = index.empty() ? cache_dir : cache_dir + "/" + index;
+    struct statvfs vs;
+    for (;;) {
+        if (::statvfs(path.c_str(), &vs) == 0) {
+            f.cache_free_bytes = static_cast<std::int64_t>(vs.f_bavail) * static_cast<std::int64_t>(vs.f_frsize);
+            break;
+        }
+        if (path.size() <= 1) break;
+        const std::size_t slash = path.find_last_of('/');
+        path = slash == std::string::npos || slash == 0 ? "/" : path.substr(0, slash);
+    }
+    std::string text;
+    if (read_small_file("/proc/meminfo", text)) {
+        const std::int64_t kb = number_after(text, "MemAvailable:");
+        if (kb >= 0) f.mem_available_bytes = kb * 1024;
+    }
+    if (read_small_file("/sys/kernel/mm/transparent_hugepage/enabled", text)) {
+        const std::size_t open = text.find('['), close = text.find(']');
+        if (open != std::string::npos && close != std::string::npos && close > open) f.hugepages = text.substr(open + 1, close - open - 1);
+    }
+    if (read_small_file("/proc/sys/vm/swappiness", text)) f.swappiness = number_after(text, "");
+    if (read_small_file("/proc/sys/vm/max_map_count", text)) f.max_map_count = number_after(text, "");
+    return f;
 }
 
 bool valid_cache_dir(const std::string &dir)

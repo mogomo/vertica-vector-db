@@ -565,6 +565,16 @@ shards; Vertica 26.2.0-2):
   one bit per position for the tombstones, and up to 2 bytes per position per
   insert thread for the visited marks. The base is the mapped cache file (page
   cache, shared).
+- The resource check (2026-09-28): before the build, `refresh_index` compares
+  the estimates above with the live figures (`v_monitor.host_resources`, the
+  catalog, and the free disk under the cache directory of every node, read by
+  `vinfo` on the node) and stops when the build exceeds `FencedUDxMemoryLimitMB`
+  in a fenced `vbuild`, the snapshot exceeds the memory of the smallest node,
+  or a node's cache disk cannot hold the new file (plus the build file on the
+  refreshing node when the build is made in a file). The index option
+  `resource_check` (strict, warn, off) chooses between stopping, recording the
+  findings in `refresh_note`, and no check. Nothing is stored: the figures are
+  read at call time.
 - The snapshot and every cache file: 256 bytes plus `4 x row_stride + 8` bytes
   per vector, plus the graph: about 141 bytes per vector with m = 16 (codes
   from M4).

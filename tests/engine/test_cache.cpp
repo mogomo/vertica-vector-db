@@ -402,6 +402,20 @@ int main()
         CHECK(throws([&] { MappedSnapshot x; x.open_active(dir, "q"); }, ("no snapshot cache for index 'q' in " + dir + "/nowhere").c_str()));
     }
 
+    {
+        // Node facts: the free disk under the cache directory, also for an index directory that does
+        // not exist yet (its parent's disk), and the kernel figures (present on Linux, -1 elsewhere).
+        const NodeFacts here = node_facts(dir, "");
+        const NodeFacts unmade = node_facts(dir, "not_made_yet");
+        const NodeFacts nowhere = node_facts("/no/such/dir/anywhere", "x");
+        CHECK(here.cache_free_bytes >= 0 && unmade.cache_free_bytes >= 0 && nowhere.cache_free_bytes >= 0);
+        CHECK(std::llabs(here.cache_free_bytes - unmade.cache_free_bytes) < (1ll << 30));
+        CHECK(here.mem_available_bytes == -1 || here.mem_available_bytes > 0);
+        CHECK(here.swappiness == -1 || (here.swappiness >= 0 && here.swappiness <= 200));
+        CHECK(here.max_map_count == -1 || here.max_map_count > 0);
+        CHECK(here.hugepages.empty() || here.hugepages == "always" || here.hugepages == "madvise" || here.hugepages == "never");
+    }
+
     std::system(("rm -rf " + dir).c_str());
     return finish("test_cache");
 }

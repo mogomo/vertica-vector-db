@@ -3,7 +3,8 @@
 --   vvector.register_index(index_name, source_table, id_col, vec_col, op_col, ver_col, metric, margin [, index_type])
 --   vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
 --                             tombstone_ratio, rebuild_every, memory_mode, precision_default,
---                             freshness_default, ef_search_default, threads_default [, verify_every [, cache_dir [, reachability]]])
+--                             freshness_default, ef_search_default, threads_default
+--                             [, verify_every [, cache_dir [, reachability [, resource_check]]]])
 --   vvector.refresh_index(index_name [, mode])
 --   vvector.set_journal_replica(index_name, auto | on | off)
 --   vvector.load_all(index_name)
@@ -442,16 +443,23 @@ $$;
 -- x_reach (reachability, argument 16): whether an HNSW build counts the live vectors that no search
 -- can reach (auto: every full build, and incremental builds below 8M positions; on: every build;
 -- off: never). Applies at the next refresh; vinfo and the manifest report the count.
+-- x_check (resource_check, argument 17): what a refresh does when the build cannot fit (more than
+-- FencedUDxMemoryLimitMB in a fenced vbuild, a snapshot larger than the memory of the smallest
+-- node, a node with less free disk under the cache directory than the new file needs): strict (the
+-- default) stops before the build with the figures, warn runs it and records them in refresh_note,
+-- off skips the check.
 -- set_index_options_core does the work; every form prints the NOTICE (NOTICEs of a nested CALL do not
 -- reach the caller).
 DROP PROCEDURE IF EXISTS vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR,
                                                         VARCHAR, VARCHAR, INT, INT, INT);
 DROP PROCEDURE IF EXISTS vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR,
                                                         VARCHAR, VARCHAR, INT, INT, INT, VARCHAR);
+DROP PROCEDURE IF EXISTS vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR,
+                                                        VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR);
 CREATE OR REPLACE PROCEDURE vvector.set_index_options_core(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                            x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                            x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
-                                                           x_cache VARCHAR, x_reach VARCHAR)
+                                                           x_cache VARCHAR, x_reach VARCHAR, x_check VARCHAR)
 LANGUAGE PLvSQL AS $$
 DECLARE
     old_home VARCHAR(1024); new_home VARCHAR(1024); sid INT;
@@ -505,6 +513,9 @@ BEGIN
     IF x_reach IS NOT NULL AND x_reach NOT IN ('auto', 'on', 'off') THEN
         RAISE EXCEPTION 'vvector.set_index_options: reachability must be auto, on or off';
     END IF;
+    IF x_check IS NOT NULL AND x_check NOT IN ('strict', 'warn', 'off') THEN
+        RAISE EXCEPTION 'vvector.set_index_options: resource_check must be strict, warn or off';
+    END IF;
     old_home := (SELECT MAX(cache_dir) FROM vvector.manifest WHERE index_name = nm);
     new_home := old_home;
     IF x_cache IS NOT NULL THEN
@@ -530,7 +541,8 @@ BEGIN
         threads_default = CASE WHEN x_thr IS NULL THEN threads_default WHEN x_thr = 0 THEN NULL ELSE x_thr END,
         verify_every = COALESCE(x_verify, verify_every),
         cache_dir = new_home,
-        reachability = COALESCE(x_reach, reachability, 'auto')
+        reachability = COALESCE(x_reach, reachability, 'auto'),
+        resource_check = COALESCE(x_check, resource_check, 'strict')
         WHERE index_name = nm;
     sid := (SELECT MAX(active_snapshot) FROM vvector.manifest WHERE index_name = nm);
     IF COALESCE(new_home, '') <> COALESCE(old_home, '') AND sid IS NOT NULL THEN
@@ -550,16 +562,29 @@ $$;
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
-                                                      x_cache VARCHAR, x_reach VARCHAR)
+                                                      x_cache VARCHAR, x_reach VARCHAR, x_check VARCHAR)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, x_reach);
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, x_reach, x_check);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
--- The 15-argument form: reachability stays as it is.
+-- The 16-argument form: resource_check stays as it is.
+CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
+                                                      x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
+                                                      x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
+                                                      x_cache VARCHAR, x_reach VARCHAR)
+LANGUAGE PLvSQL AS $$
+BEGIN
+    PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, x_reach, NULL);
+    RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
+END;
+$$;
+
+-- The 15-argument form: reachability and resource_check stay as they are.
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT,
@@ -567,31 +592,31 @@ CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, NULL);
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, x_cache, NULL, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
--- The 14-argument form: cache_dir and reachability stay as they are.
+-- The 14-argument form: cache_dir, reachability and resource_check stay as they are.
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT, x_verify INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, x_verify, NULL, NULL);
+                                                x_prec, x_fresh, x_ef, x_thr, x_verify, NULL, NULL, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
 
--- The 13-argument form of the first releases: verify_every, cache_dir and reachability stay as they are.
+-- The 13-argument form of the first releases: verify_every, cache_dir, reachability and resource_check stay as they are.
 CREATE OR REPLACE PROCEDURE vvector.set_index_options(nm VARCHAR, x_type VARCHAR, x_m INT, x_efc INT, x_quant VARCHAR,
                                                       x_refresh VARCHAR, x_ratio FLOAT, x_rebuild INT, x_memory VARCHAR,
                                                       x_prec VARCHAR, x_fresh VARCHAR, x_ef INT, x_thr INT)
 LANGUAGE PLvSQL AS $$
 BEGIN
     PERFORM CALL vvector.set_index_options_core(nm, x_type, x_m, x_efc, x_quant, x_refresh, x_ratio, x_rebuild, x_memory,
-                                                x_prec, x_fresh, x_ef, x_thr, NULL, NULL, NULL);
+                                                x_prec, x_fresh, x_ef, x_thr, NULL, NULL, NULL, NULL);
     RAISE NOTICE 'vvector: index % options changed. Build options apply at the next refresh; query defaults apply now.', nm;
 END;
 $$;
@@ -832,7 +857,7 @@ DECLARE
     tab VARCHAR(256); ver VARCHAR(128); n INT; t0 TIMESTAMPTZ; ms INT; sch VARCHAR(128); tbl VARCHAR(128);
     bytes INT; all_bytes INT; vectors INT; mem INT; free_mem INT; cores INT; fenced_mb INT; thr INT; build INT;
     rmode VARCHAR(16); tomb INT; kind VARCHAR(16); ver_type VARCHAR(128); live INT; ratio FLOAT; since INT; every INT;
-    sid INT; want INT; got INT; cd VARCHAR(1100); here VARCHAR(200);
+    sid INT; want INT; got INT; cd VARCHAR(1100); here VARCHAR(200); worst VARCHAR(400); r_check VARCHAR(8); free_mb INT;
 BEGIN
     tab := (SELECT MAX(source_table) FROM vvector.manifest WHERE index_name = nm);
     IF tab IS NULL THEN
@@ -967,6 +992,21 @@ BEGIN
     IF thr IS NOT NULL AND thr > cores THEN
         RAISE WARNING 'vvector: index %: threads_default % is more than the % cores of the smallest node: set it to 0 (one per core) or lower.', nm, thr, cores;
     END IF;
+    -- The cache disk of every node this session reaches (vinfo reads it on the node): a refresh
+    -- writes the new snapshot file beside the active one.
+    cd := (SELECT CASE WHEN MAX(cache_dir) IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(MAX(cache_dir)) END
+           FROM vvector.manifest WHERE index_name = nm);
+    r_check := (SELECT COALESCE(MAX(resource_check), 'strict') FROM vvector.manifest WHERE index_name = nm);
+    worst := EXECUTE 'SELECT node_name || '' '' || cache_free_mb FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd
+          || ') OVER(PARTITION NODES) FROM vvector.probe) i WHERE cache_free_mb IS NOT NULL ORDER BY cache_free_mb, node_name LIMIT 1';
+    IF worst IS NOT NULL THEN
+        free_mb := SPLIT_PART(worst, ' ', 2)::INT;
+        RAISE NOTICE 'vvector: index %: cache disk: % MB free on node % under %; resource_check % (a refresh checks the fenced limit, the node memory and this disk before it builds)', nm, free_mb, SPLIT_PART(worst, ' ', 1),
+                     (SELECT COALESCE(MAX(cache_dir), 'the default cache directory') FROM vvector.manifest WHERE index_name = nm), r_check;
+        IF free_mb * 1048576 < bytes THEN
+            RAISE WARNING 'vvector: index %: node % has % MB free under the cache directory, less than the % MB of the index: the next refresh cannot write its file there (resource_check strict stops it before the build). Free that disk, or set_index_options cache_dir to a larger one.', nm, SPLIT_PART(worst, ' ', 1), free_mb, bytes // 1048576;
+        END IF;
+    END IF;
 END;
 $$;
 
@@ -1002,6 +1042,8 @@ DECLARE
     cd VARCHAR(1100); build_est INT; free_mem INT; bin_note VARCHAR(300); cores INT; grew BOOLEAN;
     send VARCHAR(8); chain VARCHAR(4000); chain_b INT; whole_b INT; xfer VARCHAR(8); base_col INT; sent INT; n_cap INT;
     t_note VARCHAR(400); chain_n INT; reach VARCHAR(8); n_unr INT; u_note VARCHAR(400);
+    r_check VARCHAR(8); cdir VARCHAR(1024); snap_est INT; mem_total INT; fenced_mb INT; is_f BOOLEAN; need INT; worst VARCHAR(400); gate VARCHAR(1500);
+    me_node VARCHAR(128);
 BEGIN
     -- The manifest row in one query: PL/vSQL runs every assignment as a query of its own (2 to 7 ms
     -- each on a cluster), so the row is read once, not column by column. Digests are compared as
@@ -1013,10 +1055,10 @@ BEGIN
            boundary_digest::VARCHAR, active_max_ver, COALESCE(verify_every, 1), COALESCE(refreshes_since_verify, 0),
            CASE WHEN cache_dir IS NULL THEN '' ELSE ', cache_dir=' || QUOTE_LITERAL(cache_dir) END,
            SPLIT_PART(source_table, '.', 1), SPLIT_PART(source_table, '.', 2), snapshot_chain, COALESCE(chain_bytes, 0), index_bytes,
-           COALESCE(reachability, 'auto')
+           COALESCE(reachability, 'auto'), COALESCE(resource_check, 'strict'), cache_dir
       INTO tab, idc, vc, op, ver, measure, kind, quant, hm, hefc, margin, prev, prev_from, rmode, ratio, every, since,
            prev_opts, prev_fmt, prev_vec, prev_tomb, rows_then, digest_then, prev_max, v_every, v_since, cd, sch, tbl, chain, chain_b, whole_b,
-           reach
+           reach, r_check, cdir
       FROM vvector.manifest WHERE index_name = nm;
     IF tab IS NULL THEN
         RAISE EXCEPTION 'vvector.refresh_index: index % is not registered', nm;
@@ -1239,6 +1281,51 @@ BEGIN
         bin_note := 'built in a file: the build needs about ' || build_est // 1048576 || ' MB, the smallest node has '
                  || free_mem // 1048576 || ' MB free or in the page cache';
     END IF;
+    -- The resource check (index option resource_check, default strict). The refresh is not started
+    -- when it is certain to fail, or to leave a snapshot no node can serve: the build needs more than
+    -- FencedUDxMemoryLimitMB and vbuild runs fenced (the limit caps its address space); the snapshot
+    -- is larger than the memory of the smallest node (it cannot stay in the page cache); a node has
+    -- less free disk under the cache directory than the new file needs (vload would fail after the
+    -- build; the initiator also holds the build file when the build is made in a file). The figures
+    -- are read now: v_monitor.host_resources, the catalog, and every node's cache disk through vinfo.
+    -- The snapshot estimate: the active snapshot plus its bytes per position for every journal row
+    -- since the previous boundary (an upper bound of the appended rows); for the first build the
+    -- estimate of sizing. warn: the refresh runs and refresh_note records the findings; off: no check.
+    gate := NULL;
+    IF r_check <> 'off' AND build_est IS NOT NULL THEN
+        IF whole_b IS NOT NULL AND prev_vec + prev_tomb > 0 THEN
+            snap_est := whole_b + GREATEST(COALESCE(rows_next, 0) - COALESCE(rows_then, rows_next, 0), 0) * (whole_b // (prev_vec + prev_tomb));
+        ELSE
+            snap_est := build_est - COALESCE(n_vec, 0) * (4 + CASE WHEN kind = 'hnsw' THEN 5 + 2 * cores ELSE 0 END);
+        END IF;
+        mem_total := (SELECT MIN(total_memory_bytes) FROM v_monitor.host_resources);
+        fenced_mb := (SELECT MAX(current_value::INT) FROM v_monitor.configuration_parameters WHERE parameter_name = 'FencedUDxMemoryLimitMB');
+        is_f := (SELECT COALESCE(MAX(is_fenced::INT), 0) = 1 FROM v_catalog.user_transforms WHERE schema_name = 'vvector_admin' AND function_name = 'vbuild');
+        IF is_f AND COALESCE(fenced_mb, -1) > 0 AND build_est > fenced_mb * 1048576 THEN
+            gate := 'the build needs about ' || build_est // 1048576 || ' MB in the fenced process and FencedUDxMemoryLimitMB is ' || fenced_mb
+                 || ' MB (raise it, or deploy vbuild unfenced: make deploy FENCED=mixed)';
+        END IF;
+        IF mem_total IS NOT NULL AND snap_est > mem_total THEN
+            gate := COALESCE(gate || '; ', '') || 'the snapshot needs about ' || snap_est // 1048576 || ' MB and the smallest node has ' || mem_total // 1048576
+                 || ' MB of memory, so no node can keep it in the page cache (quantization sq8 with memory_mode compact, or larger nodes)';
+        END IF;
+        need := snap_est + CASE WHEN bin_note IS NULL THEN 0 ELSE build_est END;
+        me_node := (SELECT local_node_name());
+        worst := EXECUTE 'SELECT node_name || '' '' || cache_free_mb || '' '' || CASE WHEN node_name = ' || QUOTE_LITERAL(me_node) || ' THEN ' || need || ' ELSE ' || snap_est || ' END'
+              || ' FROM (SELECT vvector.vinfo(USING PARAMETERS index_name=' || QUOTE_LITERAL(nm) || cd || ') OVER(PARTITION NODES) FROM vvector.probe) i'
+              || ' WHERE cache_free_mb IS NOT NULL ORDER BY cache_free_mb * 1048576 - CASE WHEN node_name = ' || QUOTE_LITERAL(me_node) || ' THEN ' || need || ' ELSE ' || snap_est || ' END, node_name LIMIT 1';
+        IF worst IS NOT NULL AND SPLIT_PART(worst, ' ', 2)::INT * 1048576 < SPLIT_PART(worst, ' ', 3)::INT THEN
+            gate := COALESCE(gate || '; ', '') || 'node ' || SPLIT_PART(worst, ' ', 1) || ' has ' || SPLIT_PART(worst, ' ', 2) || ' MB free under '
+                 || COALESCE(cdir, 'the default cache directory') || ' and the new cache file needs about ' || SPLIT_PART(worst, ' ', 3)::INT // 1048576 || ' MB'
+                 || CASE WHEN bin_note IS NULL THEN '' ELSE ' together with the build file' END || ' (free that disk, or set_index_options cache_dir to a larger one)';
+        END IF;
+        IF gate IS NOT NULL AND r_check = 'strict' THEN
+            RAISE EXCEPTION 'vvector.refresh_index: index %: not started, the resource check found: %. The check is the index option resource_check (set_index_options argument 17): strict (the default) stops here, warn runs the refresh and records the findings in refresh_note, off skips the check',
+                            nm, gate;
+        ELSIF gate IS NOT NULL THEN
+            gate := 'resource check (warn): ' || gate;
+        END IF;
+    END IF;
     -- What an incremental build sends: the changed bytes (a patch over the active snapshot, which
     -- every node holds), unless the patches since the last whole copy outweigh it or the chain is
     -- long: then the whole snapshot, so the table and a cache repair stay cheap. A base without room
@@ -1274,7 +1361,7 @@ BEGIN
         -- boundary. Only the boundary moves; nothing is loaded.
         secs := (SELECT DATEDIFF('millisecond', t0, CLOCK_TIMESTAMP()) / 1000.0);
         r_note := 'refreshed: snapshot ' || prev || ' kept, no vector changed since it was built; the delta starts at the new boundary; '
-               || secs || ' seconds' || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '');
+               || secs || ' seconds' || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '') || COALESCE('; ' || gate, '');
         PERFORM UPDATE vvector.manifest SET active_max_ver = max_ver, delta_from = v_from, boundary_rows = rows_next,
                        boundary_digest = digest_next::NUMERIC(38,0), refreshes_since_verify = CASE WHEN verify THEN 0 ELSE v_since + 1 END, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, refresh_note = LEFT(r_note, 1000)
                 WHERE index_name = nm;
@@ -1336,7 +1423,7 @@ BEGIN
         END IF;
         r_note := r_note || n_vec || ' vectors of ' || n_dims || ' dimensions, ' || n_tomb || ' tombstones, '
                || n_bytes // 1048576 || ' MB, ' || secs || ' seconds; ' || t_note || COALESCE('; ' || u_note, '') || COALESCE('; ' || bin_note, '')
-               || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '');
+               || COALESCE('; ' || j_note, '') || COALESCE('; ' || lag_note, '') || COALESCE('; ' || gate, '');
         PERFORM UPDATE vvector.manifest SET active_snapshot = sid, active_max_ver = max_ver, delta_from = v_from,
                        base_snapshot = CASE WHEN why IS NULL THEN prev ELSE 0 END, vector_count = n_vec, dims = n_dims, tombstones = n_tomb,
                        graph_bytes = n_graph, index_bytes = n_bytes, built_at = CLOCK_TIMESTAMP(), build_seconds = secs, format_version = fmt,
@@ -1547,7 +1634,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM PUBLIC;
-REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM PUBLIC;
@@ -1576,7 +1664,8 @@ REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM vvector_search;
-REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) FROM vvector_search;
+REVOKE EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.load_on_nodes(VARCHAR, INT, INT) FROM vvector_search;
 REVOKE EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) FROM vvector_search;
@@ -1596,7 +1685,8 @@ GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT,
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) TO vvector_admin;
-GRANT EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) TO vvector_admin;
+GRANT EXECUTE ON PROCEDURE vvector.set_index_options_core(VARCHAR, VARCHAR, INT, INT, VARCHAR, VARCHAR, FLOAT, INT, VARCHAR, VARCHAR, VARCHAR, INT, INT, INT, VARCHAR, VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.refresh_index(VARCHAR, VARCHAR) TO vvector_admin;
 GRANT EXECUTE ON PROCEDURE vvector.set_journal_replica(VARCHAR, VARCHAR) TO vvector_admin;

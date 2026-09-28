@@ -472,3 +472,16 @@ Check again on other versions.
   with "Authentication failed for username dbadmin": the client_auth record `tls_for_all` (HOSTSSL,
   method TLS, priority 0) takes every network client and the password records are LOCAL. A session
   on another subcluster was opened by ssh to that node and a local vsql there.
+
+## Verified for the resource check (26.2.0-2 5-node Eon, 2026-09-28)
+
+- `v_catalog.user_transforms` has the columns schema_name, function_name, function_return_type,
+  function_argument_type, function_definition, is_fenced: whether a transform function runs fenced
+  is read from it (`is_fenced` of vvector_admin.vbuild decides whether FencedUDxMemoryLimitMB
+  applies to a build). `MAX(is_fenced::INT)` in PL/vSQL; MAX over a BOOLEAN is not used.
+- `v_monitor.host_resources.host_name` holds the node address, equal to `v_catalog.nodes.node_address`
+  for every node (5 of 5 joined): the row of a node is found through that join, never by node_name.
+  It has no column for the free disk of an arbitrary directory (disk_space_free_mb is the Vertica
+  data location): the free disk under a cache directory is read on the node by `vinfo` (statvfs).
+- `local_node_name()` in a query over a UDTF with OVER(PARTITION NODES) is not relied on to name the
+  initiator per row: refresh_index reads it once in PL/vSQL and puts the literal into the query.

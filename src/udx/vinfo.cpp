@@ -3,13 +3,17 @@
 // Output (node_name, index_name, snapshot_id, max_ver, vector_count, dims, metric, index_type,
 // quantization, graph_bytes, tombstones, base_snapshot, precision_default, freshness_default,
 // ef_search_default, threads_default, cache_file, loaded, resident_mb, capacity, file_bytes,
-// unreachable). The defaults are the index defaults of set_index_options (NULL = the built-in
+// unreachable, cache_free_mb, mem_available_mb, hugepages, swappiness, max_map_count). The defaults are the index defaults of set_index_options (NULL = the built-in
 // default). vector_count counts the live vectors; the snapshot has vector_count + tombstones
 // positions. resident_mb: how much of the cache file is in the node's memory now (page cache;
 // milestone M6). capacity: the positions the layout has room for (milestone M7: an incremental build
 // appends into the room without moving a section); file_bytes: the size of the cache file;
 // unreachable: the live vectors of an HNSW graph that no search can reach, as counted by the build
 // (NULL for a flat index and when the build did not count: vbuild parameter reachability).
+// The last five columns are facts about the node, read when vinfo runs (engine node_facts): the
+// free disk under the index's cache directory, MemAvailable, transparent huge pages, vm.swappiness
+// and vm.max_map_count; NULL when the node does not give them. refresh_index reads cache_free_mb
+// before a build (the resource check).
 // Without index_name it lists every index of the cache directory that has an ACTIVE or OPTIONS file.
 #include "udx_common.h"
 #include "../engine/hnsw.h"
@@ -22,7 +26,8 @@ using namespace vvector_udx;
 static const char *const FN = "vinfo";
 
 enum { C_NODE, C_INDEX, C_SNAPSHOT, C_MAX_VER, C_COUNT, C_DIMS, C_METRIC, C_TYPE, C_QUANT, C_GRAPH, C_TOMB, C_BASE,
-       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_CAPACITY, C_BYTES, C_UNREACHABLE, C_COLUMNS };
+       C_PRECISION, C_FRESHNESS, C_EF, C_THREADS, C_FILE, C_LOADED, C_RESIDENT, C_CAPACITY, C_BYTES, C_UNREACHABLE,
+       C_CACHE_FREE, C_MEM_AVAILABLE, C_HUGEPAGES, C_SWAPPINESS, C_MAP_COUNT, C_COLUMNS };
 
 class VInfo : public TransformFunction
 {
@@ -31,6 +36,16 @@ class VInfo : public TransformFunction
         auto it = o.find(name);
         if (it == o.end()) out.setNull(col);
         else out.getStringRef(col).copy(it->second);
+    }
+
+    static void facts(PartitionWriter &out, const std::string &cache_dir, const std::string &name)
+    {
+        const vvector::NodeFacts f = vvector::node_facts(cache_dir, name);
+        if (f.cache_free_bytes < 0) out.setNull(C_CACHE_FREE); else out.setInt(C_CACHE_FREE, (vint)(f.cache_free_bytes / 1048576));
+        if (f.mem_available_bytes < 0) out.setNull(C_MEM_AVAILABLE); else out.setInt(C_MEM_AVAILABLE, (vint)(f.mem_available_bytes / 1048576));
+        if (f.hugepages.empty()) out.setNull(C_HUGEPAGES); else out.getStringRef(C_HUGEPAGES).copy(f.hugepages);
+        if (f.swappiness < 0) out.setNull(C_SWAPPINESS); else out.setInt(C_SWAPPINESS, (vint)f.swappiness);
+        if (f.max_map_count < 0) out.setNull(C_MAP_COUNT); else out.setInt(C_MAP_COUNT, (vint)f.max_map_count);
     }
 
     virtual void processPartition(ServerInterface &srvInterface,
@@ -85,8 +100,9 @@ class VInfo : public TransformFunction
                     for (int c = C_SNAPSHOT; c < C_FILE; ++c) out.setNull(c);
                     out.getStringRef(C_FILE).copy(std::string(e.what()).substr(0, 1024));
                     out.setBool(C_LOADED, vbool_false);
-                    for (int c = C_RESIDENT; c < C_COLUMNS; ++c) out.setNull(c);
+                    for (int c = C_RESIDENT; c < C_CACHE_FREE; ++c) out.setNull(c);
                 }
+                facts(out, cache_dir, name);
                 out.next();
             }
             if (names.empty()) {
@@ -94,7 +110,8 @@ class VInfo : public TransformFunction
                 for (int c = C_INDEX; c < C_FILE; ++c) out.setNull(c);
                 out.getStringRef(C_FILE).copy("no indexes in " + cache_dir);
                 out.setBool(C_LOADED, vbool_false);
-                for (int c = C_RESIDENT; c < C_COLUMNS; ++c) out.setNull(c);
+                for (int c = C_RESIDENT; c < C_CACHE_FREE; ++c) out.setNull(c);
+                facts(out, cache_dir, "");
                 out.next();
             }
         } catch (std::exception &e) {
@@ -119,6 +136,11 @@ class VInfoFactory : public TransformFunctionFactory
         returnType.addInt();               // capacity
         returnType.addInt();               // file_bytes
         returnType.addInt();               // unreachable
+        returnType.addInt();               // cache_free_mb
+        returnType.addInt();               // mem_available_mb
+        returnType.addVarchar();           // hugepages
+        returnType.addInt();               // swappiness
+        returnType.addInt();               // max_map_count
     }
 
     virtual void getReturnType(ServerInterface &srvInterface, const SizedColumnTypes &inputTypes,
@@ -146,6 +168,11 @@ class VInfoFactory : public TransformFunctionFactory
         outputTypes.addInt("capacity");
         outputTypes.addInt("file_bytes");
         outputTypes.addInt("unreachable");
+        outputTypes.addInt("cache_free_mb");
+        outputTypes.addInt("mem_available_mb");
+        outputTypes.addVarchar(16, "hugepages");
+        outputTypes.addInt("swappiness");
+        outputTypes.addInt("max_map_count");
     }
 
     virtual void getParameterType(ServerInterface &srvInterface, SizedColumnTypes &parameterTypes)

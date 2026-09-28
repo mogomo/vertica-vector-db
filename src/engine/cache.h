@@ -44,6 +44,23 @@ bool read_active(const std::string &cache_dir, const std::string &index, std::in
 // by this process's user.
 std::vector<std::string> list_cached_indexes(const std::string &cache_dir);
 
+// Facts about the node a function runs on, read when it is called (no Vertica table has them):
+// the free disk under the index's cache directory, taken from the deepest directory of
+// <cache_dir>/<index> that exists (a directory not made yet reports the disk it will be made on);
+// the memory the kernel can give without swapping (MemAvailable of /proc/meminfo); and three
+// settings that shape a mapped file: transparent huge pages (the bracketed word of
+// /sys/kernel/mm/transparent_hugepage/enabled), vm.swappiness and vm.max_map_count. A fact that
+// cannot be read is -1, or an empty string. refresh_index reads them through vinfo before a build:
+// a node whose cache disk cannot hold the snapshot stops the refresh before it starts.
+struct NodeFacts {
+    std::int64_t cache_free_bytes = -1;
+    std::int64_t mem_available_bytes = -1;
+    std::string hugepages;
+    std::int64_t swappiness = -1;
+    std::int64_t max_map_count = -1;
+};
+NodeFacts node_facts(const std::string &cache_dir, const std::string &index);
+
 // A cache directory given as an index option: an absolute path of letters, digits and / . _ -,
 // without "." or ".." components, at most 1000 characters.
 bool valid_cache_dir(const std::string &dir);

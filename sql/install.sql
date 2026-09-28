@@ -120,6 +120,10 @@ ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS capacity INT DEFAULT NULL;
 -- Unreachable vectors of an HNSW graph (milestone M7): counted by the build, reported by vinfo.
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS reachability VARCHAR(8) DEFAULT 'auto';    -- auto (full builds, and incremental ones below 8M positions), on, off
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS unreachable INT DEFAULT NULL;              -- live vectors of the active graph no search can reach; NULL = not counted, or flat
+-- The resource check before a build (set_index_options resource_check): strict stops a refresh that
+-- cannot fit (fenced memory, the memory of the smallest node, the cache disk of a node), warn runs
+-- it and records the findings in refresh_note, off skips the check.
+ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS resource_check VARCHAR(8) DEFAULT 'strict';
 -- Journal replica (set_journal_replica; kept up to date by register_index and refresh_index):
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS journal_replica VARCHAR(16) DEFAULT 'auto';     -- auto, on or off
 ALTER TABLE vvector.manifest ADD COLUMN IF NOT EXISTS replica_projection VARCHAR(256) DEFAULT NULL;   -- schema.projection made by vvector

@@ -106,6 +106,18 @@ FROM (SELECT COUNT(DISTINCT node_name) AS nodes_reporting, MIN(vector_count) AS 
 CROSS JOIN (SELECT COUNT(*) AS up FROM $NODES_UP) u
 CROSS JOIN (SELECT COUNT(*) AS n FROM $SCHEMA.vectors) t;"
 
+expect "vinfo reports the node facts on every node: free cache disk, available memory, huge pages, swappiness, max_map_count" "^facts ok$" "
+SELECT CASE WHEN COUNT(*) = COUNT(cache_free_mb) AND MIN(cache_free_mb) >= 0 AND COUNT(*) = COUNT(mem_available_mb) AND MIN(mem_available_mb) > 0
+                 AND COUNT(*) = COUNT(swappiness) AND MIN(swappiness) >= 0 AND COUNT(*) = COUNT(max_map_count) AND MIN(max_map_count) > 0
+                 AND COUNT(*) = COUNT(hugepages) AND MIN(hugepages) IN ('always', 'madvise', 'never') AND MAX(hugepages) IN ('always', 'madvise', 'never')
+            THEN 'facts ok' ELSE 'facts: disk ' || MIN(cache_free_mb) || ', memory ' || MIN(mem_available_mb) || ', hugepages ' || MIN(hugepages)
+                 || ', swappiness ' || MIN(swappiness) || ', max_map_count ' || MIN(max_map_count) || ' on ' || COUNT(*) || ' rows' END
+FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='vvtest'$CD) OVER(PARTITION NODES) FROM vvector.probe) v;"
+expect "vinfo gives the node facts also for an index that has no cache yet (the resource check reads them before the first build)" "^no cache, facts ok$" "
+SELECT CASE WHEN COUNT(*) > 0 AND MAX(loaded::INT) = 0 AND COUNT(*) = COUNT(cache_free_mb) AND MIN(cache_free_mb) >= 0 AND COUNT(*) = COUNT(mem_available_mb)
+            THEN 'no cache, facts ok' ELSE 'rows ' || COUNT(*) || ', loaded ' || MAX(loaded::INT) || ', disk ' || MIN(cache_free_mb) END
+FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='vvtest_none'$CD) OVER(PARTITION NODES) FROM vvector.probe) v;"
+
 echo "== vbuild input rules"
 expect "ARRAY[INT] vectors are accepted (Vertica converts them to ARRAY[FLOAT])" "^built: 2 vectors of 3$" "
 SELECT 'built: ' || MAX(vector_count) || ' vectors of ' || MAX(dims) FROM (
@@ -234,6 +246,10 @@ fi
 expect "the stale check works through the redirect" "snapshot cache stale on .*: run vload" "
 SELECT vvector.vsearch($Q, 999999999 USING PARAMETERS index_name='$IXC') OVER() FROM dual;"
 expect "status names the directory" "node cache directory: $ALT (index option cache_dir)" "CALL vvector.status('$IXC');"
+expect "status reports the cache disk of the smallest node under that directory, and the resource check" "cache disk: [0-9]* MB free on node v_[a-z0-9_]* under $ALT; resource_check strict" "CALL vvector.status('$IXC');"
+expect "the 17-argument form of set_index_options sets resource_check" "under $ALT; resource_check warn" "
+CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'warn');
+CALL vvector.status('$IXC');"
 expect "a path with .. is refused" "cache_dir must be an absolute path of letters, digits and / . _ - without . or .. parts, or default" "
 CALL vvector.set_index_options('$IXC', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/tmp/../etc');"
 expect "a directory that cannot be used is refused with vload's message" "vload: on .*cannot create directory /proc/vvector_no" "

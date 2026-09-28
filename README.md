@@ -173,7 +173,8 @@ Vertica table `vvector.snapshot`; every node keeps it as a cache file and
 searches it from memory.
 - Gives: searches that do not read the table.
 - Costs: memory and disk on every node (`CALL vvector.sizing(...)` estimates
-  it), and a refresh to take in new rows (or `freshness='exact'`, below).
+  it before the data exists; every refresh checks the fit before it builds),
+  and a refresh to take in new rows (or `freshness='exact'`, below).
 
 <a id="terms-flat"></a>**`flat` index.** The vectors themselves, 4 bytes per
 number, searched by reading all of them. Exact.
@@ -924,8 +925,12 @@ vectors, ids, graph and int8 codes, the size of the snapshot and cache file
 on every node, the memory a build needs, and a comparison with the memory of
 the smallest node.
 
-- **When you need it:** before registering a large table, and to compare
-  index types and quantization.
+- **When you need it:** before the data is in Vertica, or before you
+  register a large table: to choose the nodes, the index type and the
+  quantization. Once an index is registered you do not need it:
+  [status](#status) compares the real index with the nodes, and
+  [refresh_index](#refresh_index) checks before every build that the build
+  and the snapshot fit the nodes.
 - **Limits:** an estimate (the HNSW graph varies with the data by a few
   percent). Anyone may call it.
 
@@ -1079,8 +1084,9 @@ snapshots that are no longer needed. Queries keep working during a refresh.
   whenever the index should take in the new rows: by hand, from your load
   job, or on a schedule ([schedule_refresh](#schedule_refresh)).
 - **Limits:** one refresh of an index runs at a time; a second one stops at
-  once with an error that names the running one. In Eon a refresh loads the
-  nodes of its own subcluster; other subclusters run
+  once with an error that names the running one. A refresh that cannot fit
+  the nodes stops before it builds (the resource check, below). In Eon a
+  refresh loads the nodes of its own subcluster; other subclusters run
   [load_all](#load_all). Rights: `vvector_admin`.
 
 **Syntax**
@@ -1112,6 +1118,37 @@ index option `verify_every` says how often a refresh checks them (1 = every
 refresh, the default; N = every N refreshes; 0 = never: then run
 `refresh_index(name, 'full')` after every physical change yourself). The
 first line of the output says what was built and why.
+
+**The resource check.** Before it builds, a refresh reads the live figures of
+the cluster (`v_monitor.host_resources`, the catalog, and the free disk under
+the cache directory of every node through [vinfo](#vinfo)) and compares them
+with the estimates of [sizing](#sizing) for this build. It stops, with the
+figures, when the outcome is certain: the build needs more than
+`FencedUDxMemoryLimitMB` and `vbuild` runs fenced; the snapshot is larger than
+the memory of the smallest node, so no node could keep it in the page cache;
+or a node has less free disk under the cache directory than the new cache
+file needs (with the build file on the refreshing node when the build is made
+in a file). The error names the index, the node, what is needed and what
+exists, and the fix; nothing is built, stored or loaded, and no refresh mark
+is left. The index option `resource_check` of
+[set_index_options](#set_index_options) decides: `strict` (the default)
+stops, `warn` runs the refresh and records the findings in `refresh_note`,
+`off` skips the check. A refresh that passes the check can still build in a
+file when the build needs more than half of the free memory (the first line
+of the output says so).
+
+What a stopped refresh prints (the Eon cluster, 3 nodes of 15.4 GB; the
+index size in the manifest was set by hand to 4 PB so that the check had
+something to find):
+
+    CALL vvector.refresh_index('articles');
+
+    ERROR 2005:  vvector.refresh_index: index articles: not started, the resource check found: the snapshot needs about 3814697265 MB and the smallest node has 15761 MB of memory, so no node can keep it in the page cache (quantization sq8 with memory_mode compact, or larger nodes); node v_eondb_node0001 has 244832 MB free under the default cache directory and the new cache file needs about 7629394531 MB together with the build file (free that disk, or set_index_options cache_dir to a larger one). The check is the index option resource_check (set_index_options argument 17): strict (the default) stops here, warn runs the refresh and records the findings in refresh_note, off skips the check
+
+With `resource_check` `warn` the same refresh runs and its first line ends
+with the findings:
+
+    NOTICE 2005:  vvector: index articles refreshed: snapshot 4570, incremental from snapshot 4568 (1 vectors appended, 0 tombstoned), 9 vectors of 4 dimensions, 0 tombstones, 0 MB, 1.914 seconds; sent 0 MB of 0 MB (a patch on snapshot 4568 in every node cache; the table holds a chain of 2 snapshots, 0 MB of patches since the whole copy 4568); built in a file: the build needs about 3814697265 MB, the smallest node has 5204 MB free or in the page cache; journal verified in 0.068 seconds; resource check (warn): the snapshot needs about 4291534423 MB and the smallest node has 15761 MB of memory, so no node can keep it in the page cache (quantization sq8 with memory_mode compact, or larger nodes); node v_eondb_node0001 has 244824 MB free under the default cache directory and the new cache file needs about 8106231689 MB together with the build file (free that disk, or set_index_options cache_dir to a larger one)
 
 **Example 1: the first build.** Both example indexes are built for the first
 time:
@@ -1172,15 +1209,15 @@ within 200 ms).
 - **Limits:** NULL keeps an option as it is; `'default'` (text) or `0`
   (numbers) sets a query default back to the built-in one. A change of a
   build option means a full build at the next refresh. The shorter forms
-  (13, 14 and 15 arguments) leave the options they do not name as they are.
-  Rights: `vvector_admin`.
+  (13, 14, 15 and 16 arguments) leave the options they do not name as they
+  are. Rights: `vvector_admin`.
 
 **Syntax**
 
     CALL vvector.set_index_options(index_name, index_type, m, ef_construction, quantization, refresh_mode,
                                    tombstone_ratio, rebuild_every, memory_mode, precision_default,
                                    freshness_default, ef_search_default, threads_default
-                                   [, verify_every [, cache_dir [, reachability]]]);
+                                   [, verify_every [, cache_dir [, reachability [, resource_check]]]]);
 
 | Option | Values | Default | Effect |
 |---|---|---|---|
@@ -1198,6 +1235,7 @@ within 200 ms).
 | verify_every | 0 (never), 1 (every refresh) or more | 1 | how often a refresh verifies the journal rows up to the boundary |
 | cache_dir | an absolute path, or `default` | `/tmp/vvector` | where every node keeps the cache files of this index; the active snapshot is loaded there at once (the option changes only when every node has it); the files in the old directory stay |
 | reachability | auto, on, off | auto | HNSW: whether a build counts the vectors no search can reach (see [Unreachable vectors](#unreachable-vectors)) |
+| resource_check | strict, warn, off | strict | what a refresh does when its build or snapshot cannot fit the nodes (see [refresh_index](#refresh_index)): `strict` stops before the build with the figures, `warn` runs it and records them in `refresh_note`, `off` skips the check |
 
 **Example 1: every search of the index sees the newest rows.** With
 `freshness_default` `exact`, a search over the `_delta` view applies the
@@ -1234,6 +1272,8 @@ More examples:
     CALL vvector.set_index_options('articles', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/data/vvector');
     -- verify the journal every 10 refreshes instead of at every one:
     CALL vvector.set_index_options('articles', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 10);
+    -- let a refresh run even when the resource check finds that the index cannot fit (the findings go to refresh_note):
+    CALL vvector.set_index_options('articles', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'warn');
 
 #### set_journal_replica
 
@@ -1353,8 +1393,9 @@ Reports on an index: live vectors and tombstones, refresh mode, what the
 last refresh did, a refresh that runs now, how many nodes hold the active
 snapshot, the rows in the delta and how long they take to read, the journal
 replica, open transactions that write to the table, versions in the future,
-and a sizing check (index size against node memory, the memory a refresh
-needs against `FencedUDxMemoryLimitMB`, `threads_default` against cores).
+a sizing check (index size against node memory, the memory a refresh
+needs against `FencedUDxMemoryLimitMB`, `threads_default` against cores),
+and the free disk under the cache directory on the node that has the least.
 Each problem is a WARNING with the recommended fix.
 
 - **When you need it:** to check an index, and before and after changing
@@ -1380,6 +1421,7 @@ reported as notices. The warnings:
 | memory | the index takes more than half of the memory of the smallest node, or all indexes together more than 70% of it | `quantization='sq8'` with `memory_mode='compact'`, fewer indexes, or larger nodes |
 | build memory | a refresh needs more than `FencedUDxMemoryLimitMB`, or more than the node has free or in the page cache | raise `FencedUDxMemoryLimitMB`; refresh when the node is quiet |
 | threads | `threads_default` exceeds the cores of the smallest node | set it to 0 (one per core) or lower |
+| cache disk | a node has less free disk under the cache directory than the index takes (the next whole copy cannot be written there; a refresh stops before the build) | free that disk, or `set_index_options` `cache_dir` to a larger one |
 
 Both examples below are healthy: no WARNING.
 
@@ -1408,6 +1450,11 @@ Both examples below are healthy: no WARNING.
     NOTICE 2005:  vvector: index products: last refresh: refreshed: snapshot 24, full build (first build), 6 vectors of 3 dimensions, 0 tombstones, 0 MB, 0.491 seconds; sent 0 MB of 0 MB (whole)
     NOTICE 2005:  vvector: index products: snapshot pieces in vvector.snapshot: a chain of 1 snapshots from the whole copy 24, 0 MB of patches after it; the layout has room for 4096 more vectors before a refresh sends the whole snapshot again
     NOTICE 2005:  vvector: index products: sizing: index 0 MB, all indexes 1 MB, build about 0 MB, smallest node 62464 MB of memory (59202 MB free or cache), 22 cores
+
+The cache disk line follows the sizing line (added after the runs above;
+this one from the Eon cluster, 3 nodes):
+
+    NOTICE 2005:  vvector: index articles: cache disk: 244746 MB free on node v_eondb_node0001 under the default cache directory; resource_check strict (a refresh checks the fenced limit, the node memory and this disk before it builds)
 
 #### load_all
 
@@ -1834,10 +1881,14 @@ oversampling, cache_dir.
 
 Shows, per node, what the node has in its cache: the snapshot, its size and
 type, the index defaults, whether it can be read, how much of it is in
-memory.
+memory; and five facts about the node itself that no Vertica table has: the
+free disk under the cache directory, the memory the kernel can give without
+swapping, and the settings transparent huge pages, swappiness and
+max_map_count.
 
 - **When you need it:** to check that every node has the active snapshot
-  after a refresh or a `load_all`, and how much memory the indexes use.
+  after a refresh or a `load_all`, how much memory the indexes use, and
+  whether the nodes have the disk, the memory and the settings for them.
 - **Limits:** reads the cache directory only (the default, the session's, or
   the `cache_dir` parameter; an index with its own `cache_dir` option is
   found by its name). Rights: `vvector_search`.
@@ -1853,7 +1904,13 @@ tombstones, base_snapshot, precision_default, freshness_default,
 ef_search_default, threads_default, cache_file (or why the cache cannot be
 read), loaded, resident_mb (how much of the file is in memory now),
 capacity (the vectors the layout has room for), file_bytes, unreachable
-(HNSW: live vectors no search can reach; NULL when not counted).
+(HNSW: live vectors no search can reach; NULL when not counted), and the
+node facts cache_free_mb (free disk under the cache directory of the index,
+or under the directory it will be made in), mem_available_mb (`MemAvailable`
+of the node), hugepages (`always`, `madvise` or `never`), swappiness and
+max_map_count (NULL when the node does not give them). The node facts come
+with every row, also for an index that has no cache yet; `refresh_index`
+reads cache_free_mb before every build.
 `vvector.probe` makes the function run once on every node.
 
 **Example 1: does every node have the active snapshot?** Compare with the
@@ -1882,6 +1939,19 @@ manifest:
     ----------------+------------+------------+--------------+------------+-------------
      v_vdb_node0001 | articles   | hnsw       | none         |     912640 |           0
      v_vdb_node0001 | products   | flat       | none         |     312640 |           0
+
+**Example 3: the disk, the memory and the settings of every node** (the Eon
+cluster, 3 nodes of the primary subcluster):
+
+    SELECT node_name, cache_free_mb, mem_available_mb, hugepages, swappiness, max_map_count
+    FROM (SELECT vvector.vinfo(USING PARAMETERS index_name='articles') OVER(PARTITION NODES) FROM vvector.probe) i
+    ORDER BY node_name;
+
+        node_name     | cache_free_mb | mem_available_mb | hugepages | swappiness | max_map_count
+    ------------------+---------------+------------------+-----------+------------+---------------
+     v_eondb_node0001 |        244741 |             5120 | always    |         30 |       1012972
+     v_eondb_node0002 |        268051 |             4949 | always    |         30 |       1012972
+     v_eondb_node0003 |        271977 |             4702 | always    |         30 |       1012972
 
 #### vversion
 
@@ -3429,7 +3499,8 @@ patch bytes since that whole copy), `sent_bytes` and `transfer` (what the
 last refresh stored and sent: `whole` or `patch`), `capacity` (the vectors
 the active snapshot's layout has room for), `reachability` and `unreachable`
 (the option, and the vectors of the active graph no search can reach; NULL
-when not counted)), and
+when not counted), `resource_check` (what a refresh does when its build
+cannot fit: strict, warn or off)), and
 the journal replica (`journal_replica` = auto, on or off;
 `replica_projection`, the projection vvector made; `replica_note`, what the
 last check did and why).
@@ -3476,7 +3547,7 @@ cache), starting with `vknn:`.
 | `vload: on NODE: bad snapshot graph: ... in FILE`, `vsearch: bad snapshot graph: ...` | the graph section of the snapshot or cache file is damaged (vload checks every link) | `CALL vvector.refresh_index('x')` |
 | `vload: on NODE: bad snapshot sq8 section: ... in FILE`, `vsearch: bad snapshot sq8 section: ...` | the int8 codes of the snapshot or cache file are damaged (vload checks every row) | `CALL vvector.refresh_index('x', 'full')` |
 | `vbuild: index 'x': the base snapshot has quantization sq8, not none: refresh with mode full` (or `none, not sq8`) | a hand-made incremental build with another quantization than the base (a refresh builds in full by itself when the option changed) | `CALL vvector.refresh_index('x', 'full')` |
-| `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
+| `vbuild: out of memory: cannot map N MB for the snapshot` | the node has too little memory for the build (a refresh with `resource_check` `strict` stops before this happens) | `CALL vvector.sizing(...)`; a larger node or FencedUDxMemoryLimitMB |
 | `vload: on NODE: pieces are missing or duplicated`, `bad snapshot: checksum mismatch`, `cannot write ...` | a damaged transfer or a full disk | check disk space of cache_dir; `load_all` |
 | `vload`, `vinfo`, `vsearch`: `cache_dir '...' must be an absolute path`, `index name '...' is not valid` | bad cache_dir or index name | use `/path` and letters, digits, underscore |
 | `vsearch: index 'x': OPTIONS file in the cache DIR: ...: run vvector.load_all` | the index defaults file of the node was changed by hand | `CALL vvector.load_all('x')` |
@@ -3485,6 +3556,8 @@ cache), starting with `vknn:`.
 | `vvector.refresh_index: index x: table T has no vectors, nothing to build` | the table has no live rows | insert rows first |
 | `vvector.refresh_index: index x: no live vector up to the delta boundary B ...; N rows of T are newer` | every live row was written after the boundary (within the margin before the refresh, or after the start of an open writer), for example the first refresh right after a load | refresh again when the margin has passed; the rows are found meanwhile with `freshness='exact'`. On one node with `CLOCK_TIMESTAMP()` versions a margin of 0 is safe |
 | `vvector.refresh_index: mode must be auto, incremental or full` | a bad second argument | `'auto'`, `'incremental'` or `'full'` |
+| `vvector.refresh_index: index x: not started, the resource check found: ...` | the build or the snapshot cannot fit: more than `FencedUDxMemoryLimitMB` in a fenced build, a snapshot larger than the memory of the smallest node, or a node with too little free disk under the cache directory; the message gives the figures and the node | fix what the message names (nodes, `quantization='sq8'` with `memory_mode='compact'`, the fenced limit, the disk or `cache_dir`); `set_index_options(..., 'warn')` as argument 17 runs the refresh anyway |
+| `vvector.set_index_options: resource_check must be strict, warn or off` | a bad argument 17 | `'strict'`, `'warn'` or `'off'` |
 | `vvector.refresh_index: index x is being refreshed since T UTC (by USER, session S). Two refreshes of one index cannot run at the same time ...` | another refresh of the index runs (by hand or by the schedule), or one was killed and left its mark (a superuser, or the same user, gets past a killed one at once) | wait until it ends; if none runs, `UPDATE vvector.manifest SET refresh_started_at = NULL WHERE index_name = 'x'; COMMIT;` (or wait for the hours the message names) |
 | `Function vvector.vsearch(...) does not exist, or permission is denied for vvector.vsearch(...)` (or vknn, vinfo, a vector function) | the user lacks the role `vvector_search`, or has it but not enabled | `GRANT vvector_search TO someone; ALTER USER someone DEFAULT ROLE vvector_search;` (or `make deploy SEARCH=public`) |
 | `Permission denied for schema vvector_admin` | a build or load function called without the role `vvector_admin` | `GRANT vvector_admin TO someone;` and enable it (default role or `SET ROLE`) |
@@ -3806,8 +3879,21 @@ The index must stay in the page cache of every node. A `flat` index holds 4
 bytes per number (the vector length padded to a multiple of 16) plus 8 bytes
 per id; HNSW adds the links, about a quarter more at 128 dimensions with
 m = 16; sq8 adds one byte per number. For SIFT1M (1M x 128): 496 MB flat,
-631 MB HNSW, 757 MB HNSW with sq8. `CALL vvector.sizing(vectors, dims,
-index_type, quantization)` estimates it before you load (see [sizing](#sizing)).
+631 MB HNSW, 757 MB HNSW with sq8. You work this out yourself only before
+the data exists, to choose the nodes and the index type: `CALL
+vvector.sizing(vectors, dims, index_type, quantization)` does the arithmetic
+(see [sizing](#sizing)). Once the index is registered, nothing is left to
+you: `status` compares the real index with the nodes, and every refresh
+checks before it builds that the build fits `FencedUDxMemoryLimitMB`, the
+snapshot fits the memory of the smallest node and the new cache file fits
+the disk of every node. When not, it stops with the figures instead of
+running for hours and failing at the end (see [refresh_index](#refresh_index)).
+
+**How do I see the free disk, the memory and the kernel settings of every node?**
+`vinfo` reports them with every row: cache_free_mb, mem_available_mb,
+hugepages, swappiness and max_map_count (see [vinfo](#vinfo)). They are read
+on the node when the function runs, never stored: a stored copy would be out
+of date within seconds.
 
 **How long does a refresh take?**
 On the test VM with 1M vectors of 128 dimensions: a full build 12 s for
